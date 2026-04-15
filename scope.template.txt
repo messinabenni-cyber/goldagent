@@ -1,0 +1,33 @@
+PENETRATION TEST AUTHORIZATION / SCOPE OF WORK
+===============================================
+
+Client:            __________________________________________
+Client contact:    __________________________________________
+Tester:            __________________________________________
+Engagement dates:  From ______________ To ______________
+
+Authorized targets (IP ranges, hostnames):
+  - _______________________________________________________
+  - _______________________________________________________
+
+Authorized tests:
+  [ ] Host and port discovery
+  [ ] Service/version enumeration
+  [ ] Extension enumeration
+  [ ] Default credential testing
+  [ ] Anonymous-call testing
+  [ ] Outbound-call proof-of-concept
+      Permitted destination number(s): ______________________
+
+Out of scope (do NOT test):
+  - _______________________________________________________
+
+Emergency contact (if testing causes a service impact):
+  Name:   _________________________________________________
+  Phone:  _________________________________________________
+
+By signing below the client confirms ownership of, or legal authority over,
+the listed targets and authorizes the tester to carry out the tests listed.
+
+Client signature:  ______________________  Date: ______________
+Tester signature:  ______________________  Date: ______________

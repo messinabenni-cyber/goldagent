@@ -1,0 +1,1736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VoIPScan Pro</title>
+<style>
+:root {
+  --bg: #0a0c10;
+  --panel: #111318;
+  --border: #1e2330;
+  --accent: #3b82f6;
+  --green: #22c55e;
+  --red: #ef4444;
+  --orange: #f97316;
+  --yellow: #eab308;
+  --muted: #6b7280;
+  --text: #e2e8f0;
+  --panel2: #161b24;
+  --hover: #1a2033;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.5; }
+a { color: var(--accent); text-decoration: none; }
+button { cursor: pointer; font-family: inherit; font-size: 13px; }
+input, select, textarea { font-family: inherit; font-size: 13px; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: #2a3148; border-radius: 3px; }
+
+#app { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+
+/* Header */
+#header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 20px; height: 52px; border-bottom: 1px solid var(--border);
+  background: var(--panel); flex-shrink: 0; z-index: 100;
+}
+.logo { display: flex; align-items: center; gap: 10px; }
+.logo-icon { width: 28px; height: 28px; background: var(--accent); border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 700; color: #fff; font-size: 12px; letter-spacing: -0.5px; }
+.logo-text { font-size: 15px; font-weight: 600; letter-spacing: -0.3px; }
+.logo-sub { font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 1px; }
+.header-right { display: flex; align-items: center; gap: 10px; }
+#scan-state-badge { padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; background: #1a2033; color: var(--muted); border: 1px solid var(--border); }
+#scan-state-badge.running { background: rgba(59,130,246,0.15); color: var(--accent); border-color: rgba(59,130,246,0.3); animation: pulse-badge 2s infinite; }
+#scan-state-badge.done { background: rgba(34,197,94,0.1); color: var(--green); border-color: rgba(34,197,94,0.3); }
+#scan-state-badge.error { background: rgba(239,68,68,0.1); color: var(--red); border-color: rgba(239,68,68,0.3); }
+@keyframes pulse-badge { 0%,100% { opacity:1; } 50% { opacity:0.6; } }
+
+#btn-settings { width:32px;height:32px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--muted);display:flex;align-items:center;justify-content:center;transition:all 0.15s; }
+#btn-settings:hover { background:var(--hover);color:var(--text); }
+#btn-stop-scan { padding:6px 16px;border-radius:6px;border:1px solid var(--red);background:rgba(239,68,68,0.1);color:var(--red);font-weight:500;display:none;transition:all 0.15s; }
+#btn-stop-scan:hover { background:rgba(239,68,68,0.2); }
+#btn-stop-scan.visible { display:flex;align-items:center;gap:6px; }
+
+.continuous-badge { padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;background:rgba(168,85,247,0.12);color:#a855f7;border:1px solid rgba(168,85,247,0.3);display:none;align-items:center;gap:5px; }
+.continuous-badge.visible { display:inline-flex; }
+.continuous-badge::before { content:'';width:6px;height:6px;border-radius:50%;background:#a855f7;animation:pulse-badge 1.5s infinite; }
+
+#main { display:flex;flex:1;overflow:hidden; }
+
+/* Config panel */
+#config-panel { width:100%;display:flex;align-items:flex-start;justify-content:center;padding:40px 20px;overflow-y:auto; }
+#config-panel.hidden { display:none; }
+.config-card { width:100%;max-width:880px;background:var(--panel);border:1px solid var(--border);border-radius:12px;overflow:hidden; }
+.config-card-header { padding:20px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px; }
+.config-card-header h2 { font-size:16px;font-weight:600; }
+.config-card-header p { color:var(--muted);font-size:12px;margin-top:2px; }
+.config-body { padding:24px; }
+.form-grid { display:grid;grid-template-columns:1fr 1fr;gap:16px; }
+.form-group { display:flex;flex-direction:column;gap:6px; }
+.form-group.full { grid-column:1 / -1; }
+label { font-size:12px;font-weight:500;color:#94a3b8;letter-spacing:0.3px; }
+label .req { color:var(--red);margin-left:2px; }
+.form-input { background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);outline:none;transition:border-color 0.15s;width:100%; }
+.form-input:focus { border-color:var(--accent); }
+.form-input::placeholder { color:var(--muted); }
+.form-input.error-field { border-color:var(--red); }
+
+.check-grid { display:flex;flex-wrap:wrap;gap:12px 20px; }
+.check-item { display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none; }
+.check-item input[type=checkbox], .check-item input[type=radio] { accent-color:var(--accent);width:14px;height:14px;cursor:pointer; }
+.check-item span { font-size:12px;color:var(--text); }
+.scan-mode-group { display:flex;gap:8px;flex-wrap:wrap; }
+.mode-btn { padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--muted);font-size:12px;font-weight:500;cursor:pointer;transition:all 0.15s; }
+.mode-btn.active { border-color:var(--accent);background:rgba(59,130,246,0.12);color:var(--accent); }
+.mode-btn:hover:not(.active) { border-color:#2a3148;color:var(--text); }
+
+.section-divider { border:none;border-top:1px solid var(--border);margin:20px 0; }
+.section-label { font-size:11px;font-weight:600;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:14px; }
+
+#btn-start-scan { width:100%;padding:12px;background:var(--accent);border:none;border-radius:8px;color:#fff;font-size:14px;font-weight:600;margin-top:20px;transition:opacity 0.15s;letter-spacing:0.2px; }
+#btn-start-scan:hover { opacity:0.85; }
+#start-error { color:var(--red);font-size:12px;margin-top:8px;display:none; }
+
+/* Dashboard */
+#dashboard { display:flex;flex-direction:column;flex:1;overflow:hidden; }
+#dashboard.hidden { display:none; }
+
+#tab-bar { display:flex;align-items:center;gap:2px;padding:0 20px;border-bottom:1px solid var(--border);background:var(--panel);flex-shrink:0;height:44px; }
+.tab-btn { padding:0 14px;height:44px;border:none;background:transparent;color:var(--muted);font-size:12px;font-weight:500;position:relative;transition:color 0.15s;white-space:nowrap;display:flex;align-items:center;gap:6px; }
+.tab-btn:hover { color:var(--text); }
+.tab-btn.active { color:var(--text); }
+.tab-btn.active::after { content:'';position:absolute;bottom:0;left:0;right:0;height:2px;background:var(--accent);border-radius:2px 2px 0 0; }
+.tab-badge { display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;background:var(--accent);border-radius:8px;font-size:10px;color:#fff;font-weight:700; }
+.tab-badge.red { background:var(--red); }
+
+#tab-content { flex:1;overflow:hidden;display:flex;flex-direction:column; }
+.tab-pane { display:none;flex:1;overflow:hidden;flex-direction:column; }
+.tab-pane.active { display:flex; }
+.tab-scroll { flex:1;overflow-y:auto;padding:20px; }
+
+/* Stat cards */
+.stat-row { display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px; }
+.stat-card { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:4px; }
+.stat-label { font-size:11px;color:var(--muted);font-weight:500;letter-spacing:0.3px;text-transform:uppercase; }
+.stat-value { font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1; }
+.stat-value.blue { color:var(--accent); }
+.stat-value.green { color:var(--green); }
+.stat-value.red { color:var(--red); }
+.stat-value.orange { color:var(--orange); }
+.stat-sub { font-size:11px;color:var(--muted); }
+
+/* Phase tracker */
+.phase-tracker { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px 20px;margin-bottom:18px;overflow-x:auto; }
+.phase-steps { display:flex;align-items:center;gap:0;min-width:600px; }
+.phase-step { display:flex;flex-direction:column;align-items:center;gap:6px;flex:1;position:relative; }
+.phase-step:not(:last-child)::after { content:'';position:absolute;top:12px;left:50%;width:100%;height:2px;background:var(--border);z-index:0; }
+.phase-step.done:not(:last-child)::after { background:var(--accent); }
+.phase-dot { width:24px;height:24px;border-radius:50%;border:2px solid var(--border);background:var(--bg);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;position:relative;z-index:1;flex-shrink:0;transition:all 0.3s; }
+.phase-step.done .phase-dot { background:var(--accent);border-color:var(--accent);color:#fff; }
+.phase-step.active .phase-dot { border-color:var(--accent);color:var(--accent);animation:pulse-phase 1.5s infinite; }
+@keyframes pulse-phase { 0%,100% { box-shadow:0 0 0 0 rgba(59,130,246,0.4); } 50% { box-shadow:0 0 0 6px rgba(59,130,246,0); } }
+.phase-name { font-size:10px;color:var(--muted);text-align:center;white-space:nowrap; }
+.phase-step.done .phase-name, .phase-step.active .phase-name { color:var(--text); }
+
+.two-col { display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px; }
+.panel-box { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden; }
+.panel-header { padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between; }
+.panel-title { font-size:12px;font-weight:600;letter-spacing:0.3px; }
+.panel-count { font-size:11px;color:var(--muted); }
+.panel-body { max-height:240px;overflow-y:auto; }
+
+/* Host cards */
+.host-card { padding:10px 14px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono','Fira Code',monospace; }
+.host-card:last-child { border-bottom:none; }
+.host-ip { font-size:12px;font-weight:600;color:var(--accent); }
+.host-meta { font-size:11px;color:var(--muted);margin-top:2px; }
+.ext-tags { display:flex;flex-wrap:wrap;gap:4px;margin-top:5px; }
+.ext-tag { padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(59,130,246,0.12);color:var(--accent);border:1px solid rgba(59,130,246,0.2); }
+.ext-tag.cred { background:rgba(34,197,94,0.1);color:var(--green);border-color:rgba(34,197,94,0.2); }
+
+/* Findings */
+.finding-item { padding:10px 14px;border-bottom:1px solid var(--border); }
+.finding-item:last-child { border-bottom:none; }
+.finding-header { display:flex;align-items:center;gap:8px;margin-bottom:3px; }
+.sev-badge { padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px; }
+.sev-badge.critical { background:rgba(239,68,68,0.15);color:var(--red);border:1px solid rgba(239,68,68,0.3); }
+.sev-badge.high { background:rgba(249,115,22,0.15);color:var(--orange);border:1px solid rgba(249,115,22,0.3); }
+.sev-badge.medium { background:rgba(234,179,8,0.15);color:var(--yellow);border:1px solid rgba(234,179,8,0.3); }
+.sev-badge.low { background:rgba(59,130,246,0.12);color:var(--accent);border:1px solid rgba(59,130,246,0.3); }
+.sev-badge.info { background:rgba(107,114,128,0.15);color:var(--muted);border:1px solid rgba(107,114,128,0.3); }
+.finding-title { font-size:12px;font-weight:500; }
+.finding-desc { font-size:11px;color:var(--muted);font-family:monospace; }
+
+/* Attack matrix */
+.matrix-table-wrap { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:18px; }
+.matrix-header { padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between; }
+.matrix-table { width:100%;border-collapse:collapse; }
+.matrix-table th { padding:8px 12px;text-align:left;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:0.5px;border-bottom:1px solid var(--border);white-space:nowrap; }
+.matrix-table td { padding:8px 12px;font-size:12px;border-bottom:1px solid var(--border);font-family:'JetBrains Mono','Fira Code',monospace; }
+.matrix-table tr:last-child td { border-bottom:none; }
+.matrix-table tr:hover td { background:var(--hover); }
+.status-dot { display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:500; }
+.status-dot::before { content:'';width:6px;height:6px;border-radius:50%; }
+.status-dot.active::before { background:var(--green); }
+.status-dot.pending::before { background:var(--muted); }
+.status-dot.pwned::before { background:var(--red); }
+
+/* Call cards */
+.calls-section { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:18px; }
+.calls-header { padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap; }
+.launch-bar { display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1; }
+.launch-bar input { flex:1;min-width:100px; }
+.call-cards-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;padding:14px; }
+.call-card { background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:8px; }
+.call-card-header { display:flex;align-items:center;justify-content:space-between; }
+.call-ext { font-family:monospace;font-size:13px;font-weight:700; }
+.call-state { padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px; }
+.call-state.ringing { background:rgba(234,179,8,0.12);color:var(--yellow);border:1px solid rgba(234,179,8,0.3);animation:pulse-badge 1.5s infinite; }
+.call-state.active { background:rgba(34,197,94,0.1);color:var(--green);border:1px solid rgba(34,197,94,0.3); }
+.call-state.ended { background:rgba(107,114,128,0.1);color:var(--muted);border:1px solid var(--border); }
+.call-state.failed { background:rgba(239,68,68,0.1);color:var(--red);border:1px solid rgba(239,68,68,0.3); }
+.call-meta { font-size:11px;color:var(--muted);font-family:monospace; }
+.call-rtp { display:flex;justify-content:space-between;align-items:center; }
+.call-rtp-stats { font-size:10px;color:var(--muted);font-family:monospace; }
+.sparkline { display:block; }
+.call-actions { display:flex;gap:6px; }
+.btn-hangup { flex:1;padding:5px;border-radius:5px;border:1px solid rgba(239,68,68,0.3);background:rgba(239,68,68,0.08);color:var(--red);font-size:11px;font-weight:500;transition:all 0.15s; }
+.btn-hangup:hover { background:rgba(239,68,68,0.18); }
+.no-calls { padding:30px;text-align:center;color:var(--muted);font-size:12px; }
+
+/* Event log */
+.event-log-box { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:18px; }
+.event-log-header { padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between; }
+.event-log-body { height:220px;overflow-y:auto;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px; }
+.log-line { padding:3px 14px;display:flex;gap:10px;border-bottom:1px solid rgba(30,35,48,0.5); }
+.log-line:hover { background:var(--hover); }
+.log-time { color:var(--muted);flex-shrink:0;width:60px; }
+.log-cat { flex-shrink:0;width:70px;font-weight:600; }
+.log-cat.info { color:var(--muted); }
+.log-cat.success { color:var(--green); }
+.log-cat.warn { color:var(--yellow); }
+.log-cat.error { color:var(--red); }
+.log-cat.critical { color:var(--red);font-weight:700; }
+.log-cat.call { color:var(--accent); }
+.log-cat.osint { color:#a78bfa; }
+.log-cat.ai { color:#f472b6; }
+.log-msg { color:var(--text);flex:1;word-break:break-all; }
+.btn-clear { padding:3px 10px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);font-size:11px;cursor:pointer; }
+.btn-clear:hover { color:var(--text); }
+
+/* Downloads */
+.downloads-row { display:flex;gap:10px;flex-wrap:wrap; }
+.dl-btn { padding:8px 16px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:12px;font-weight:500;display:flex;align-items:center;gap:7px;text-decoration:none;transition:all 0.15s; }
+.dl-btn:hover { border-color:var(--accent);color:var(--accent); }
+.dl-icon { font-size:14px; }
+
+/* OSINT tab */
+.osint-grid { display:grid;grid-template-columns:1fr 1fr;gap:14px; }
+.osint-card { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden; }
+.osint-card.full { grid-column:1 / -1; }
+.osint-banner { padding:14px;font-family:monospace;font-size:11px;color:#a0aec0;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow-y:auto;background:var(--bg); }
+.risk-score-box { display:flex;align-items:center;gap:14px;padding:14px; }
+.risk-gauge { width:60px;height:60px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;border:3px solid; }
+.risk-gauge.critical { border-color:var(--red);color:var(--red); }
+.risk-gauge.high { border-color:var(--orange);color:var(--orange); }
+.risk-gauge.medium { border-color:var(--yellow);color:var(--yellow); }
+.risk-gauge.low { border-color:var(--green);color:var(--green); }
+.data-table { width:100%;border-collapse:collapse; }
+.data-table td { padding:7px 14px;border-bottom:1px solid var(--border);font-size:12px; }
+.data-table td:first-child { color:var(--muted);font-weight:500;width:130px; }
+.data-table tr:last-child td { border-bottom:none; }
+.cve-list { display:flex;flex-wrap:wrap;gap:6px;padding:12px 14px; }
+.cve-tag { padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;font-family:monospace;background:rgba(249,115,22,0.12);color:var(--orange);border:1px solid rgba(249,115,22,0.25); }
+
+/* AI Advisor */
+.ai-advice-box { background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:14px; }
+.ai-narrative { padding:16px;font-size:13px;line-height:1.7;color:#cbd5e1; }
+.ai-rec-list { display:flex;flex-direction:column;gap:10px; }
+.ai-rec { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;display:flex;gap:12px;align-items:flex-start; }
+.ai-rec-rank { width:28px;height:28px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0; }
+.ai-rec-body { flex:1; }
+.ai-rec-title { font-size:13px;font-weight:600;margin-bottom:4px; }
+.ai-rec-desc { font-size:12px;color:var(--muted); }
+.ai-rec-conf { font-size:11px;color:var(--green);margin-top:5px;font-weight:500; }
+.fuzz-status-bar { display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--bg);border-radius:6px;border:1px solid var(--border);margin-bottom:12px; }
+.fuzz-status { display:flex;align-items:center;gap:8px;font-size:12px; }
+.fuzz-dot { width:8px;height:8px;border-radius:50%;background:var(--muted); }
+.fuzz-dot.running { background:var(--green);animation:pulse-badge 1.5s infinite; }
+
+/* Persistence */
+.persist-layout { display:grid;grid-template-columns:1fr 1fr;gap:14px; }
+.persist-status { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px; }
+.persist-stat-row { display:flex;flex-direction:column;gap:10px; }
+.persist-stat { display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border); }
+.persist-stat:last-child { border-bottom:none; }
+.persist-stat-label { font-size:12px;color:var(--muted); }
+.persist-stat-val { font-size:12px;font-weight:600;font-family:monospace; }
+.persist-control { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px; }
+.persist-btn-row { display:flex;gap:8px;margin-top:12px; }
+
+/* Anomalies */
+.anomaly-list { display:flex;flex-direction:column;gap:10px; }
+.anomaly-item { background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 16px;display:flex;gap:12px;align-items:flex-start; }
+.anomaly-sev { flex-shrink:0; }
+.anomaly-body { flex:1; }
+.anomaly-title { font-size:12px;font-weight:600;margin-bottom:3px; }
+.anomaly-evidence { font-size:11px;color:var(--muted);font-family:monospace;margin-bottom:4px;word-break:break-all; }
+.anomaly-ts { font-size:10px;color:#4b5563; }
+.anomaly-empty { padding:40px;text-align:center;color:var(--muted);font-size:12px; }
+
+/* Report */
+.report-layout { display:grid;grid-template-columns:1fr 2fr;gap:14px; }
+.risk-score-large { display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:30px; }
+.risk-ring { width:100px;height:100px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid; }
+.risk-ring.critical { border-color:var(--red); }
+.risk-ring.high { border-color:var(--orange); }
+.risk-ring.medium { border-color:var(--yellow); }
+.risk-ring.low { border-color:var(--green); }
+.risk-num { font-size:32px;font-weight:800; }
+.risk-label { font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px; }
+.exec-summary { padding:16px;font-size:13px;line-height:1.7;color:#cbd5e1;white-space:pre-wrap; }
+
+/* Settings modal */
+#settings-modal { display:none;position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:1000;align-items:center;justify-content:center; }
+#settings-modal.open { display:flex; }
+.modal-card { background:var(--panel);border:1px solid var(--border);border-radius:12px;width:520px;max-width:95vw;max-height:90vh;overflow-y:auto; }
+.modal-header { padding:18px 22px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between; }
+.modal-title { font-size:15px;font-weight:600; }
+.modal-close { width:28px;height:28px;border:none;background:transparent;color:var(--muted);font-size:18px;cursor:pointer;border-radius:4px;display:flex;align-items:center;justify-content:center; }
+.modal-close:hover { color:var(--text);background:var(--hover); }
+.modal-body { padding:22px;display:flex;flex-direction:column;gap:14px; }
+.modal-footer { padding:16px 22px;border-top:1px solid var(--border);display:flex;justify-content:flex-end;gap:8px; }
+
+.btn { padding:7px 16px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text);font-size:12px;font-weight:500;cursor:pointer;transition:all 0.15s; }
+.btn:hover { background:var(--hover); }
+.btn.primary { background:var(--accent);border-color:var(--accent);color:#fff; }
+.btn.primary:hover { opacity:0.85; }
+.btn.success { background:rgba(34,197,94,0.1);border-color:rgba(34,197,94,0.3);color:var(--green); }
+.btn.success:hover { background:rgba(34,197,94,0.18); }
+.btn.danger { background:rgba(239,68,68,0.1);border-color:rgba(239,68,68,0.3);color:var(--red); }
+.btn.danger:hover { background:rgba(239,68,68,0.18); }
+.btn:disabled { opacity:0.4;cursor:not-allowed; }
+
+.empty-state { padding:40px 20px;text-align:center;color:var(--muted);font-size:12px; }
+
+@media (max-width:900px) {
+  .two-col,.osint-grid,.persist-layout,.report-layout { grid-template-columns:1fr; }
+  .stat-row { grid-template-columns:1fr 1fr; }
+  .form-grid { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+<div id="toast-container" style="position:fixed;top:1em;right:1em;z-index:9999;pointer-events:none;display:flex;flex-direction:column;gap:8px;"></div>
+<div id="app">
+
+  <!-- Header -->
+  <div id="header">
+    <div class="logo">
+      <div class="logo-icon">VS</div>
+      <div>
+        <div class="logo-text">VoIPScan Pro</div>
+        <div class="logo-sub">Authorized VoIP Assessment Platform</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <span id="continuous-badge" class="continuous-badge">CONTINUOUS</span>
+      <span id="scan-state-badge">IDLE</span>
+      <button id="btn-stop-scan">&#9632; Stop Scan</button>
+      <button id="btn-settings" title="Settings">&#9881;</button>
+    </div>
+  </div>
+
+  <div id="main">
+
+    <!-- Config Panel -->
+    <div id="config-panel">
+      <div class="config-card">
+        <div class="config-card-header">
+          <div class="logo-icon" style="width:36px;height:36px;font-size:14px;">VS</div>
+          <div>
+            <h2>New Scan Configuration</h2>
+            <p>Configure target, call parameters, and scan options before launching</p>
+          </div>
+        </div>
+        <div class="config-body">
+
+          <p class="section-label">Target</p>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Target IP / Range <span class="req">*</span></label>
+              <input id="cfg-target" class="form-input" type="text" placeholder="192.168.1.0/24 or 10.0.0.1">
+            </div>
+            <div class="form-group">
+              <label>SIP Port</label>
+              <input id="cfg-port" class="form-input" type="number" value="5060" min="1" max="65535">
+            </div>
+            <div class="form-group">
+              <label>Extension Range</label>
+              <input id="cfg-ext-range" class="form-input" type="text" value="100-9999" placeholder="100-9999">
+            </div>
+            <div class="form-group">
+              <label>Scope File <span style="color:var(--muted);font-weight:400">(optional &#8212; SHA-256 stored in report)</span></label>
+              <input id="cfg-scope" class="form-input" type="text" placeholder="/path/to/scope.txt">
+            </div>
+          </div>
+
+          <hr class="section-divider">
+          <p class="section-label">Call Parameters</p>
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Ring Number (operator mobile) <span class="req">*</span></label>
+              <input id="cfg-ring-number" class="form-input" type="text" placeholder="+447700900000">
+            </div>
+            <div class="form-group">
+              <label>Caller ID Name</label>
+              <input id="cfg-callerid" class="form-input" type="text" placeholder="Reception">
+            </div>
+            <div class="form-group">
+              <label>Hold Time (seconds)</label>
+              <input id="cfg-hold-time" class="form-input" type="number" value="30" min="1">
+            </div>
+            <div class="form-group">
+              <label>DTMF Sequence</label>
+              <input id="cfg-dtmf" class="form-input" type="text" placeholder="1234#">
+            </div>
+          </div>
+
+          <hr class="section-divider">
+          <p class="section-label">Options</p>
+          <div class="check-grid" style="margin-bottom:16px;">
+            <label class="check-item"><input type="checkbox" id="cfg-record"><span>Record Calls</span></label>
+            <label class="check-item"><input type="checkbox" id="cfg-stun"><span>Use STUN</span></label>
+            <label class="check-item"><input type="checkbox" id="cfg-tls"><span>Use TLS</span></label>
+            <label class="check-item"><input type="checkbox" id="cfg-osint"><span>Run OSINT</span></label>
+            <label class="check-item"><input type="checkbox" id="cfg-ai"><span>AI Auto-Analyse</span></label>
+          </div>
+
+          <hr class="section-divider">
+          <p class="section-label">Scan Mode</p>
+          <div class="scan-mode-group" id="scan-mode-group">
+            <button class="mode-btn active" data-mode="standard">Standard</button>
+            <button class="mode-btn" data-mode="fast">Fast</button>
+            <button class="mode-btn" data-mode="stealth">Stealth</button>
+            <button class="mode-btn" data-mode="continuous">Continuous</button>
+          </div>
+
+          <button id="btn-start-scan">Launch Scan</button>
+          <div id="start-error"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="dashboard" class="hidden">
+      <div id="tab-bar">
+        <button class="tab-btn active" data-tab="scan">Scan</button>
+        <button class="tab-btn" data-tab="osint">OSINT</button>
+        <button class="tab-btn" data-tab="ai">AI Advisor</button>
+        <button class="tab-btn" data-tab="calls">Live Calls <span id="tab-badge-calls" class="tab-badge" style="display:none">0</span></button>
+        <button class="tab-btn" data-tab="persistence">Persistence</button>
+        <button class="tab-btn" data-tab="anomalies">Anomalies <span id="tab-badge-anomalies" class="tab-badge red" style="display:none">0</span></button>
+        <button class="tab-btn" data-tab="report">Report</button>
+      </div>
+
+      <div id="tab-content">
+
+        <!-- SCAN TAB -->
+        <div class="tab-pane active" id="tab-scan">
+          <div class="tab-scroll">
+
+            <div class="phase-tracker">
+              <div class="phase-steps" id="phase-steps">
+                <div class="phase-step" data-phase="discovery"><div class="phase-dot">1</div><div class="phase-name">Discovery</div></div>
+                <div class="phase-step" data-phase="cve"><div class="phase-dot">2</div><div class="phase-name">CVE Probes</div></div>
+                <div class="phase-step" data-phase="enumerate"><div class="phase-dot">3</div><div class="phase-name">Enumerate</div></div>
+                <div class="phase-step" data-phase="cred"><div class="phase-dot">4</div><div class="phase-name">Cred Spray</div></div>
+                <div class="phase-step" data-phase="dial"><div class="phase-dot">5</div><div class="phase-name">Dial Probe</div></div>
+                <div class="phase-step" data-phase="live"><div class="phase-dot">6</div><div class="phase-name">Live Call</div></div>
+              </div>
+              <div id="phase-progress-enum" style="margin-top:8px;font-size:11px;color:var(--muted);display:none;"></div>
+              <div id="phase-progress-spray" style="margin-top:4px;font-size:11px;color:var(--muted);display:none;"></div>
+            </div>
+
+            <div class="stat-row">
+              <div class="stat-card">
+                <div class="stat-label">Hosts Found</div>
+                <div class="stat-value blue" id="stat-hosts">0</div>
+                <div class="stat-sub" id="stat-hosts-sub">scanning...</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Extensions</div>
+                <div class="stat-value green" id="stat-extensions">0</div>
+                <div class="stat-sub">discovered</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Credentials</div>
+                <div class="stat-value red" id="stat-creds">0</div>
+                <div class="stat-sub">captured</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">Findings</div>
+                <div class="stat-value orange" id="stat-findings">0</div>
+                <div class="stat-sub">vulnerabilities</div>
+              </div>
+            </div>
+
+            <div class="two-col">
+              <div class="panel-box">
+                <div class="panel-header">
+                  <span class="panel-title">Discovery</span>
+                  <span class="panel-count" id="discovery-count">0 hosts</span>
+                </div>
+                <div class="panel-body" id="discovery-list"><div class="empty-state">No hosts found yet</div></div>
+              </div>
+              <div class="panel-box">
+                <div class="panel-header">
+                  <span class="panel-title">Findings</span>
+                  <span class="panel-count" id="findings-count">0 items</span>
+                </div>
+                <div class="panel-body" id="findings-list"><div class="empty-state">No findings yet</div></div>
+              </div>
+            </div>
+
+            <div class="matrix-table-wrap">
+              <div class="matrix-header">
+                <span class="panel-title">Attack Matrix</span>
+                <span class="panel-count" id="matrix-count">0 entries</span>
+              </div>
+              <div style="overflow-x:auto;">
+                <table class="matrix-table">
+                  <thead>
+                    <tr>
+                      <th>#</th><th>Host</th><th>Extension</th><th>Attack Vector</th><th>Credentials</th><th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody id="matrix-body">
+                    <tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px;">No data</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div class="calls-section">
+              <div class="calls-header">
+                <span class="panel-title">Live Calls Control Center</span>
+                <div class="launch-bar">
+                  <input id="launch-ext" class="form-input" type="text" placeholder="Extension" style="width:100px;flex:none;">
+                  <input id="launch-target" class="form-input" type="text" placeholder="Target IP" style="width:140px;flex:none;">
+                  <button class="btn primary" id="btn-launch-call">&#9658; Call</button>
+                  <button class="btn danger" id="btn-hangup-all">Hang Up All</button>
+                </div>
+              </div>
+              <div class="call-cards-grid" id="call-cards-scan"><div class="no-calls">No active calls</div></div>
+            </div>
+
+            <div class="event-log-box">
+              <div class="event-log-header">
+                <span class="panel-title">Event Log</span>
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <label class="check-item"><input type="checkbox" id="log-autoscroll" checked><span style="font-size:11px;">Auto-scroll</span></label>
+                  <button class="btn-clear" id="btn-clear-log">Clear</button>
+                </div>
+              </div>
+              <div class="event-log-body" id="event-log"></div>
+            </div>
+
+            <div class="panel-box" style="margin-bottom:18px;">
+              <div class="panel-header"><span class="panel-title">Downloads</span></div>
+              <div style="padding:14px;" class="downloads-row">
+                <a href="/api/download/html" class="dl-btn"><span class="dl-icon">&#128196;</span>HTML Report</a>
+                <a href="/api/download/json" class="dl-btn"><span class="dl-icon">&#128209;</span>JSON Export</a>
+                <a href="/api/download/txt" class="dl-btn"><span class="dl-icon">&#128462;</span>Text Report</a>
+                <a href="/api/download/wav" class="dl-btn"><span class="dl-icon">&#127908;</span>WAV Recording</a>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- OSINT TAB -->
+        <div class="tab-pane" id="tab-osint">
+          <div class="tab-scroll">
+            <div id="osint-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:300px;gap:16px;">
+              <div style="font-size:32px;color:var(--muted);">&#128269;</div>
+              <div style="color:var(--muted);font-size:13px;">OSINT data not yet collected</div>
+              <button class="btn primary" id="btn-run-osint">Run OSINT Now</button>
+            </div>
+            <div id="osint-content" style="display:none;">
+              <div class="osint-grid" style="margin-bottom:14px;">
+                <div class="osint-card">
+                  <div class="panel-header"><span class="panel-title">Risk Score</span></div>
+                  <div class="risk-score-box">
+                    <div class="risk-gauge medium" id="osint-risk-gauge">--</div>
+                    <div>
+                      <div id="osint-risk-label" style="font-size:14px;font-weight:600;">Unknown</div>
+                      <div id="osint-risk-sub" style="font-size:11px;color:var(--muted);margin-top:3px;">No data</div>
+                    </div>
+                  </div>
+                </div>
+                <div class="osint-card">
+                  <div class="panel-header"><span class="panel-title">Target Info</span></div>
+                  <table class="data-table">
+                    <tr><td>IP</td><td id="osint-ip">&#8212;</td></tr>
+                    <tr><td>Country</td><td id="osint-country">&#8212;</td></tr>
+                    <tr><td>Org / ISP</td><td id="osint-org">&#8212;</td></tr>
+                    <tr><td>AS Number</td><td id="osint-asn">&#8212;</td></tr>
+                    <tr><td>Open Ports</td><td id="osint-ports">&#8212;</td></tr>
+                    <tr><td>Services</td><td id="osint-services">&#8212;</td></tr>
+                  </table>
+                </div>
+                <div class="osint-card full">
+                  <div class="panel-header"><span class="panel-title">CVEs</span></div>
+                  <div class="cve-list" id="osint-cves"><span style="color:var(--muted);font-size:12px;">None found</span></div>
+                </div>
+                <div class="osint-card full">
+                  <div class="panel-header"><span class="panel-title">Shodan Banner</span></div>
+                  <div class="osint-banner" id="osint-shodan-banner">&#8212;</div>
+                </div>
+                <div class="osint-card full">
+                  <div class="panel-header"><span class="panel-title">Censys Data</span></div>
+                  <div class="osint-banner" id="osint-censys-data">&#8212;</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- AI ADVISOR TAB -->
+        <div class="tab-pane" id="tab-ai">
+          <div class="tab-scroll">
+            <div class="fuzz-status-bar">
+              <div class="fuzz-status">
+                <div class="fuzz-dot" id="fuzz-dot"></div>
+                <span id="fuzz-status-text">AI Fuzzer: Stopped</span>
+              </div>
+              <div style="display:flex;gap:8px;">
+                <button class="btn success" id="btn-fuzz-start">Start Fuzzer</button>
+                <button class="btn danger" id="btn-fuzz-stop" disabled>Stop Fuzzer</button>
+              </div>
+            </div>
+            <div id="ai-empty" style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:260px;gap:16px;">
+              <div style="font-size:32px;color:var(--muted);">&#129504;</div>
+              <div style="color:var(--muted);font-size:13px;">AI analysis not yet run</div>
+              <button class="btn primary" id="btn-run-ai">Run AI Analysis</button>
+            </div>
+            <div id="ai-content" style="display:none;">
+              <div class="ai-advice-box">
+                <div class="panel-header"><span class="panel-title">Risk Summary</span></div>
+                <div class="ai-narrative" id="ai-narrative">&#8212;</div>
+              </div>
+              <p class="section-label" style="margin-bottom:10px;">Priority Attack Recommendations</p>
+              <div class="ai-rec-list" id="ai-rec-list"></div>
+              <div class="ai-advice-box" style="margin-top:14px;">
+                <div class="panel-header"><span class="panel-title">Client Narrative</span></div>
+                <div class="ai-narrative" id="ai-client-narrative">&#8212;</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- LIVE CALLS TAB -->
+        <div class="tab-pane" id="tab-calls">
+          <div class="tab-scroll">
+            <div style="display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap;">
+              <div class="stat-card" style="flex:1;min-width:130px;">
+                <div class="stat-label">Active</div>
+                <div class="stat-value green" id="calls-stat-active">0</div>
+              </div>
+              <div class="stat-card" style="flex:1;min-width:130px;">
+                <div class="stat-label">Total Dialled</div>
+                <div class="stat-value blue" id="calls-stat-total">0</div>
+              </div>
+              <div class="stat-card" style="flex:1;min-width:130px;">
+                <div class="stat-label">Answered</div>
+                <div class="stat-value orange" id="calls-stat-answered">0</div>
+              </div>
+              <div class="stat-card" style="flex:1;min-width:130px;">
+                <div class="stat-label">Failed</div>
+                <div class="stat-value red" id="calls-stat-failed">0</div>
+              </div>
+            </div>
+            <div class="calls-section">
+              <div class="calls-header">
+                <span class="panel-title">Call Control</span>
+                <div class="launch-bar">
+                  <input id="launch-ext2" class="form-input" type="text" placeholder="Extension" style="width:100px;flex:none;">
+                  <input id="launch-target2" class="form-input" type="text" placeholder="Target IP" style="width:140px;flex:none;">
+                  <button class="btn primary" id="btn-launch-call2">&#9658; Call</button>
+                  <button class="btn danger" id="btn-hangup-all2">Hang Up All</button>
+                </div>
+              </div>
+              <div class="call-cards-grid" id="call-cards-tab"><div class="no-calls">No active calls</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PERSISTENCE TAB -->
+        <div class="tab-pane" id="tab-persistence">
+          <div class="tab-scroll">
+            <div class="persist-layout">
+              <div class="persist-status">
+                <div class="panel-title" style="margin-bottom:14px;">Engine Status</div>
+                <div class="persist-stat-row">
+                  <div class="persist-stat"><span class="persist-stat-label">State</span><span class="persist-stat-val" id="persist-state">Stopped</span></div>
+                  <div class="persist-stat"><span class="persist-stat-label">Current Extension</span><span class="persist-stat-val" id="persist-ext">&#8212;</span></div>
+                  <div class="persist-stat"><span class="persist-stat-label">Dial Attempts</span><span class="persist-stat-val" id="persist-attempts">0</span></div>
+                  <div class="persist-stat"><span class="persist-stat-label">Failures</span><span class="persist-stat-val" id="persist-fails">0</span></div>
+                  <div class="persist-stat"><span class="persist-stat-label">Blocked Extensions</span><span class="persist-stat-val" id="persist-blocked">0</span></div>
+                </div>
+              </div>
+              <div class="persist-control">
+                <div class="panel-title" style="margin-bottom:14px;">Configuration</div>
+                <div class="form-group" style="margin-bottom:12px;">
+                  <label>Extension List (one per line or comma-separated)</label>
+                  <textarea id="persist-ext-list" class="form-input" rows="6" placeholder="100&#10;101&#10;102-199"></textarea>
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                  <label>Redial Interval (seconds)</label>
+                  <input id="persist-interval" class="form-input" type="number" value="60" min="5">
+                </div>
+                <div class="persist-btn-row">
+                  <button class="btn success" id="btn-persist-start">Start Engine</button>
+                  <button class="btn danger" id="btn-persist-stop" disabled>Stop Engine</button>
+                </div>
+              </div>
+            </div>
+            <div class="event-log-box" style="margin-top:14px;">
+              <div class="event-log-header">
+                <span class="panel-title">Persistence Log</span>
+                <button class="btn-clear" id="btn-clear-persist-log">Clear</button>
+              </div>
+              <div class="event-log-body" id="persist-log"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ANOMALIES TAB -->
+        <div class="tab-pane" id="tab-anomalies">
+          <div class="tab-scroll">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+              <span style="font-size:13px;font-weight:600;">Traffic Anomalies</span>
+              <button class="btn" id="btn-clear-anomalies">Clear All</button>
+            </div>
+            <div class="anomaly-list" id="anomaly-list">
+              <div class="anomaly-empty">No anomalies detected</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- REPORT TAB -->
+        <div class="tab-pane" id="tab-report">
+          <div class="tab-scroll">
+            <div class="report-layout" style="margin-bottom:18px;">
+              <div class="osint-card">
+                <div class="panel-header"><span class="panel-title">Risk Score</span></div>
+                <div class="risk-score-large">
+                  <div class="risk-ring medium" id="report-risk-ring">
+                    <div class="risk-num" id="report-risk-num">--</div>
+                    <div class="risk-label" id="report-risk-label">UNKNOWN</div>
+                  </div>
+                  <div style="font-size:11px;color:var(--muted);text-align:center;" id="report-risk-desc">Run a scan to generate risk score</div>
+                </div>
+              </div>
+              <div class="osint-card">
+                <div class="panel-header"><span class="panel-title">Executive Summary</span></div>
+                <div class="exec-summary" id="report-exec-summary">No scan data available. Start a scan to generate the executive summary.</div>
+              </div>
+            </div>
+            <div class="panel-box" style="margin-bottom:14px;">
+              <div class="panel-header"><span class="panel-title">Audio Recording</span></div>
+              <div style="padding:14px;" id="report-audio-section">
+                <span style="color:var(--muted);font-size:12px;">No recording available</span>
+              </div>
+            </div>
+            <div class="panel-box">
+              <div class="panel-header"><span class="panel-title">Download Full Report</span></div>
+              <div style="padding:14px;" class="downloads-row">
+                <a href="/api/download/html" class="dl-btn"><span class="dl-icon">&#128196;</span>HTML Report</a>
+                <a href="/api/download/json" class="dl-btn"><span class="dl-icon">&#128209;</span>JSON Export</a>
+                <a href="/api/download/txt" class="dl-btn"><span class="dl-icon">&#128462;</span>Text Report</a>
+                <a href="/api/download/wav" class="dl-btn"><span class="dl-icon">&#127908;</span>WAV Recording</a>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Settings Modal -->
+<div id="settings-modal">
+  <div class="modal-card">
+    <div class="modal-header">
+      <span class="modal-title">&#9881; Settings &amp; API Keys</span>
+      <button class="modal-close" id="btn-close-settings">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-group">
+        <label>Shodan API Key</label>
+        <input id="set-shodan" class="form-input" type="password" placeholder="Enter Shodan API key">
+      </div>
+      <div class="form-group">
+        <label>Censys API ID</label>
+        <input id="set-censys-id" class="form-input" type="text" placeholder="Censys API ID">
+      </div>
+      <div class="form-group">
+        <label>Censys API Secret</label>
+        <input id="set-censys-secret" class="form-input" type="password" placeholder="Censys API Secret">
+      </div>
+      <div class="form-group">
+        <label>Anthropic API Key</label>
+        <input id="set-anthropic" class="form-input" type="password" placeholder="sk-ant-...">
+      </div>
+      <div class="form-group">
+        <label>AI Model</label>
+        <input id="set-ai-model" class="form-input" type="text" value="claude-opus-4-6" placeholder="claude-opus-4-6">
+      </div>
+      <div class="form-group">
+        <label>User-Agent String</label>
+        <input id="set-useragent" class="form-input" type="text" placeholder="VoIPScan/1.0">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" id="btn-cancel-settings">Cancel</button>
+      <button class="btn primary" id="btn-save-settings">Save Settings</button>
+    </div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// ── XSS escape ─────────────────────────────────────────────────────
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// ── Toast notifications ────────────────────────────────────────────
+function showToast(msg, level='info', ttl=6000) {
+  const colors = { info: 'var(--accent)', warn: 'var(--orange)', error: 'var(--red)' };
+  const border = colors[level] || colors.info;
+  const t = document.createElement('div');
+  t.style.cssText = [
+    'background:var(--panel)',
+    'border:1px solid '+border,
+    'border-left:4px solid '+border,
+    'border-radius:6px',
+    'padding:10px 14px',
+    'font-size:12px',
+    'color:var(--text)',
+    'max-width:340px',
+    'box-shadow:0 4px 12px rgba(0,0,0,0.5)',
+    'pointer-events:auto',
+    'opacity:1',
+    'transition:opacity 0.4s',
+  ].join(';');
+  t.textContent = msg;
+  document.getElementById('toast-container').appendChild(t);
+  const remove = () => { t.style.opacity = '0'; setTimeout(() => t.remove(), 420); };
+  const timer = setTimeout(remove, ttl);
+  t.addEventListener('click', () => { clearTimeout(timer); remove(); });
+}
+
+// ── Target format validation ───────────────────────────────────────
+function validateTarget(t) {
+  if (!t) return false;
+  // IPv6: lenient — must contain a colon and only hex digits/colons/brackets
+  if (t.includes(':')) return /^[0-9a-fA-F:[\]/]+$/.test(t);
+  // CIDR: strip prefix then validate as IPv4
+  const cidrMatch = t.match(/^(.+)\/(\d{1,2})$/);
+  if (cidrMatch) {
+    const prefix = parseInt(cidrMatch[2], 10);
+    if (prefix < 0 || prefix > 32) return false;
+    return isValidIPv4(cidrMatch[1]);
+  }
+  // Plain IPv4
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(t)) return isValidIPv4(t);
+  // Hostname (RFC 1123)
+  return /^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$/.test(t);
+}
+function isValidIPv4(ip) {
+  const parts = ip.split('.');
+  return parts.length === 4 && parts.every(p => {
+    const n = Number(p);
+    return /^\d{1,3}$/.test(p) && n >= 0 && n <= 255;
+  });
+}
+
+// ── Inline field error helper ──────────────────────────────────────
+function showError(msg, selector='#start-error') {
+  const el = document.querySelector(selector);
+  if (!el) return;
+  el.textContent = msg;
+  el.style.display = 'block';
+  clearTimeout(el._errTimer);
+  el._errTimer = setTimeout(() => { el.style.display = 'none'; }, 8000);
+}
+
+// ── Application state ──────────────────────────────────────────────
+const state = {
+  scanning: false,
+  scanMode: 'standard',
+  phase: null,
+  hosts: {},
+  findings: [],
+  calls: {},
+  anomalies: [],
+  matrixRows: {},
+  stats: { hosts:0, extensions:0, creds:0, findings:0 },
+  callStats: { active:0, total:0, answered:0, failed:0 },
+  persist: { running:false, ext:'—', attempts:0, fails:0, blocked:0 },
+  logLines: 0,
+  MAX_LOG: 500,
+  fuzzRunning: false,
+  riskScore: null,
+};
+
+const PHASES = ['discovery','cve','enumerate','cred','dial','live'];
+
+// ── Time helpers ───────────────────────────────────────────────────
+function fmtTime(ts) {
+  return (ts ? new Date(ts) : new Date()).toTimeString().slice(0,8);
+}
+function fmtDuration(startTs) {
+  const sec = Math.floor((Date.now() - startTs) / 1000);
+  return Math.floor(sec/60) + ':' + String(sec%60).padStart(2,'0');
+}
+
+// ── Event log ──────────────────────────────────────────────────────
+function addLog(cat, msg, ts) {
+  const log = document.getElementById('event-log');
+  while (state.logLines >= state.MAX_LOG && log.firstChild) {
+    log.removeChild(log.firstChild); state.logLines--;
+  }
+  const el = document.createElement('div');
+  el.className = 'log-line';
+  el.innerHTML = `<span class="log-time">${esc(fmtTime(ts))}</span><span class="log-cat ${esc(cat)}">${esc(cat.toUpperCase())}</span><span class="log-msg">${esc(msg)}</span>`;
+  log.appendChild(el);
+  state.logLines++;
+  const cb = document.getElementById('log-autoscroll');
+  if (cb && cb.checked) log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('btn-clear-log').addEventListener('click', () => {
+  document.getElementById('event-log').innerHTML = ''; state.logLines = 0;
+});
+
+function addPersistLog(msg, ts) {
+  const log = document.getElementById('persist-log');
+  const el = document.createElement('div');
+  el.className = 'log-line';
+  el.innerHTML = `<span class="log-time">${esc(fmtTime(ts))}</span><span class="log-cat info">PERSIST</span><span class="log-msg">${esc(msg)}</span>`;
+  log.appendChild(el);
+  log.scrollTop = log.scrollHeight;
+}
+
+document.getElementById('btn-clear-persist-log').addEventListener('click', () => {
+  document.getElementById('persist-log').innerHTML = '';
+});
+
+// ── Tab switching ──────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.id === 'tab-' + name));
+}
+document.querySelectorAll('.tab-btn').forEach(btn => btn.addEventListener('click', () => switchTab(btn.dataset.tab)));
+
+// ── Scan mode ──────────────────────────────────────────────────────
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.scanMode = btn.dataset.mode;
+  });
+});
+
+// ── Settings modal ─────────────────────────────────────────────────
+function openSettings() { document.getElementById('settings-modal').classList.add('open'); }
+function closeSettings() { document.getElementById('settings-modal').classList.remove('open'); }
+document.getElementById('btn-settings').addEventListener('click', openSettings);
+document.getElementById('btn-close-settings').addEventListener('click', closeSettings);
+document.getElementById('btn-cancel-settings').addEventListener('click', closeSettings);
+document.getElementById('settings-modal').addEventListener('click', e => { if (e.target === document.getElementById('settings-modal')) closeSettings(); });
+
+document.getElementById('btn-save-settings').addEventListener('click', async () => {
+  const cfg = {
+    shodan_key: document.getElementById('set-shodan').value,
+    censys_id: document.getElementById('set-censys-id').value,
+    censys_secret: document.getElementById('set-censys-secret').value,
+    anthropic_key: document.getElementById('set-anthropic').value,
+    ai_model: document.getElementById('set-ai-model').value,
+    user_agent: document.getElementById('set-useragent').value,
+  };
+  try {
+    await fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(cfg) });
+    addLog('info', 'Settings saved');
+    closeSettings();
+  } catch(e) { addLog('error', 'Failed to save settings: ' + e.message); }
+});
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    if (!r.ok) return;
+    const cfg = await r.json();
+    const fields = { shodan_key:'set-shodan', censys_id:'set-censys-id', censys_secret:'set-censys-secret', anthropic_key:'set-anthropic', ai_model:'set-ai-model', user_agent:'set-useragent' };
+    Object.entries(fields).forEach(([k,id]) => { if (cfg[k]) document.getElementById(id).value = cfg[k]; });
+  } catch(e) {}
+}
+
+// ── Start scan ─────────────────────────────────────────────────────
+document.getElementById('btn-start-scan').addEventListener('click', startScan);
+
+async function startScan() {
+  const targetEl = document.getElementById('cfg-target');
+  const ringEl = document.getElementById('cfg-ring-number');
+  const errEl = document.getElementById('start-error');
+  targetEl.classList.remove('error-field');
+  ringEl.classList.remove('error-field');
+  errEl.style.display = 'none';
+
+  const target = targetEl.value.trim();
+  const ring = ringEl.value.trim();
+  const errs = [];
+  if (!target) { errs.push('Target is required'); targetEl.classList.add('error-field'); }
+  if (!ring)   { errs.push('Ring number is required'); ringEl.classList.add('error-field'); }
+  if (errs.length) { showError(errs.join(' — ')); return; }
+
+  // Client-side target format validation
+  if (!validateTarget(target)) {
+    targetEl.classList.add('error-field');
+    showError('Target format invalid — use IP, CIDR (e.g. 10.0.0.0/24), or hostname');
+    return;
+  }
+
+  const body = {
+    target, ring_number: ring,
+    port: parseInt(document.getElementById('cfg-port').value) || 5060,
+    ext_range: document.getElementById('cfg-ext-range').value.trim() || '100-9999',
+    scope_file: document.getElementById('cfg-scope').value.trim() || null,
+    caller_id: document.getElementById('cfg-callerid').value.trim(),
+    hold_time: parseInt(document.getElementById('cfg-hold-time').value) || 30,
+    dtmf: document.getElementById('cfg-dtmf').value.trim(),
+    record: document.getElementById('cfg-record').checked,
+    use_stun: document.getElementById('cfg-stun').checked,
+    use_tls: document.getElementById('cfg-tls').checked,
+    run_osint: document.getElementById('cfg-osint').checked,
+    ai_analyse: document.getElementById('cfg-ai').checked,
+    scan_mode: state.scanMode,
+  };
+
+  try {
+    const r = await fetch('/api/scan/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+    if (!r.ok) { const t = await r.text(); showError('Error: ' + t); return; }
+    enterDashboard();
+  } catch(e) { showError('Connection error: ' + e.message); }
+}
+
+document.getElementById('btn-stop-scan').addEventListener('click', async () => {
+  try { await fetch('/api/scan/stop', { method:'POST' }); addLog('warn', 'Scan stop requested'); }
+  catch(e) { addLog('error', 'Stop failed: ' + e.message); }
+});
+
+// ── Dashboard state ────────────────────────────────────────────────
+function enterDashboard() {
+  document.getElementById('config-panel').classList.add('hidden');
+  document.getElementById('dashboard').classList.remove('hidden');
+  setScanBadge('running', 'RUNNING');
+  document.getElementById('btn-stop-scan').classList.add('visible');
+  state.scanning = true;
+}
+
+function setScanBadge(cls, text) {
+  const b = document.getElementById('scan-state-badge');
+  b.className = cls; b.textContent = text;
+}
+
+// ── Phase tracker ──────────────────────────────────────────────────
+function updatePhase(phase) {
+  state.phase = phase;
+  const idx = PHASES.indexOf(phase);
+  document.querySelectorAll('.phase-step').forEach((el, i) => {
+    el.classList.remove('done','active');
+    if (i < idx) el.classList.add('done');
+    else if (i === idx) el.classList.add('active');
+  });
+  document.querySelectorAll('.phase-dot').forEach((el, i) => {
+    el.textContent = i < idx ? '\u2713' : String(i+1);
+  });
+  // Show/hide per-phase progress counters
+  const enumEl = document.getElementById('phase-progress-enum');
+  const sprayEl = document.getElementById('phase-progress-spray');
+  if (enumEl) enumEl.style.display = (phase === 'enumerate') ? 'block' : (enumEl.textContent ? 'block' : 'none');
+  if (sprayEl) sprayEl.style.display = (phase === 'cred') ? 'block' : (sprayEl.textContent ? 'block' : 'none');
+}
+
+// ── Stat cards ─────────────────────────────────────────────────────
+function updateStats() {
+  document.getElementById('stat-hosts').textContent = state.stats.hosts;
+  document.getElementById('stat-extensions').textContent = state.stats.extensions;
+  document.getElementById('stat-creds').textContent = state.stats.creds;
+  document.getElementById('stat-findings').textContent = state.stats.findings;
+}
+
+// ── Discovery panel ────────────────────────────────────────────────
+function renderDiscovery() {
+  const list = document.getElementById('discovery-list');
+  const ips = Object.keys(state.hosts);
+  document.getElementById('discovery-count').textContent = ips.length + ' hosts';
+  if (!ips.length) { list.innerHTML = '<div class="empty-state">No hosts found yet</div>'; return; }
+  list.innerHTML = ips.map(ip => {
+    const h = state.hosts[ip];
+    const tags = (h.extensions||[]).map(e => {
+      const hasCred = (h.creds||[]).some(c => c.ext === e);
+      return `<span class="ext-tag${hasCred?' cred':''}">${esc(e)}</span>`;
+    }).join('');
+    return `<div class="host-card">
+      <div class="host-ip">${esc(ip)}${h.port?':'+esc(h.port):''}</div>
+      <div class="host-meta">${esc(h.banner||h.server||'')}</div>
+      ${tags?'<div class="ext-tags">'+tags+'</div>':''}
+    </div>`;
+  }).join('');
+}
+
+// ── Findings panel ─────────────────────────────────────────────────
+function renderFindings() {
+  const list = document.getElementById('findings-list');
+  document.getElementById('findings-count').textContent = state.findings.length + ' items';
+  if (!state.findings.length) { list.innerHTML = '<div class="empty-state">No findings yet</div>'; return; }
+  list.innerHTML = state.findings.map(f => {
+    const sev = (f.severity||'info').toLowerCase();
+    return `<div class="finding-item">
+      <div class="finding-header"><span class="sev-badge ${esc(sev)}">${esc(sev)}</span><span class="finding-title">${esc(f.title||f.type||'Finding')}</span></div>
+      <div class="finding-desc">${esc(f.description||f.desc||'')}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Attack matrix ──────────────────────────────────────────────────
+function renderMatrix() {
+  const tbody = document.getElementById('matrix-body');
+  const rows = Object.values(state.matrixRows);
+  document.getElementById('matrix-count').textContent = rows.length + ' entries';
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px;">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map((r,i) => {
+    const sc = r.status === 'active' ? 'active' : r.status === 'pwned' ? 'pwned' : 'pending';
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${esc(r.host||'—')}</td>
+      <td>${esc(r.extension||'—')}</td>
+      <td>${esc(r.attack_vector||'—')}</td>
+      <td style="font-family:monospace">${esc(r.credentials||'—')}</td>
+      <td><span class="status-dot ${esc(sc)}">${esc(r.status||'pending')}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Call cards ─────────────────────────────────────────────────────
+const callTimers = {};
+
+function renderCallCards() {
+  const calls = Object.values(state.calls);
+  const active = calls.filter(c => c.state === 'active' || c.state === 'ringing');
+
+  const badge = document.getElementById('tab-badge-calls');
+  if (active.length) { badge.textContent = active.length; badge.style.display = 'inline-flex'; }
+  else badge.style.display = 'none';
+
+  state.callStats.active = active.length;
+  document.getElementById('calls-stat-active').textContent = state.callStats.active;
+  document.getElementById('calls-stat-total').textContent = state.callStats.total;
+  document.getElementById('calls-stat-answered').textContent = state.callStats.answered;
+  document.getElementById('calls-stat-failed').textContent = state.callStats.failed;
+
+  const html = calls.length ? calls.map(buildCallCard).join('') : '<div class="no-calls">No active calls</div>';
+  document.getElementById('call-cards-scan').innerHTML = html;
+  document.getElementById('call-cards-tab').innerHTML = html;
+
+  calls.forEach(c => {
+    ['call-cards-scan','call-cards-tab'].forEach(gid => {
+      document.querySelectorAll(`#${gid} canvas[data-cid="${CSS.escape(c.id)}"]`).forEach(cv => drawSparkline(cv, c.rtp_samples||[]));
+    });
+    if (c.state === 'active' && c.answer_time && !callTimers[c.id]) {
+      callTimers[c.id] = setInterval(() => {
+        document.querySelectorAll(`.call-duration[data-cid="${CSS.escape(c.id)}"]`).forEach(el => { el.textContent = fmtDuration(c.answer_time); });
+      }, 1000);
+    }
+    if (c.state !== 'active' && c.state !== 'ringing' && callTimers[c.id]) {
+      clearInterval(callTimers[c.id]); delete callTimers[c.id];
+    }
+  });
+}
+
+function buildCallCard(c) {
+  const st = c.state || 'pending';
+  const dur = c.answer_time ? fmtDuration(c.answer_time) : '—';
+  return `<div class="call-card">
+    <div class="call-card-header">
+      <span class="call-ext">${esc(c.extension||c.ext||'?')}</span>
+      <span class="call-state ${esc(st)}">${esc(st)}</span>
+    </div>
+    <div class="call-meta">${esc(c.target||'')} &#8594; ${esc(c.ring_number||'')}</div>
+    <div class="call-meta">Duration: <span class="call-duration" data-cid="${esc(c.id)}">${esc(dur)}</span></div>
+    <div class="call-rtp">
+      <div class="call-rtp-stats">RTP: ${esc(String(c.rtp_packets!=null?c.rtp_packets:'—'))} pkts / ${esc(c.rtp_rate!=null?c.rtp_rate+'pps':'—')}</div>
+      <canvas class="sparkline" data-cid="${esc(c.id)}" width="80" height="28"></canvas>
+    </div>
+    <div class="call-actions">
+      <button class="btn-hangup" onclick="hangup('${esc(c.id)}')">Hang Up</button>
+    </div>
+  </div>`;
+}
+
+function drawSparkline(canvas, samples) {
+  if (!canvas || !samples.length) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const max = Math.max(...samples, 1);
+  const bw = canvas.width / samples.length;
+  samples.forEach((v, i) => {
+    const bh = (v / max) * canvas.height;
+    ctx.fillStyle = '#3b82f6';
+    ctx.fillRect(i*bw, canvas.height-bh, Math.max(bw-1,1), bh);
+  });
+}
+
+async function hangup(id) {
+  try { await fetch('/api/call/stop/' + encodeURIComponent(id), { method:'POST' }); }
+  catch(e) { addLog('error','Hangup failed: ' + e.message); }
+}
+
+async function hangupAll() {
+  try { await fetch('/api/call/hangup_all', { method:'POST' }); addLog('warn','Hang up all requested'); }
+  catch(e) { addLog('error','Hangup all failed: ' + e.message); }
+}
+
+document.getElementById('btn-hangup-all').addEventListener('click', hangupAll);
+document.getElementById('btn-hangup-all2').addEventListener('click', hangupAll);
+
+function launchCallFrom(extId, targetId) {
+  const ext = document.getElementById(extId).value.trim();
+  const target = document.getElementById(targetId).value.trim();
+  if (!ext || !target) { addLog('warn','Extension and target required'); return; }
+  fetch('/api/call/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ extension:ext, target }) })
+    .then(() => { document.getElementById(extId).value = ''; })
+    .catch(e => addLog('error','Launch call failed: ' + e.message));
+}
+
+document.getElementById('btn-launch-call').addEventListener('click', () => launchCallFrom('launch-ext','launch-target'));
+document.getElementById('btn-launch-call2').addEventListener('click', () => launchCallFrom('launch-ext2','launch-target2'));
+
+// ── Anomalies ──────────────────────────────────────────────────────
+function renderAnomalies() {
+  const list = document.getElementById('anomaly-list');
+  const badge = document.getElementById('tab-badge-anomalies');
+  if (!state.anomalies.length) {
+    list.innerHTML = '<div class="anomaly-empty">No anomalies detected</div>';
+    badge.style.display = 'none'; return;
+  }
+  badge.textContent = state.anomalies.length; badge.style.display = 'inline-flex';
+  list.innerHTML = state.anomalies.map(a => {
+    const sev = (a.severity||'info').toLowerCase();
+    return `<div class="anomaly-item">
+      <div class="anomaly-sev"><span class="sev-badge ${esc(sev)}">${esc(sev)}</span></div>
+      <div class="anomaly-body">
+        <div class="anomaly-title">${esc(a.title||a.type||'Anomaly')}</div>
+        <div class="anomaly-evidence">${esc(a.evidence||a.description||'')}</div>
+        <div class="anomaly-ts">${esc(a.timestamp?fmtTime(a.timestamp):fmtTime())}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+document.getElementById('btn-clear-anomalies').addEventListener('click', () => {
+  state.anomalies = []; renderAnomalies();
+});
+
+// ── OSINT tab ──────────────────────────────────────────────────────
+function renderOsint(data) {
+  state.osintData = data;
+  document.getElementById('osint-empty').style.display = 'none';
+  document.getElementById('osint-content').style.display = 'block';
+
+  const score = data.risk_score || data.risk || 0;
+  const cls = score >= 80 ? 'critical' : score >= 60 ? 'high' : score >= 40 ? 'medium' : 'low';
+  const gauge = document.getElementById('osint-risk-gauge');
+  gauge.textContent = score; gauge.className = 'risk-gauge ' + cls;
+  document.getElementById('osint-risk-label').textContent = cls.charAt(0).toUpperCase() + cls.slice(1);
+  document.getElementById('osint-risk-sub').textContent = 'Score: ' + score + '/100';
+  document.getElementById('osint-ip').textContent = data.ip || '—';
+  document.getElementById('osint-country').textContent = data.country || data.country_name || '—';
+  document.getElementById('osint-org').textContent = data.org || data.isp || '—';
+  document.getElementById('osint-asn').textContent = data.asn || '—';
+  document.getElementById('osint-ports').textContent = (data.ports||[]).join(', ') || '—';
+  document.getElementById('osint-services').textContent = (data.services||data.hostnames||[]).join(', ') || '—';
+
+  const cves = data.cves || data.vulns || [];
+  document.getElementById('osint-cves').innerHTML = cves.length
+    ? cves.map(c => `<span class="cve-tag">${esc(c)}</span>`).join('')
+    : '<span style="color:var(--muted);font-size:12px;">None found</span>';
+
+  document.getElementById('osint-shodan-banner').textContent = data.shodan_banner || data.banner || '—';
+  document.getElementById('osint-censys-data').textContent = typeof data.censys === 'object' ? JSON.stringify(data.censys,null,2) : (data.censys || '—');
+
+  updateReportRisk(score, cls);
+}
+
+document.getElementById('btn-run-osint').addEventListener('click', async () => {
+  const ip = (document.getElementById('cfg-target').value.trim() || 'unknown').split('/')[0];
+  try {
+    const r = await fetch('/api/osint/' + encodeURIComponent(ip));
+    if (r.ok) renderOsint(await r.json());
+    else { addLog('error','OSINT request failed'); showToast('OSINT request failed', 'error'); }
+  } catch(e) { addLog('error','OSINT error: ' + e.message); showToast('OSINT error: ' + e.message, 'error'); }
+});
+
+// ── AI Advisor tab ─────────────────────────────────────────────────
+function renderAi(data) {
+  state.aiData = data;
+  document.getElementById('ai-empty').style.display = 'none';
+  document.getElementById('ai-content').style.display = 'block';
+  document.getElementById('ai-narrative').textContent = data.risk_summary || data.summary || '—';
+  document.getElementById('ai-client-narrative').textContent = data.client_narrative || data.narrative || '—';
+
+  const recs = data.recommendations || data.attacks || [];
+  const recList = document.getElementById('ai-rec-list');
+  if (!recs.length) { recList.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:10px;">No recommendations generated</div>'; return; }
+  recList.innerHTML = recs.map((r,i) => `<div class="ai-rec">
+    <div class="ai-rec-rank">${i+1}</div>
+    <div class="ai-rec-body">
+      <div class="ai-rec-title">${esc(r.title||r.attack||'Recommendation '+(i+1))}</div>
+      <div class="ai-rec-desc">${esc(r.description||r.desc||'')}</div>
+      <div class="ai-rec-conf">Confidence: ${esc(String(r.confidence||r.score||'—'))}</div>
+    </div>
+  </div>`).join('');
+}
+
+document.getElementById('btn-run-ai').addEventListener('click', async () => {
+  try {
+    const r = await fetch('/api/ai/advisor');
+    if (r.ok) renderAi(await r.json());
+    else { addLog('error','AI advisor request failed'); showToast('AI advisor request failed', 'error'); }
+  } catch(e) { addLog('error','AI error: ' + e.message); showToast('AI error: ' + e.message, 'error'); }
+});
+
+// ── AI Fuzzer ──────────────────────────────────────────────────────
+function setFuzzState(running) {
+  state.fuzzRunning = running;
+  document.getElementById('fuzz-dot').className = 'fuzz-dot' + (running ? ' running' : '');
+  document.getElementById('fuzz-status-text').textContent = 'AI Fuzzer: ' + (running ? 'Running' : 'Stopped');
+  document.getElementById('btn-fuzz-start').disabled = running;
+  document.getElementById('btn-fuzz-stop').disabled = !running;
+}
+
+document.getElementById('btn-fuzz-start').addEventListener('click', async () => {
+  try { await fetch('/api/ai/fuzz/start', { method:'POST' }); setFuzzState(true); }
+  catch(e) { addLog('error','Fuzz start failed: ' + e.message); }
+});
+
+document.getElementById('btn-fuzz-stop').addEventListener('click', async () => {
+  try { await fetch('/api/ai/fuzz/stop', { method:'POST' }); setFuzzState(false); }
+  catch(e) { addLog('error','Fuzz stop failed: ' + e.message); }
+});
+
+// ── Persistence tab ────────────────────────────────────────────────
+function updatePersistUI() {
+  const ps = state.persist;
+  const stEl = document.getElementById('persist-state');
+  stEl.textContent = ps.running ? 'Running' : 'Stopped';
+  stEl.style.color = ps.running ? 'var(--green)' : 'var(--muted)';
+  document.getElementById('persist-ext').textContent = ps.ext || '—';
+  document.getElementById('persist-attempts').textContent = ps.attempts || 0;
+  document.getElementById('persist-fails').textContent = ps.fails || 0;
+  document.getElementById('persist-blocked').textContent = ps.blocked || 0;
+  document.getElementById('btn-persist-start').disabled = ps.running;
+  document.getElementById('btn-persist-stop').disabled = !ps.running;
+}
+
+document.getElementById('btn-persist-start').addEventListener('click', async () => {
+  const extList = document.getElementById('persist-ext-list').value.trim();
+  const interval = parseInt(document.getElementById('persist-interval').value) || 60;
+  try {
+    await fetch('/api/persistence/start', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ extensions:extList, interval }) });
+    addLog('info','Persistence engine started');
+  } catch(e) { addLog('error','Persistence start failed: ' + e.message); }
+});
+
+document.getElementById('btn-persist-stop').addEventListener('click', async () => {
+  try { await fetch('/api/persistence/stop', { method:'POST' }); addLog('info','Persistence engine stopped'); }
+  catch(e) { addLog('error','Persistence stop failed: ' + e.message); }
+});
+
+// ── Report tab ─────────────────────────────────────────────────────
+function updateReportRisk(score, cls) {
+  state.riskScore = score;
+  document.getElementById('report-risk-ring').className = 'risk-ring ' + cls;
+  document.getElementById('report-risk-num').textContent = score;
+  document.getElementById('report-risk-label').textContent = cls.toUpperCase();
+  document.getElementById('report-risk-desc').textContent = 'Based on OSINT and scan findings';
+}
+
+function showAudioPlayer() {
+  const section = document.getElementById('report-audio-section');
+  section.innerHTML = `<audio class="audio-player" controls><source src="/api/download/wav" type="audio/wav">Your browser does not support audio.</audio>`;
+}
+
+// ── SSE event dispatcher ───────────────────────────────────────────
+function dispatch(type, data) {
+  switch (type) {
+
+    case 'state':
+      if (data.state === 'running') { enterDashboard(); setScanBadge('running','RUNNING'); state.scanning = true; }
+      else if (data.state === 'done') { setScanBadge('done','DONE'); document.getElementById('btn-stop-scan').classList.remove('visible'); state.scanning = false; }
+      else if (data.state === 'error') { setScanBadge('error','ERROR'); document.getElementById('btn-stop-scan').classList.remove('visible'); state.scanning = false; }
+      else if (data.state === 'idle') { setScanBadge('','IDLE'); document.getElementById('btn-stop-scan').classList.remove('visible'); }
+      break;
+
+    case 'scan.start':
+      enterDashboard(); setScanBadge('running','RUNNING'); state.scanning = true;
+      addLog('info','Scan started: ' + (data.target||''), data.timestamp);
+      if (state.scanMode === 'continuous') document.getElementById('continuous-badge').classList.add('visible');
+      break;
+
+    case 'scan.done':
+      setScanBadge('done','COMPLETE');
+      document.getElementById('btn-stop-scan').classList.remove('visible');
+      state.scanning = false;
+      addLog('success','Scan complete', data.timestamp);
+      PHASES.forEach(p => updatePhase(p));
+      document.querySelectorAll('.phase-step').forEach(el => el.classList.add('done'));
+      if (data.summary) document.getElementById('report-exec-summary').textContent = data.summary;
+      if (data.wav_available) showAudioPlayer();
+      break;
+
+    case 'scan.error':
+      setScanBadge('error','ERROR');
+      document.getElementById('btn-stop-scan').classList.remove('visible');
+      state.scanning = false;
+      addLog('error','Scan error: ' + (data.message||data.error||''), data.timestamp);
+      break;
+
+    case 'scan.cancelled':
+      setScanBadge('','CANCELLED');
+      document.getElementById('btn-stop-scan').classList.remove('visible');
+      state.scanning = false;
+      addLog('warn','Scan cancelled', data.timestamp);
+      break;
+
+    case 'phase.update':
+      updatePhase(data.phase);
+      addLog('info','Phase: ' + (data.phase||'') + (data.message?' — '+data.message:''), data.timestamp);
+      break;
+
+    case 'host.found':
+      if (data.ip && !state.hosts[data.ip]) {
+        state.hosts[data.ip] = { ip:data.ip, port:data.port, banner:data.banner, server:data.server, extensions:[], creds:[] };
+        state.stats.hosts = Object.keys(state.hosts).length;
+        updateStats(); renderDiscovery();
+        addLog('info','Host: '+data.ip+(data.port?':'+data.port:'')+(data.banner?' — '+data.banner:''), data.timestamp);
+      }
+      break;
+
+    case 'extension.found':
+      if (data.ip) {
+        if (!state.hosts[data.ip]) state.hosts[data.ip] = { ip:data.ip, extensions:[], creds:[] };
+        const exts = state.hosts[data.ip].extensions;
+        if (!exts.includes(data.extension)) { exts.push(data.extension); state.stats.extensions++; }
+        state.stats.hosts = Object.keys(state.hosts).length;
+        updateStats(); renderDiscovery();
+      }
+      addLog('info','Extension: '+esc(data.extension)+' @ '+esc(data.ip), data.timestamp);
+      break;
+
+    case 'cred.found':
+      state.stats.creds++;
+      if (data.ip && state.hosts[data.ip]) {
+        state.hosts[data.ip].creds = state.hosts[data.ip].creds || [];
+        state.hosts[data.ip].creds.push({ ext:data.extension, user:data.username, pass:data.password });
+      }
+      updateStats(); renderDiscovery();
+      addLog('success','CRED: '+esc(data.extension)+' user='+esc(data.username)+' pass='+esc(data.password), data.timestamp);
+      break;
+
+    case 'vuln.found':
+      state.findings.push(data); state.stats.findings++;
+      updateStats(); renderFindings();
+      addLog('warn','Vuln: '+esc(data.title||data.type)+' ['+esc(data.severity)+']', data.timestamp);
+      break;
+
+    case 'matrix.update': {
+      const key = (data.host||'')+(data.extension||'');
+      state.matrixRows[key] = { ...state.matrixRows[key], ...data };
+      renderMatrix();
+      break;
+    }
+
+    case 'call.ringing':
+      state.calls[data.call_id] = { id:data.call_id, extension:data.extension, target:data.target, ring_number:data.ring_number, state:'ringing', rtp_samples:[] };
+      state.callStats.total++;
+      renderCallCards();
+      addLog('call','Ringing: '+esc(data.extension), data.timestamp);
+      break;
+
+    case 'call.answered':
+      if (state.calls[data.call_id]) { state.calls[data.call_id].state = 'active'; state.calls[data.call_id].answer_time = Date.now(); state.callStats.answered++; }
+      renderCallCards();
+      addLog('call','Answered: '+esc(data.extension||data.call_id), data.timestamp);
+      break;
+
+    case 'call.ended':
+      if (state.calls[data.call_id]) state.calls[data.call_id].state = 'ended';
+      renderCallCards();
+      addLog('call','Ended: '+esc(data.call_id), data.timestamp);
+      break;
+
+    case 'call.failed':
+      if (state.calls[data.call_id]) { state.calls[data.call_id].state = 'failed'; state.callStats.failed++; }
+      renderCallCards();
+      addLog('error','Call failed: '+esc(data.call_id)+(data.reason?' — '+data.reason:''), data.timestamp);
+      break;
+
+    case 'call.updated':
+      if (state.calls[data.call_id]) Object.assign(state.calls[data.call_id], data);
+      renderCallCards();
+      break;
+
+    case 'multicall.update':
+      if (data.calls && typeof data.calls === 'object') {
+        Object.entries(data.calls).forEach(([id,cd]) => {
+          if (!state.calls[id]) state.calls[id] = { id, rtp_samples:[] };
+          Object.assign(state.calls[id], cd);
+        });
+      }
+      if (data.stats) Object.assign(state.callStats, data.stats);
+      renderCallCards();
+      break;
+
+    case 'rtp.update':
+      if (data.call_id && state.calls[data.call_id]) {
+        const c = state.calls[data.call_id];
+        c.rtp_packets = data.packets; c.rtp_rate = data.rate;
+        c.rtp_samples = c.rtp_samples || [];
+        c.rtp_samples.push(data.rate||0);
+        if (c.rtp_samples.length > 20) c.rtp_samples.shift();
+        ['call-cards-scan','call-cards-tab'].forEach(gid => {
+          document.querySelectorAll(`#${gid} canvas[data-cid="${CSS.escape(data.call_id)}"]`).forEach(cv => drawSparkline(cv, c.rtp_samples));
+        });
+      }
+      break;
+
+    case 'anomaly.detected':
+      state.anomalies.unshift({ ...data, timestamp:data.timestamp||new Date().toISOString() });
+      renderAnomalies();
+      addLog('warn','Anomaly ['+esc(data.severity)+']: '+esc(data.title||data.type), data.timestamp);
+      break;
+
+    case 'osint.complete':
+      renderOsint(data);
+      addLog('osint','OSINT complete for '+esc(data.ip||''), data.timestamp);
+      break;
+
+    case 'ai.advice_ready':
+      renderAi(data);
+      addLog('ai','AI analysis ready', data.timestamp);
+      break;
+
+    case 'stun.discovered':
+      addLog('info','STUN: external IP = '+esc(data.external_ip||''), data.timestamp);
+      break;
+
+    case 'ami.success':
+      addLog('success','AMI: '+esc(data.message||'Success'), data.timestamp);
+      break;
+
+    case 'ami.attempt':
+      addLog('info','AMI attempt: '+esc(data.message||''), data.timestamp);
+      break;
+
+    case 'continuous.started':
+      document.getElementById('continuous-badge').classList.add('visible');
+      addLog('info','Continuous scan started', data.timestamp);
+      break;
+
+    case 'continuous.round_start':
+      addLog('info','Continuous round #'+esc(String(data.round||'')), data.timestamp);
+      break;
+
+    case 'log':
+      addLog(data.level||data.category||'info', data.message||data.msg||'', data.timestamp);
+      break;
+
+    case 'persistence.started':
+      state.persist.running = true; updatePersistUI();
+      addPersistLog('Engine started', data.timestamp);
+      break;
+
+    case 'persistence.dialling':
+      state.persist.ext = data.extension||'—';
+      state.persist.attempts = (state.persist.attempts||0) + 1;
+      updatePersistUI();
+      addPersistLog('Dialling: '+(data.extension||''), data.timestamp);
+      break;
+
+    case 'persistence.redial':
+      addPersistLog('Redial: '+esc(data.extension||'')+(data.reason?' — '+data.reason:''), data.timestamp);
+      break;
+
+    case 'persistence.ext_blocked':
+      state.persist.blocked = (state.persist.blocked||0) + 1;
+      state.persist.fails = (state.persist.fails||0) + 1;
+      updatePersistUI();
+      addPersistLog('Blocked: '+esc(data.extension||''), data.timestamp);
+      break;
+
+    case 'persistence.all_blocked':
+      state.persist.running = false; updatePersistUI();
+      addPersistLog('All extensions blocked — engine stopped', data.timestamp);
+      break;
+
+    case 'enum.progress': {
+      const ep = document.getElementById('phase-progress-enum');
+      if (ep) ep.textContent = `Enum: ${data.found??0} found / ${data.total??0} probed • ${data.anon??0} anon • ${data.auth_required??0} auth`;
+      addLog('info', `Enum ${esc(data.host)}: ${data.found??0}/${data.total??0} probed, ${data.anon??0} anon`, data.timestamp);
+      break;
+    }
+
+    case 'spray.progress': {
+      const sp = document.getElementById('phase-progress-spray');
+      if (sp) sp.textContent = `Spray: ${data.creds_found??0} creds found / ${data.creds_attempted??0} attempted on ${data.extensions_tried??0} ext(s)`;
+      addLog('info', `Spray ${esc(data.host)}: ${data.creds_found??0} creds found of ${data.creds_attempted??0} tried`, data.timestamp);
+      break;
+    }
+
+    default:
+      addLog('info','['+esc(type)+'] '+JSON.stringify(data).slice(0,200));
+  }
+}
+
+// ── SSE with exponential backoff ───────────────────────────────────
+let sseSource = null;
+let sseDelay = 1000;
+
+const SSE_EVENTS = [
+  'state','scan.start','scan.done','scan.error','scan.cancelled',
+  'phase.update','host.found','extension.found','cred.found','vuln.found',
+  'matrix.update','call.ringing','call.answered','call.ended','call.failed',
+  'call.updated','multicall.update','rtp.update','anomaly.detected',
+  'osint.complete','ai.advice_ready','stun.discovered','ami.success',
+  'ami.attempt','continuous.started','continuous.round_start','log',
+  'persistence.started','persistence.dialling','persistence.redial',
+  'persistence.ext_blocked','persistence.all_blocked',
+  'enum.progress','spray.progress'
+];
+
+function connectSSE() {
+  if (sseSource) { sseSource.close(); sseSource = null; }
+  try {
+    sseSource = new EventSource('/api/events');
+    sseSource.onopen = () => {
+      if (sseDelay > 1000) showToast('Event stream reconnected', 'info', 3000);
+      sseDelay = 1000; addLog('info','Event stream connected');
+    };
+    sseSource.onmessage = e => {
+      try { const m = JSON.parse(e.data); dispatch(m.type||m.event, m.data||m); } catch(_) {}
+    };
+    SSE_EVENTS.forEach(t => {
+      sseSource.addEventListener(t, e => {
+        try { dispatch(t, JSON.parse(e.data)); } catch(_) { dispatch(t, { message:e.data }); }
+      });
+    });
+    sseSource.onerror = () => {
+      sseSource.close(); sseSource = null;
+      addLog('error','Stream disconnected — retry in '+(sseDelay/1000)+'s');
+      showToast('Event stream disconnected — reconnecting...', 'warn', 4000);
+      setTimeout(connectSSE, sseDelay);
+      sseDelay = Math.min(sseDelay * 2, 30000);
+    };
+  } catch(e) {
+    addLog('error','SSE init error: ' + e.message);
+    setTimeout(connectSSE, sseDelay);
+    sseDelay = Math.min(sseDelay * 2, 30000);
+  }
+}
+
+// ── Startup polling ────────────────────────────────────────────────
+async function pollFuzzStatus() {
+  try {
+    const r = await fetch('/api/ai/fuzz/status');
+    if (r.ok) { const d = await r.json(); setFuzzState(d.running||false); }
+  } catch(_) {}
+}
+
+async function pollPersistStatus() {
+  try {
+    const r = await fetch('/api/persistence/status');
+    if (r.ok) {
+      const d = await r.json();
+      Object.assign(state.persist, { running:d.running||false, ext:d.current_extension||'—', attempts:d.attempts||0, fails:d.fail_count||0, blocked:d.blocked_count||0 });
+      updatePersistUI();
+    }
+  } catch(_) {}
+}
+
+async function pollRiskScore() {
+  try {
+    const r = await fetch('/api/risk-score');
+    if (r.ok) {
+      const d = await r.json();
+      const score = d.score || 0;
+      const cls = score >= 80 ? 'critical' : score >= 60 ? 'high' : score >= 40 ? 'medium' : 'low';
+      updateReportRisk(score, cls);
+    }
+  } catch(_) {}
+}
+
+async function pollStatus() {
+  try {
+    const r = await fetch('/api/status');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.state === 'running' || d.state === 'done') {
+      enterDashboard();
+      setScanBadge(d.state === 'running' ? 'running' : 'done', d.state === 'running' ? 'RUNNING' : 'COMPLETE');
+      if (d.stats) { Object.assign(state.stats, d.stats); updateStats(); }
+      if (d.phase) updatePhase(d.phase);
+      if (d.scan_mode) state.scanMode = d.scan_mode;
+    }
+    const cr = await fetch('/api/calls');
+    if (cr.ok) {
+      const calls = await cr.json();
+      if (Array.isArray(calls)) { calls.forEach(c => { state.calls[c.id||c.call_id] = { ...c, rtp_samples:[] }; }); renderCallCards(); }
+    }
+    const ar = await fetch('/api/anomalies');
+    if (ar.ok) {
+      const anoms = await ar.json();
+      if (Array.isArray(anoms)) { state.anomalies = anoms; renderAnomalies(); }
+    }
+  } catch(_) {}
+}
+
+// ── Init ───────────────────────────────────────────────────────────
+(async function init() {
+  await loadConfig();
+  await pollStatus();
+  await pollFuzzStatus();
+  await pollPersistStatus();
+  await pollRiskScore();
+  connectSSE();
+  setInterval(async () => { await pollPersistStatus(); await pollRiskScore(); await pollFuzzStatus(); }, 30000);
+  setInterval(() => { if (Object.keys(state.calls).length) renderCallCards(); }, 5000);
+})();
+</script>
+</body>
+</html>

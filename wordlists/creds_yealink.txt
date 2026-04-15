@@ -1,0 +1,9 @@
+# Yealink phone / T-series default credentials
+admin:admin
+admin:0000
+admin:1234
+var:admin
+user:user
+admin:
+guest:guest
+yealink:yealink

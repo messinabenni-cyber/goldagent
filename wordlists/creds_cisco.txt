@@ -1,0 +1,19 @@
+# Cisco UC / IP Phone / CUCM / CME default credentials
+# Sources: vendor docs, Cisco security advisories, published pentest writeups
+admin:cisco
+cisco:cisco
+cisco:
+admin:admin
+ccmadministrator:ccmadministrator
+ccmadmin:ccmadmin
+administrator:cisco
+Administrator:Administrator
+root:cisco
+enable:cisco
+telnet:cisco
+user:cisco
+User:User
+admin:c1sc0
+admin:Cisco123
+support:support
+voice:voice

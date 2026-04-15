@@ -1,0 +1,10 @@
+# Grandstream UCM / GXP / HT / DP series default credentials
+admin:admin
+user:123
+admin:123
+user:user
+operator:operator
+grandstream:grandstream
+admin:password
+superadmin:superadmin
+manager:manager
