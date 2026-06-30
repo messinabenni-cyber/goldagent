@@ -651,10 +651,12 @@ def main() -> int:
                         "wordlists", "extensions_priority.txt"
                     )
                     if os.path.exists(prio_path):
-                        prio_list = [
-                            e for e in enumeration.expand_ext_range(f"file:{prio_path}")
-                            if e not in seen_exts
-                        ]
+                        with open(prio_path) as _pf:
+                            prio_list = [
+                                ln.strip() for ln in _pf
+                                if ln.strip() and not ln.startswith("#")
+                                and ln.strip() not in seen_exts
+                            ]
                         _info(f"Priority sweep: {len(prio_list)} common extensions "
                               f"({h.fingerprint} platform)...", col)
                         prog = Progress("Priority sweep", len(prio_list), col)
