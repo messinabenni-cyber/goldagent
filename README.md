@@ -1,85 +1,88 @@
-# VoIP Pentest Scanner
+# voip_scan
 
-A VoIP network security assessment tool for authorized penetration testing.
-Discovers SIP/VoIP systems on a network, enumerates extensions, tests for
-weak/default credentials, probes for anonymous calling, and optionally places
-a proof-of-concept outbound call to demonstrate exposure to the client.
+Minimal VoIP penetration testing scanner, tuned for **FreePBX / Asterisk /
+Grandstream** engagements on internet-facing targets.
 
-## Authorization
+One CLI. One HTML report. One job: prove the toll-fraud risk.
 
-**This tool may only be used on networks and systems you own or have explicit
-written authorization to test.** Unauthorized scanning, credential testing,
-or call placement is illegal in most jurisdictions (CFAA, Computer Misuse
-Act, etc.). The tool prints an authorization prompt on launch and logs the
-operator's acknowledgement into the report — use `--scope-file` to record the
-signed scope of work for the engagement.
-
-## What it checks
-
-| Check | Purpose |
-|---|---|
-| Host/port discovery | Finds hosts listening on SIP (5060/5061 UDP+TCP), IAX2 (4569), H.323 (1720), Skinny (2000), MGCP (2427) |
-| SIP OPTIONS probe | Identifies PBX software + version from `Server` / `User-Agent` headers |
-| Extension enumeration | Uses REGISTER/INVITE response codes (401 vs 404) to list valid extensions |
-| Anonymous INVITE | Checks whether the PBX accepts calls from unauthenticated peers |
-| Credential spraying | Tests extensions against a default-credentials list (admin/admin, 1000/1000, etc.) |
-| Open management ports | Detects exposed FreePBX/Asterisk Manager/web admin |
-| Call proof-of-concept | With explicit `--call-test` flag, places a SIP INVITE to a number you control to prove outbound toll-fraud risk |
-| Report | Generates HTML + JSON report with findings, severity, evidence, remediation |
+> **Use only on systems you own or are explicitly authorised to test.**
+> A signed scope-of-work is required before any intrusive action.
 
 ## Install
 
-```
-python3 -m venv venv
-source venv/bin/activate
+```bash
 pip install -r requirements.txt
 ```
 
-No root required for SIP probing (uses unprivileged UDP sockets).
-Host sweep uses TCP connect — also unprivileged.
+`cryptography` is the only dependency, and only needed for SRTP testing —
+plain RTP scans work without it.
 
-## Usage
+## Quick start
 
-```
-# Passive discovery only (safe, OPTIONS only, no auth attempts)
-python3 voip_scan.py --target 192.168.1.0/24 --discover
+```bash
+# Discovery only (safe, default)
+python3.12 voip_scan.py --target 1.2.3.4
 
-# Full audit without call placement
-python3 voip_scan.py --target 192.168.1.0/24 --full --scope-file scope.txt
-
-# Full audit + proof-of-concept call to a number YOU control
-python3 voip_scan.py --target 10.0.0.50 --full \
-    --call-test --call-to 15551234567 --call-from 1000 \
-    --scope-file scope.txt --report-dir reports/acme
-
-# Enumerate extensions on a known PBX
-python3 voip_scan.py --target 10.0.0.50 --enum-extensions \
-    --ext-range 1000-2000
+# Full external pentest with toll-fraud PoC
+python3.12 voip_scan.py --target 1.2.3.0/24 \
+    --scope-file sow.pdf \
+    --full \
+    --call-test --call-to +447900900900 --call-dry-run
 ```
 
-### Key flags
+Outputs land in `reports/<timestamp>/`:
+- `report.html` — open in a browser, print to PDF for clients
+- `report.json` — same data, machine-readable
+- `traffic.log` — every SIP packet sent and received
 
-- `--target`  Single IP, CIDR, or hostname
-- `--discover`  Host+port sweep only (safest)
-- `--enum-extensions`  REGISTER/INVITE extension enumeration
-- `--test-creds`  Try default credentials against discovered extensions
-- `--call-test`  Attempt outbound call (requires `--call-to`, `--call-from`)
-- `--full`  All checks EXCEPT call-test (must be opted-in explicitly)
-- `--scope-file path`  Path to signed authorization/scope document; hash is recorded in report
-- `--report-dir dir`  Where to write findings (default `./reports/<timestamp>/`)
-- `--rate N`  Max packets per second (default 50; tune to avoid DoS-like impact)
-- `--timeout N`  Socket timeout seconds (default 3)
+## What it tests
 
-## Safety
+| Phase            | Detect                                                   |
+|------------------|----------------------------------------------------------|
+| Discovery        | Open SIP/HTTP/AMI ports, fingerprint PBX vendor          |
+| HTTP probes      | Exposed FreePBX admin, UCP, Asterisk HTTP, Grandstream UI |
+| AMI attack       | Default credentials on TCP/5038 (FreePBX/Asterisk/UCM)   |
+| Extension enum   | REGISTER probe + INVITE acceptance check                  |
+| Credential spray | Common defaults + Grandstream-specific list, with lockout guard |
+| Call PoC         | Toll-fraud demonstration — INVITE → 200 OK → ACK → BYE   |
 
-- Rate-limited by default
-- Call test requires BOTH `--call-test` AND a `--call-to` number to avoid accidental dialing
-- Call test ACKs and immediately sends BYE — no audio streamed, no ring-through
-- Authorization prompt must be answered `yes` interactively unless `--i-have-authorization` is passed and a `--scope-file` is supplied
-- Never tests credentials without `--test-creds`
-- Writes ALL outbound SIP traffic to `traffic.log` inside the report dir for post-engagement review
+The call PoC supports SRTP offer (to detect downgrade), SIP-INFO DTMF (to
+traverse IVRs), source-IP/port binding (for multi-NIC hosts), and identity
+header spoofing (PAI / Diversion / Privacy / Remote-Party-ID / display name)
+— all the primitives a strong toll-fraud demonstration needs.
 
-## Scope-of-work template
+## Authorisation
 
-See `scope.template.txt` for a minimal authorization-to-test template you
-should have the client countersign before running anything beyond `--discover`.
+```
+--scope-file sow.pdf          # SHA-256 of the file is logged in the report
+--operator "Your Name"        # Logged in the report
+--i-have-authorization        # Skip the interactive y/n prompt
+```
+
+Every intrusive flag (`--enum`, `--spray`, `--call-test`, `--ami-attack`,
+`--full`) requires either a scope file or the interactive prompt.
+
+## Layout
+
+```
+voip_scan.py            CLI entry point — the only thing you run
+scanner/
+  sip.py                SIP build/parse, digest auth, identity headers
+  discovery.py          Host + port + SIP fingerprint
+  enumeration.py        Extension enum
+  auth.py               Credential spray with lockout guard
+  call.py               Toll-fraud PoC + SRTP + SIP-INFO DTMF
+  ami.py                Asterisk Manager Interface attacks
+  http_probes.py        FreePBX / Asterisk / Grandstream web probes
+  rtp.py                SDP parse (IPv4 + IPv6)
+  srtp.py               SDES SRTP (optional, needs cryptography)
+  dtmf.py               SIP-INFO DTMF
+  report.py             HTML + JSON report
+  utils.py              Helpers
+wordlists/
+  extensions.txt        Common extensions
+  credentials.txt       Common defaults
+  grandstream.txt       Grandstream-specific
+tests/
+  ...                   pytest test suite
+```
