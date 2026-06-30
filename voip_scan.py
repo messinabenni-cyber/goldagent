@@ -220,6 +220,8 @@ def parse_args() -> argparse.Namespace:
                    help="Remote-Party-ID header (Cisco/legacy equivalent of PAI)")
     c.add_argument("--srtp", choices=["off", "offer", "require"], default="off",
                    help="Media-plane SRTP policy")
+    c.add_argument("--call-duration", type=float, default=60.0, metavar="SECS",
+                   help="Seconds to hold the call before sending BYE (default 60)")
     c.add_argument("--call-dtmf",
                    help='DTMF sequence after answer (e.g. "1p500#"; pN = N-ms pause)')
     c.add_argument("--discover-prefix", action="store_true",
@@ -1067,6 +1069,7 @@ def main() -> int:
                 port=args.port,
                 username=username, password=password,
                 timeout=args.timeout, dry_run=args.call_dry_run,
+                call_duration=0.0 if args.call_dry_run else args.call_duration,
                 traffic_log=traffic_log,
                 pai=args.pai, diversion=args.diversion,
                 privacy=args.privacy, remote_party_id=args.remote_party_id,

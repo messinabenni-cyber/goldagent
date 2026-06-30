@@ -64,6 +64,7 @@ def place_call(
     timeout: float = 5.0,
     dry_run: bool = False,
     max_wait: float = 10.0,
+    call_duration: float = 0.0,   # seconds to hold before BYE (0 = immediate)
     traffic_log=None,
     # Identity / spoof primitives
     pai: str | None = None,
@@ -278,6 +279,11 @@ def place_call(
                 send(ack)
                 trace.append("> ACK")
 
+                if call_duration > 0:
+                    hold_s = max(0.0, min(call_duration, 3600.0))
+                    trace.append(f"* Call established — holding {hold_s:.0f}s then BYE")
+                    time.sleep(hold_s)
+
                 dtmf_sent: list[str] = []
                 bye_cseq = ack_cseq + 1
                 if dtmf_digits:
@@ -348,7 +354,8 @@ def place_call(
     if success and dry_run:
         evidence += " (dry-run: dialplan engaged at provisional)"
     elif success:
-        evidence += " (200 OK — call established; torn down with BYE)"
+        held = f"; held {call_duration:.0f}s" if call_duration > 0 else "; immediate"
+        evidence += f" (200 OK — call established{held} BYE)"
     if srtp_state != "off":
         evidence += f" [srtp={srtp_state}]"
 
