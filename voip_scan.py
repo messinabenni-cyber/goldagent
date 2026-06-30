@@ -17,12 +17,20 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import random
 import sys
 import time
 from dataclasses import asdict
 
-from scanner import ami, auth, call, cve, discovery, enumeration, http_probes, report
+from scanner import ami, auth, call, discovery, enumeration, http_probes, report
 from scanner.utils import Colours, Progress, TrafficLog, hash_file
+
+try:
+    from scanner import cve as cve_module
+    _CVE_AVAILABLE = True
+except ImportError:
+    cve_module = None  # type: ignore[assignment]
+    _CVE_AVAILABLE = False
 
 # Mode preset definitions
 _MODE_PRESETS: dict[str, dict] = {
@@ -47,7 +55,7 @@ BANNER = r"""
     \ \/ / (_) | ||  __/   ___) | (_| (_| | | | | | | |  __/ |
      \__/ \___/___|_|     |____/ \___\__,_|_| |_|_| |_|\___|_|
 
-  v4.0 — FreePBX · Asterisk · Grandstream · 3CX  |  Authorised use only
+  v4.0 — FreePBX / Asterisk / Grandstream / 3CX  |  Elite Auto-Mode
 """
 
 # ---------------------------------------------------------------------------
@@ -80,6 +88,12 @@ def _err(msg: str, col: Colours) -> None:
 def _finding(sev: str, msg: str, col: Colours) -> None:
     tag = f"[{sev.upper():8}]"
     print(f"  {col.for_severity(sev)}{tag}{col.RESET} {msg}")
+
+
+def _jitter_sleep(jitter: float) -> None:
+    """Sleep for a random duration between 0 and jitter seconds."""
+    if jitter > 0.0:
+        time.sleep(random.uniform(0.0, jitter))
 
 
 # ---------------------------------------------------------------------------
@@ -135,9 +149,9 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "ONE-CLICK FULL AUDIT:\n"
-            "  %(prog)s --target 10.0.0.1 --full --call-test --call-to +447900900900\n\n"
-            "Checks run with --full:\n"
-            "  discovery · HTTP probes · AMI brute-force · Asterisk HTTP API\n"
+            "  %(prog)s --target 10.0.0.1 --auto --call-to +447900900900 --i-have-authorization\n\n"
+            "Checks run with --auto / --full:\n"
+            "  discovery · HTTP probes · CVE scan · AMI brute-force · Asterisk HTTP API\n"
             "  extension enumeration · credential spray · SRTP downgrade\n"
             "  CVE-2021-37748 (Grandstream) · FreePBX REST API · rawman\n\n"
             "Add --call-test --call-to <number> to demonstrate live toll fraud."
@@ -154,15 +168,16 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--auto", action="store_true",
                    help="One-command full audit: enables --full + CVE scan + stealth "
-                        "mode + STUN. The most comprehensive single flag. "
-                        "Add --call-to to also demonstrate live toll fraud. "
+                        "mode + STUN + AMI + prefix discovery. The most comprehensive "
+                        "single flag. Add --call-to to also demonstrate live toll fraud. "
                         "Requires --i-have-authorization.")
 
     g = p.add_argument_group("Checks (default: discover only)")
     g.add_argument("--full", action="store_true",
                    help="Run all checks: enum + spray + ami-attack + HTTP probes + "
                         "CVE scan + Asterisk HTTP API. Automatically enables --stun "
-                        "auto and --discover-prefix when --call-to is provided.")
+                        "auto and --discover-prefix when --call-to is provided. "
+                        "Alias for --auto.")
     g.add_argument("--enum", action="store_true",
                    help="Enumerate extensions via REGISTER+INVITE")
     g.add_argument("--ext-range",
@@ -207,6 +222,10 @@ def parse_args() -> argparse.Namespace:
     c.add_argument("--discover-prefix", action="store_true",
                    help="Auto-discover dial-plan prefix (9, 0, +, etc.) before full call test. "
                         "Enabled automatically with --full when --call-to is set.")
+    c.add_argument("--call-to-auto", action="store_true",
+                   help="Use the AMI-discovered first extension as the from-number and try "
+                        "a call to --call-to to show dialplan routing. "
+                        "Requires --call-to for the actual destination number.")
 
     t = p.add_argument_group("Tuning")
     t.add_argument("--mode", choices=["fast", "standard", "stealth"],
@@ -219,6 +238,10 @@ def parse_args() -> argparse.Namespace:
                    help="Socket timeout in seconds (default: from --mode)")
     t.add_argument("--workers", type=int, default=None,
                    help="Parallel workers for sweeps (default: from --mode)")
+    t.add_argument("--jitter", type=float, default=None,
+                   help="Random per-request sleep: 0 to JITTER seconds. "
+                        "Default: 0.0 for fast/standard, 0.15 for stealth. "
+                        "In stealth mode, a minimum of 0.05s jitter is always applied.")
     t.add_argument("--port", type=int, default=5060,
                    help="SIP port (default 5060)")
     t.add_argument("--ami-port", type=int, default=5038,
@@ -269,14 +292,27 @@ def main() -> int:
 
     col = Colours(force=False if args.no_color else None)
 
+    # --full is an alias for --auto (backwards compat)
+    if args.full and not args.auto:
+        args.auto = True
+
     # --auto: one-command maximum-depth audit
     if args.auto:
         args.full = True
+        args.ami_attack = True
         if args.mode == "standard":
             args.mode = "stealth"
+        if not args.stun:
+            args.stun = "auto"
+        if not args.discover_prefix:
+            args.discover_prefix = True
+        # Auto-enable call test when --call-to is provided
+        if args.call_to and not args.call_test:
+            args.call_test = True
         if not args.i_have_authorization:
             _err("--auto requires --i-have-authorization", col)
             return 2
+        _info("AUTO mode — hyper-intelligent scan, all checks enabled", col)
 
     # --full expands into constituent checks
     if args.full:
@@ -298,10 +334,26 @@ def main() -> int:
     if args.workers is None:
         args.workers = preset["workers"]
 
+    # Jitter: apply defaults based on mode, then enforce stealth minimum
+    if args.jitter is None:
+        if args.mode == "stealth":
+            args.jitter = 0.15
+        else:
+            args.jitter = 0.0
+    elif args.mode == "stealth":
+        # Stealth mode enforces a minimum of 0.05s jitter
+        args.jitter = max(args.jitter, 0.05)
+
     _info(f"Mode: {col.BOLD}{args.mode}{col.RESET} — {preset['desc']}", col)
+    if args.jitter > 0.0:
+        _info(f"Jitter: {args.jitter:.2f}s per-request random sleep enabled", col)
 
     if args.call_test and not args.call_to:
         _err("--call-test requires --call-to (a number YOU control)", col)
+        return 2
+
+    if args.call_to_auto and not args.call_to:
+        _err("--call-to-auto requires --call-to (destination number)", col)
         return 2
 
     source_port_range = _parse_port_range(args.source_port_range)
@@ -373,6 +425,7 @@ def main() -> int:
 
         tcp_ports = sorted({p["port"] for p in h.open_ports if p["proto"] == "tcp"})
         if tcp_ports:
+            _jitter_sleep(args.jitter)
             findings = http_probes.run_all(h.ip, tcp_ports, timeout=args.timeout)
             hr["http_findings"] = [
                 {"name": f.name, "severity": f.severity, "target": f.target,
@@ -398,29 +451,34 @@ def main() -> int:
         sip_port = args.port
 
         sip_server_banner = sip_info.get("server", "")
-        cve_results = cve.check_all(
-            h.ip,
-            tcp_ports=tcp_ports,
-            fingerprint=h.fingerprint,
-            sip_server=sip_server_banner,
-            sip_port=sip_port,
-            timeout=args.timeout,
-        )
-        hr["cve_findings"] = [
-            {
-                "cve_id": r.cve_id, "platform": r.platform,
-                "severity": r.severity, "host": r.host, "port": r.port,
-                "title": r.title, "evidence": r.evidence,
-                "remediation": r.remediation,
-                "affected_version": r.affected_version,
-            }
-            for r in cve_results
-        ]
-        if cve_results:
-            for r in cve_results:
-                _finding(r.severity, f"{r.cve_id} — {r.title}", col)
+
+        if _CVE_AVAILABLE:
+            _jitter_sleep(args.jitter)
+            cve_results = cve_module.check_all(
+                h.ip,
+                tcp_ports=tcp_ports,
+                fingerprint=h.fingerprint,
+                sip_server=sip_server_banner,
+                sip_port=sip_port,
+                timeout=args.timeout,
+            )
+            hr["cve_findings"] = [
+                {
+                    "cve_id": r.cve_id, "platform": r.platform,
+                    "severity": r.severity, "host": r.host, "port": r.port,
+                    "title": r.title, "evidence": r.evidence,
+                    "remediation": r.remediation,
+                    "affected_version": r.affected_version,
+                }
+                for r in cve_results
+            ]
+            if cve_results:
+                for r in cve_results:
+                    _finding(r.severity, f"{r.cve_id} — {r.title}", col)
+            else:
+                _info("No CVE/config findings on this host.", col)
         else:
-            _info("No CVE/config findings on this host.", col)
+            _warn("CVE module not available — skipping CVE scan.", col)
 
         if h.sip:
             sip_srv = h.sip.get("server", "")
@@ -438,6 +496,7 @@ def main() -> int:
             ami_open = any(p["service"] == "Asterisk-AMI" for p in h.open_ports)
             if ami_open:
                 _info(f"Trying AMI default credentials on TCP/{args.ami_port}...", col)
+                _jitter_sleep(args.jitter)
                 ami_res = ami.attack(h.ip, port=args.ami_port,
                                      timeout=args.timeout,
                                      traffic_log=traffic_log)
@@ -448,6 +507,54 @@ def main() -> int:
                              f"({len(ami_res.extensions)} extensions, "
                              f"{len(ami_res.voicemail_boxes)} voicemail boxes dumped)",
                              col)
+
+                    # Phase 3 bonus: try AMI originate as an alternative toll-fraud PoC
+                    if args.call_test and args.call_to:
+                        # Determine from-extension: prefer first AMI-dumped ext
+                        ami_exts = ami_res.extensions or []
+                        originate_from = args.call_from or (ami_exts[0] if ami_exts else "1000")
+                        _info(
+                            f"AMI originate PoC: {col.BOLD}{originate_from}{col.RESET} → "
+                            f"{col.BOLD}{args.call_to}{col.RESET}",
+                            col,
+                        )
+                        _jitter_sleep(args.jitter)
+                        try:
+                            originate_result = ami.originate_call(
+                                h.ip,
+                                port=args.ami_port,
+                                username=ami_res.username,
+                                password=ami_res.password,
+                                call_from=originate_from,
+                                call_to=args.call_to,
+                                timeout=args.timeout,
+                                dry_run=args.call_dry_run,
+                            )
+                            if originate_result and getattr(originate_result, "success", False):
+                                _finding(
+                                    "critical",
+                                    f"AMI ORIGINATE toll fraud confirmed — call to "
+                                    f"{args.call_to} placed via AMI",
+                                    col,
+                                )
+                                if hr["call_test"] is None:
+                                    hr["call_test"] = {
+                                        "call_to": args.call_to,
+                                        "call_from": originate_from,
+                                        "success": True,
+                                        "reached_dialplan": True,
+                                        "status_code": "AMI",
+                                        "reason": "Originate via AMI",
+                                        "evidence": getattr(originate_result, "evidence", ""),
+                                        "trace": "",
+                                        "srtp_state": "off",
+                                        "dtmf_digits_sent": "",
+                                    }
+                            else:
+                                _info("AMI originate: call not confirmed (may need dialplan check).", col)
+                        except AttributeError:
+                            _info("ami.originate_call() not available in this build — skipping.", col)
+
                 elif ami_res.reachable:
                     _warn(f"AMI reachable but no default creds matched.", col)
                 else:
@@ -456,6 +563,7 @@ def main() -> int:
             # Asterisk HTTP rawman API (port 8088)
             http_attack_port = args.http_attack_port
             _info(f"Trying Asterisk HTTP /rawman on port {http_attack_port}...", col)
+            _jitter_sleep(args.jitter)
             ami_http_res = ami.attack_asterisk_http(
                 h.ip, port=http_attack_port, timeout=args.timeout
             )
@@ -480,11 +588,20 @@ def main() -> int:
 
         ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
 
+        # In --auto mode, use platform-specific extension ranges after fingerprinting
+        if args.auto and not args.ext_range and ami_dumped_exts == []:
+            auto_ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
+            _info(
+                f"AUTO mode: using platform-specific ranges for {h.fingerprint}: {auto_ranges}",
+                col,
+            )
+
         if args.enum:
             if ami_dumped_exts:
                 # AMI gave us ground truth — skip wordlist
                 ext_list = ami_dumped_exts
                 _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
+                _jitter_sleep(args.jitter)
                 found = enumeration.sweep(
                     h.ip, ext_list, port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
@@ -495,6 +612,7 @@ def main() -> int:
                 ext_list = enumeration.expand_ext_range(args.ext_range)
                 _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
                 prog = Progress("REGISTER sweep", len(ext_list), col)
+                _jitter_sleep(args.jitter)
                 found = enumeration.sweep(
                     h.ip, ext_list, port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
@@ -510,6 +628,7 @@ def main() -> int:
                     _info(f"Fingerprint: {h.fingerprint} — using adaptive sweep "
                           f"over ranges {ranges}", col)
                     found_all: list[enumeration.ExtensionResult] = []
+                    _jitter_sleep(args.jitter)
                     sf = enumeration.sweep(
                         h.ip, specials, port=sip_port,
                         timeout=args.timeout, max_workers=args.workers,
@@ -524,6 +643,7 @@ def main() -> int:
                         _info(f"Adaptive sweep {lo}–{hi} (coarse step 10, "
                               f"~{total_coarse} coarse probes)...", col)
                         prog = Progress(f"{lo}-{hi}", total_coarse, col)
+                        _jitter_sleep(args.jitter)
                         batch = enumeration.adaptive_sweep(
                             h.ip, port=sip_port, low=lo, high=hi,
                             timeout=args.timeout, max_workers=args.workers,
@@ -542,6 +662,7 @@ def main() -> int:
                     ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
                     _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
                     prog = Progress("REGISTER sweep", len(ext_list), col)
+                    _jitter_sleep(args.jitter)
                     found = enumeration.sweep(
                         h.ip, ext_list, port=sip_port,
                         timeout=args.timeout, max_workers=args.workers,
@@ -554,6 +675,7 @@ def main() -> int:
             if found:
                 _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
                 prog2 = Progress("INVITE probe", len(found), col)
+                _jitter_sleep(args.jitter)
                 inv_map = enumeration.probe_invite_acceptance(
                     h.ip, [r.extension for r in found], port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
@@ -601,6 +723,7 @@ def main() -> int:
                 _info(f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
                       f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
                 prog = Progress("Spray", len(targets_for_spray), col)
+                _jitter_sleep(args.jitter)
                 hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
                     port=sip_port, timeout=args.timeout,
@@ -620,6 +743,47 @@ def main() -> int:
                                  col)
                 else:
                     _info("No credentials cracked.", col)
+
+                # --auto: also try INVITE-based auth spray for extensions that only
+                # challenge INVITE (some PBXes skip REGISTER challenge)
+                if args.auto and not successes:
+                    invite_auth_exts = [
+                        e["extension"] for e in hr["extensions"]
+                        if e.get("auth_required")
+                    ]
+                    if invite_auth_exts:
+                        _info(
+                            f"AUTO mode: trying INVITE-based auth spray on "
+                            f"{len(invite_auth_exts)} extension(s) "
+                            f"(some PBXes only challenge INVITE, not REGISTER)...",
+                            col,
+                        )
+                        _jitter_sleep(args.jitter)
+                        try:
+                            invite_hits = auth.spray(
+                                h.ip, invite_auth_exts, creds,
+                                port=sip_port, timeout=args.timeout,
+                                max_workers=min(args.workers, 10),
+                                max_failures_per_ext=args.max_failures_per_ext,
+                                traffic_log=traffic_log,
+                                source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                                method="INVITE",
+                            )
+                            invite_successes = [asdict(c) for c in invite_hits if c.success]
+                            if invite_successes:
+                                hr["credentials_found"].extend(invite_successes)
+                                for c in invite_successes:
+                                    _finding(
+                                        "critical",
+                                        f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                        f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                        col,
+                                    )
+                            else:
+                                _info("INVITE-based auth spray: no additional credentials found.", col)
+                        except TypeError:
+                            # auth.spray() may not support method= in all builds
+                            _info("INVITE auth spray not supported in this build — skipping.", col)
             else:
                 _info("No auth-required extensions to spray.", col)
         elif args.spray:
@@ -627,6 +791,10 @@ def main() -> int:
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 6 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
+
+        # --auto with no --call-to but creds found: hint the operator
+        if args.auto and not args.call_to and hr["credentials_found"]:
+            _warn("  [!] Add --call-to <YOUR_NUMBER> to demonstrate live toll fraud", col)
 
         if args.call_test:
             call_from = args.call_from
@@ -643,12 +811,35 @@ def main() -> int:
                 if openish:
                     call_from = call_from or openish[0]["extension"]
                     _info(f"Using open extension {call_from} for anonymous INVITE.", col)
+
+                # --auto: also try toll-fraud PoC if anonymous INVITE found
+                if args.auto and openish:
+                    _info(
+                        "AUTO mode: anonymous INVITE accepted — toll-fraud vector confirmed.",
+                        col,
+                    )
+
             call_from = call_from or "1000"
+
+            # --call-to-auto: override call_from with first AMI-discovered extension
+            if args.call_to_auto:
+                ami_exts_for_auto = (hr.get("ami") or {}).get("extensions") or []
+                if ami_exts_for_auto:
+                    auto_from = ami_exts_for_auto[0]
+                    _info(
+                        f"--call-to-auto: using AMI-discovered extension "
+                        f"{col.BOLD}{auto_from}{col.RESET} as from-number for dialplan routing test.",
+                        col,
+                    )
+                    call_from = auto_from
+                else:
+                    _warn("--call-to-auto: no AMI-discovered extensions available; using default.", col)
 
             # Dial-plan prefix discovery
             effective_call_to = args.call_to
             if args.discover_prefix:
                 _info(f"Discovering dial-plan prefix for {args.call_to}...", col)
+                _jitter_sleep(args.jitter)
                 found_prefix, effective_call_to = call.discover_dialplan_prefix(
                     h.ip, args.call_to, call_from,
                     port=args.port, username=username, password=password,
@@ -666,6 +857,7 @@ def main() -> int:
                   f"{col.BOLD}{effective_call_to}{col.RESET}  "
                   f"dry_run={args.call_dry_run}  srtp={args.srtp}", col)
 
+            _jitter_sleep(args.jitter)
             result = call.place_call(
                 h.ip, effective_call_to, call_from,
                 port=args.port,
@@ -743,7 +935,7 @@ def main() -> int:
         print(f"  {col.for_severity(sev)}{sev.upper():8}{col.RESET}  {bar} {n}")
     print(f"  {'─' * 60}")
 
-    # Risk score
+    # Risk score — displayed prominently
     if rs:
         score = rs.get("score", 0)
         band = rs.get("band", "")
@@ -753,27 +945,42 @@ def main() -> int:
             "medium"   if score >= 25 else "info"
         )
         print()
-        print(f"  {col.BOLD}RISK SCORE{col.RESET}  "
-              f"{band_col}{score}/100{col.RESET}  "
-              f"{col.BOLD}{band}{col.RESET}")
+        _info(
+            f"RISK SCORE: {band_col}{col.BOLD}{score}/100 [{band}]{col.RESET}",
+            col,
+        )
 
-    # Toll-fraud exposure
+    # Toll-fraud exposure — displayed prominently
     if tf and tf.get("high_usd", 0) > 0:
         proven = tf.get("proven", False)
-        low_k = tf.get("low_usd", 0) // 1000
-        high_k = tf.get("high_usd", 0) // 1000
+        low_usd = tf.get("low_usd", 0)
+        high_usd = tf.get("high_usd", 0)
         proven_label = (f"{col.RED}PROVEN{col.RESET}" if proven
                         else f"{col.YELLOW}ESTIMATED{col.RESET}")
-        print(f"  {col.BOLD}TOLL-FRAUD EXPOSURE{col.RESET}  "
-              f"{proven_label}  "
-              f"${low_k}k–${high_k}k/month")
-        print(f"  {tf.get('scenario', '')}")
+        # Format as dollars with commas; use k notation only for >= 10000
+        def _fmt_usd(v: int) -> str:
+            if v >= 10000:
+                return f"${v // 1000}k"
+            return f"${v:,}"
+        _warn(
+            f"Estimated monthly exposure: {_fmt_usd(low_usd)}–{_fmt_usd(high_usd)}  "
+            f"[{proven_label}]",
+            col,
+        )
+        if tf.get("scenario"):
+            print(f"  {tf['scenario']}")
 
     print(f"\n  {'─' * 60}")
     print()
     for k, pth in paths.items():
         label = k if k != "findings" else "findings (actionable)"
         _ok(f"{label:<26} : {pth}", col)
+
+    # sales_brief.html path
+    sales_brief_path = os.path.join(report_dir, "sales_brief.html")
+    if os.path.exists(sales_brief_path):
+        _ok(f"{'sales_brief':<26} : {sales_brief_path}", col)
+
     _ok(f"{'traffic':<26} : {os.path.join(report_dir, 'traffic.log')}", col)
     print()
 
