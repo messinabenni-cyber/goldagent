@@ -564,293 +564,86 @@ def toll_fraud_cost_estimate(findings: list[dict]) -> dict:
     }
 
 
-def render_sales_brief(report: dict) -> str:
-    """Render a one-page HTML sales brief for client presentation.
-
-    Written for business decision makers — no technical jargon.
-    Includes risk score, estimated financial exposure, key bullets,
-    a call-to-action box, and optional SIP trace evidence.
-    """
-    findings = report.get("findings", [])
-    score = report.get("risk_score", risk_score(findings))
-    fraud = report.get("toll_fraud_estimate", toll_fraud_cost_estimate(findings))
-
-    monthly = fraud.get("monthly_estimate_usd", 0.0)
-    annual = fraud.get("annual_estimate_usd", 0.0)
-    risk_level = fraud.get("risk_level", "LOW")
-
-    target = _esc(report.get("target", "your phone system"))
-    timestamp = _esc(report.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S")))
-
-    # Score colour
-    if score > 70:
-        score_colour = "#c0392b"
-        score_bg = "#fff0f0"
-        alert_html = (
-            '<div class="alert-banner">'
-            'YOUR PBX IS AT RISK &nbsp;&mdash;&nbsp; IMMEDIATE ACTION REQUIRED'
-            '</div>'
+def render_sales_brief(report):
+    findings = report.get("findings") or build_findings(report)
+    _rs_raw = risk_score(findings)
+    # risk_score returns an int; normalise to the dict shape the template expects
+    if isinstance(_rs_raw, int):
+        _score_val = _rs_raw
+        _band_val = (
+            "CRITICAL" if _score_val >= 75 else
+            "HIGH" if _score_val >= 50 else
+            "MEDIUM" if _score_val > 0 else
+            "LOW"
         )
-    elif score >= 40:
-        score_colour = "#d68910"
-        score_bg = "#fffbe6"
-        alert_html = (
-            '<div class="alert-banner amber">'
-            'SIGNIFICANT VULNERABILITIES DETECTED &nbsp;&mdash;&nbsp; ACTION RECOMMENDED'
-            '</div>'
-        )
+        rs = {"score": _score_val, "band": _band_val}
     else:
-        score_colour = "#1e8449"
-        score_bg = "#f0fff4"
-        alert_html = ""
-
-    # Derive three bullet points from findings
-    counts = severity_counts(findings)
-    crit = counts.get("critical", 0)
-    high = counts.get("high", 0)
-    med = counts.get("medium", 0)
-
-    # What we found
-    if crit + high > 0:
-        bullet_found = (
-            f"We found <strong>{crit} critical</strong> and "
-            f"<strong>{high} high</strong> severity vulnerabilities in your phone system — "
-            "serious weaknesses that an attacker can exploit right now, from anywhere on the internet."
-        )
-    elif med > 0:
-        bullet_found = (
-            f"We found <strong>{med} medium</strong> severity issues in your phone system "
-            "that could be exploited by a determined attacker."
-        )
-    else:
-        bullet_found = (
-            "No critical vulnerabilities were found. Informational findings "
-            "and hardening recommendations are detailed in the full report."
-        )
-
-    # What an attacker can do
-    attacker_actions: list[str] = []
-    for f in findings:
-        title = f.get("title", "").lower()
-        sev = f.get("severity", "")
-        if "outbound call placed" in title or "toll-fraud poc" in title:
-            attacker_actions.append("make unlimited international calls billed to you")
-        elif "anonymous invite" in title:
-            attacker_actions.append("route calls through your system without logging in")
-        elif "valid credentials" in title:
-            attacker_actions.append("log in as your staff using cracked passwords")
-        elif "ami authenticated" in title:
-            attacker_actions.append("take full remote control of your phone system")
-        elif "accepts register without authentication" in title:
-            attacker_actions.append("register fake phones on your network without a password")
-
-    if attacker_actions:
-        unique_actions = list(dict.fromkeys(attacker_actions))
-        bullet_attacker = (
-            "An attacker with no special access can: "
-            + "; ".join(unique_actions[:3])
-            + "."
-        )
-    else:
-        bullet_attacker = (
-            "No immediately exploitable attack path was confirmed, but the "
-            "findings above represent a realistic pathway to compromise."
-        )
-
-    # What you must fix
-    if score > 70:
-        bullet_fix = (
-            "You must act today: disable unauthenticated access, change all "
-            "default passwords, restrict your phone system management interface "
-            "to your internal network, and block international dialling until "
-            "an allow-list is in place."
-        )
-    elif score >= 40:
-        bullet_fix = (
-            "Schedule remediation within the next 5 business days: enforce "
-            "strong passwords on all extensions, review firewall rules for your "
-            "phone system ports, and confirm that overseas dialling is restricted."
-        )
-    else:
-        bullet_fix = (
-            "Apply the hardening recommendations in the full report. Consider "
-            "a follow-up assessment in 6 months to verify ongoing security posture."
-        )
-
-    # Financial exposure display
-    if monthly > 0:
-        exposure_html = (
-            f'<div class="exposure-box">'
-            f'<div class="exposure-label">Estimated Monthly Financial Exposure</div>'
-            f'<div class="exposure-amount">${monthly:,.0f}<span class="exposure-period">/month</span></div>'
-            f'<div class="exposure-annual">Up to <strong>${annual:,.0f} per year</strong> if left unaddressed</div>'
-            f'<div class="exposure-basis">{_esc(fraud.get("calculation_basis", ""))}</div>'
-            f'</div>'
-        )
-    else:
-        exposure_html = (
-            '<div class="exposure-box low">'
-            '<div class="exposure-label">Financial Exposure</div>'
-            '<div class="exposure-amount low-text">Minimal</div>'
-            '<div class="exposure-annual">No immediate toll-fraud vector confirmed at this time.</div>'
-            '</div>'
-        )
-
-    # SIP trace evidence (if call was placed)
-    sip_evidence_html = ""
-    for h in report.get("hosts", []):
-        ct = h.get("call_test")
-        if ct and ct.get("success"):
-            evidence = _esc(ct.get("evidence", ""))
-            call_to = _esc(ct.get("call_to", ""))
-            call_from = _esc(ct.get("call_from", ""))
-            host_ip = _esc(h.get("ip", ""))
-            sip_evidence_html = f"""
-<div class="evidence-box">
-  <div class="evidence-title">PROOF: Outbound Call Successfully Placed</div>
-  <div class="evidence-body">
-    <table class="ev-table">
-      <tr><th>Target PBX</th><td><code>{host_ip}</code></td></tr>
-      <tr><th>Called from</th><td><code>{call_from}</code></td></tr>
-      <tr><th>Called to</th><td><code>{call_to}</code></td></tr>
-      <tr><th>SIP evidence</th><td><code>{evidence}</code></td></tr>
-    </table>
-    <p class="evidence-note">
-      This call was placed during the assessment using a controlled test number.
-      The same technique can be used by any attacker on the internet to bill
-      calls to your account. No credentials were required.
-    </p>
-  </div>
-</div>
-"""
-            break
-
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Phone System Security Assessment — {target}</title>
-<style>
-*{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;
-  background:#f5f6fa;color:#1a1a2e;line-height:1.6;padding:0}}
-.page{{max-width:860px;margin:0 auto;background:#fff;box-shadow:0 2px 24px rgba(0,0,0,.10)}}
-.header{{background:#0b1a33;color:#fff;padding:40px 48px 32px}}
-.header h1{{font-size:28px;font-weight:700;letter-spacing:-.5px;margin-bottom:6px}}
-.header .sub{{font-size:14px;color:#a0aec0;margin-top:4px}}
-.alert-banner{{background:#c0392b;color:#fff;text-align:center;padding:14px 24px;
-  font-size:15px;font-weight:700;letter-spacing:.5px;text-transform:uppercase}}
-.alert-banner.amber{{background:#d68910}}
-.body{{padding:40px 48px}}
-.score-section{{display:flex;align-items:center;gap:40px;margin-bottom:36px;
-  padding:28px 32px;border-radius:10px;background:{score_bg};
-  border:2px solid {score_colour}}}
-.score-circle{{width:110px;height:110px;border-radius:50%;
-  background:{score_colour};display:flex;flex-direction:column;
-  align-items:center;justify-content:center;flex-shrink:0}}
-.score-circle .n{{font-size:38px;font-weight:800;color:#fff;line-height:1}}
-.score-circle .lbl{{font-size:10px;color:rgba(255,255,255,.8);
-  text-transform:uppercase;letter-spacing:1px;margin-top:2px}}
-.score-text h2{{font-size:22px;font-weight:700;color:{score_colour};margin-bottom:6px}}
-.score-text p{{font-size:14px;color:#444}}
-.section{{margin-bottom:32px}}
-.section h3{{font-size:16px;font-weight:700;text-transform:uppercase;
-  letter-spacing:.8px;color:#0b1a33;border-bottom:2px solid #e2e8f0;
-  padding-bottom:8px;margin-bottom:16px}}
-.bullets{{list-style:none;padding:0}}
-.bullets li{{padding:12px 16px 12px 48px;position:relative;margin-bottom:8px;
-  background:#f8f9fb;border-radius:6px;font-size:15px;border-left:4px solid #0b1a33}}
-.bullets li::before{{content:attr(data-icon);position:absolute;left:14px;
-  font-size:18px}}
-.exposure-box{{background:#fff8e1;border:2px solid #d68910;border-radius:8px;
-  padding:24px 28px;margin-bottom:24px;text-align:center}}
-.exposure-box.low{{background:#f0fff4;border-color:#1e8449}}
-.exposure-label{{font-size:12px;text-transform:uppercase;letter-spacing:1px;
-  color:#666;margin-bottom:8px}}
-.exposure-amount{{font-size:48px;font-weight:800;color:#c0392b;line-height:1;
-  margin-bottom:6px}}
-.exposure-amount.low-text{{font-size:36px;color:#1e8449}}
-.exposure-period{{font-size:20px;font-weight:400;color:#666}}
-.exposure-annual{{font-size:14px;color:#555;margin-bottom:10px}}
-.exposure-basis{{font-size:12px;color:#888;font-style:italic;
-  border-top:1px solid #e9c46a;padding-top:10px;margin-top:10px}}
-.cta-box{{background:#0b1a33;color:#fff;border-radius:10px;padding:32px 36px;
-  text-align:center;margin-bottom:32px}}
-.cta-box h2{{font-size:20px;font-weight:700;margin-bottom:10px}}
-.cta-box p{{font-size:15px;color:#a0aec0;margin-bottom:18px}}
-.cta-tag{{display:inline-block;background:#e2b96f;color:#0b1a33;
-  font-weight:700;font-size:14px;border-radius:20px;padding:8px 24px;
-  letter-spacing:.3px}}
-.evidence-box{{border:2px solid #c0392b;border-radius:8px;margin-bottom:28px;
-  overflow:hidden}}
-.evidence-title{{background:#c0392b;color:#fff;padding:10px 16px;
-  font-size:13px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}}
-.evidence-body{{padding:16px}}
-.ev-table{{border-collapse:collapse;width:100%;font-size:13px;margin-bottom:12px}}
-.ev-table th,.ev-table td{{padding:7px 10px;border:1px solid #e5c5c5;text-align:left}}
-.ev-table th{{background:#fff5f5;font-weight:600;width:140px}}
-.ev-table code{{background:#f8f0f0;padding:2px 6px;border-radius:3px;
-  font-family:monospace;font-size:12px}}
-.evidence-note{{font-size:13px;color:#666;font-style:italic;
-  border-top:1px dashed #e5c5c5;padding-top:10px}}
-.footer{{border-top:1px solid #e2e8f0;padding:16px 48px;
-  font-size:11px;color:#999;display:flex;justify-content:space-between}}
-</style>
-</head>
-<body>
-<div class="page">
-
-  <div class="header">
-    <h1>Phone System Security Assessment</h1>
-    <div class="sub">Target: {target} &nbsp;&middot;&nbsp; Assessment date: {timestamp}</div>
-  </div>
-
-  {alert_html}
-
-  <div class="body">
-
-    <div class="score-section">
-      <div class="score-circle">
-        <div class="n">{score}</div>
-        <div class="lbl">Risk Score</div>
-      </div>
-      <div class="score-text">
-        <h2>Risk Level: {_esc(risk_level)}</h2>
-        <p>This score (0&ndash;100) reflects the severity and number of vulnerabilities
-        found in your phone system. A score above 70 represents an urgent threat
-        that can be exploited today.</p>
-      </div>
-    </div>
-
-    {exposure_html}
-
-    <div class="section">
-      <h3>Key Findings</h3>
-      <ul class="bullets">
-        <li data-icon="&#128269;">{bullet_found}</li>
-        <li data-icon="&#9888;">{bullet_attacker}</li>
-        <li data-icon="&#128295;">{bullet_fix}</li>
-      </ul>
-    </div>
-
-    {sip_evidence_html}
-
-    <div class="cta-box">
-      <h2>Ready to Fix This?</h2>
-      <p>Contact us to remediate these vulnerabilities — typical fix time: <strong>1&ndash;2 days</strong>.<br>
-      We will harden your phone system configuration, restrict access, and verify
-      the issues are resolved with a follow-up check.</p>
-      <span class="cta-tag">Get in touch today &rarr;</span>
-    </div>
-
-  </div>
-
-  <div class="footer">
-    <span>VoIPScan Security Assessment &mdash; Confidential</span>
-    <span>Generated: {timestamp}</span>
-  </div>
-
-</div>
-</body></html>"""
+        rs = _rs_raw
+    # toll_fraud_cost_estimate takes a findings list; map its output to the keys
+    # the template expects (high_usd, low_usd, proven)
+    _tf_raw = toll_fraud_cost_estimate(findings)
+    _monthly = _tf_raw.get("monthly_estimate_usd", 0)
+    tf = {
+        "high_usd": int(_monthly * 1.5),
+        "low_usd": int(_monthly * 0.5),
+        "proven": _tf_raw.get("risk_level", "LOW") == "CRITICAL",
+    }
+    target = _esc(report.get("target", "?"))
+    ts = _esc(report.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S")))
+    score = rs.get("score", 0)
+    band = rs.get("band", "")
+    band_col = SEVERITY_COLOUR.get(
+        "critical" if score >= 75 else "high" if score >= 50 else "medium" if score > 0 else "info",
+        "#666"
+    )
+    top5 = [f for f in findings if f.get("severity") in ("critical", "high")][:5]
+    rows = "".join(
+        '<tr><td style="background:' + SEVERITY_COLOUR.get(f.get("severity","info"),"#666") + ';color:#fff;font-weight:700;width:90px">' +
+        f.get("severity","").upper() + '</td><td><b>' + _esc(f.get("title","")) + '</b></td><td>' +
+        _esc(f.get("host","")) + '</td></tr>'
+        for f in top5
+    ) or '<tr><td colspan="3"><i>No critical/high findings.</i></td></tr>'
+    hi_usd = tf.get("high_usd", 0)
+    lo_usd = tf.get("low_usd", 0)
+    cost_str = ("$" + str(lo_usd // 1000) + "k–$" + str(hi_usd // 1000) + "k/month") if hi_usd else "None identified"
+    proven_label = "CONFIRMED" if tf.get("proven") else "ESTIMATED"
+    remediation_items = "".join(
+        "<li><b>" + _esc(f.get("title","")) + "</b> — " + _esc(f.get("remediation","")[:120]) + "...</li>"
+        for f in top5
+    ) or "<li>No immediate actions required.</li>"
+    return (
+        "<!doctype html><html><head><meta charset=utf-8>"
+        "<title>VoIP Security Brief — " + target + "</title>"
+        "<style>"
+        "body{font-family:-apple-system,Arial,sans-serif;margin:0;color:#222}"
+        ".hdr{background:#0b1a33;color:#fff;padding:28px 40px}"
+        ".hdr h1{margin:0;font-size:22px;font-weight:700}"
+        ".hdr p{margin:6px 0 0;opacity:.7;font-size:13px}"
+        ".body{padding:32px 40px;max-width:900px}"
+        ".score-box{display:inline-block;background:" + band_col + ";color:#fff;padding:20px 36px;border-radius:8px;margin:16px 16px 16px 0}"
+        ".score-box .n{font-size:52px;font-weight:900;line-height:1}"
+        ".score-box .l{font-size:14px;font-weight:600;margin-top:4px;letter-spacing:2px}"
+        ".cost-box{display:inline-block;background:#0b1a33;color:#fff;padding:20px 36px;border-radius:8px;margin:16px 0}"
+        ".cost-box .n{font-size:28px;font-weight:700;line-height:1}"
+        ".cost-box .l{font-size:12px;margin-top:4px;opacity:.8}"
+        "h2{color:#0b1a33;border-left:4px solid #0b1a33;padding-left:12px;margin-top:32px}"
+        "table{border-collapse:collapse;width:100%;margin:12px 0}"
+        "th,td{padding:10px 12px;border:1px solid #ddd;font-size:13px;text-align:left;vertical-align:top}"
+        "th{background:#0b1a33;color:#fff;font-weight:600}"
+        ".footer{margin-top:48px;padding-top:16px;border-top:1px solid #ddd;color:#888;font-size:11px}"
+        "</style></head><body>"
+        "<div class=hdr><h1>VoIP Security Assessment — Findings Summary</h1>"
+        "<p>Target: " + target + " &nbsp;·&nbsp; Generated: " + ts + "</p></div>"
+        "<div class=body>"
+        "<div class=score-box><div class=n>" + str(score) + "</div><div class=l>" + band + "</div></div>"
+        "<div class=cost-box><div class=n>" + cost_str + "</div><div class=l>TOLL-FRAUD EXPOSURE (" + proven_label + ")</div></div>"
+        "<h2>Top Findings</h2>"
+        "<table><tr><th>Severity</th><th>Finding</th><th>Host</th></tr>" + rows + "</table>"
+        "<h2>Remediation Actions</h2>"
+        "<ol>" + remediation_items + "</ol>"
+        "<p class=footer>Executive summary only. Full technical report with evidence, traffic logs, and detailed steps available on request.<br>Generated by VoIPScan v4.1</p>"
+        "</div></body></html>"
+    )
 
 
 _ACTIONABLE_SEVERITIES = {"critical", "high", "medium"}

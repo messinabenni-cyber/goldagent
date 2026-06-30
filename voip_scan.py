@@ -760,6 +760,9 @@ def main() -> int:
                       f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
                 prog = Progress("Spray", len(targets_for_spray), col)
                 _jitter_sleep(args.jitter)
+                ami_pwds = []
+                if hr.get("ami") and hr["ami"].get("success") and hr["ami"].get("password"):
+                    ami_pwds = [hr["ami"]["password"]]
                 hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
                     port=sip_port, timeout=args.timeout,
@@ -767,6 +770,7 @@ def main() -> int:
                     max_failures_per_ext=args.max_failures_per_ext,
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    ami_cracked_passwords=ami_pwds,
                 )
                 prog.close()
                 successes = [asdict(c) for c in hits_spray if c.success]
@@ -1009,7 +1013,12 @@ def main() -> int:
     print(f"\n  {'─' * 60}")
     print()
     for k, pth in paths.items():
-        label = k if k != "findings" else "findings (actionable)"
+        if k == "findings":
+            label = "findings (actionable)"
+        elif k == "sales_brief":
+            label = "sales brief (client)"
+        else:
+            label = k
         _ok(f"{label:<26} : {pth}", col)
 
     # sales_brief.html path
