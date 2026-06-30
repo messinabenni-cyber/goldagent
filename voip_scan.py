@@ -841,6 +841,11 @@ def main() -> int:
                 if r.auth_required:
                     flags.append("auth-required")
                 _info(f"  ext {col.BOLD}{r.extension}{col.RESET}  " + "  ".join(flags), col)
+            if not found and args.call_test:
+                _warn("0 extensions enumerated — PBX may suppress REGISTER probes or use "
+                      "a non-standard range. Phase 6 will probe for ANONYMOUS DIAL-OUT: "
+                      "whether the PBX routes PSTN calls from completely unknown/unregistered "
+                      "extensions with no credentials.", col)
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 5 · CREDENTIAL SPRAY  [{h.ip}]", col)
@@ -951,6 +956,7 @@ def main() -> int:
                 if _openish and args.auto:
                     _info("AUTO mode: anonymous INVITE accepted — toll-fraud vector confirmed.", col)
 
+            _anonymous_dialout_probe = False
             if _call_candidates:
                 _best = _call_candidates[0]
                 call_from = call_from or _best[0]
@@ -958,7 +964,17 @@ def main() -> int:
                 _auth_label = f"{username}/{password}" if username else "anonymous"
                 _info(f"Primary calling extension: {col.BOLD}{call_from}{col.RESET}  [{_auth_label}]", col)
             else:
+                # No discovered or cracked extensions — probe for anonymous dial-out:
+                # does the PBX route PSTN calls from a completely unknown, unauthenticated
+                # SIP endpoint? This is the most dangerous misconfiguration possible.
                 call_from = call_from or "1000"
+                _anonymous_dialout_probe = True
+                _warn(
+                    f"{col.RED}ANONYMOUS DIAL-OUT PROBE{col.RESET}: no extensions found/cracked — "
+                    f"testing whether PBX routes PSTN calls from a completely unknown, "
+                    f"unauthenticated SIP endpoint (ext {col.BOLD}{call_from}{col.RESET}, no credentials)",
+                    col,
+                )
 
             # --call-to-auto: override call_from with first AMI-discovered extension
             if args.call_to_auto:
@@ -1024,7 +1040,7 @@ def main() -> int:
                             break
 
                 if _found_prefix is not None:
-                    _prefix_label = repr(_found_prefix) if _found_prefix else "'(none/direct)'"
+                    _prefix_label = repr(_found_prefix) if _found_prefix else "'(none — direct E.164 routing)'"
                     _ok(f"Dial-plan prefix: {_prefix_label} → {col.BOLD}{effective_call_to}{col.RESET}  "
                         f"via ext {call_from}", col)
                 else:
@@ -1070,11 +1086,20 @@ def main() -> int:
                 "trace": result.sip_trace,
                 "srtp_state": result.srtp_state,
                 "dtmf_digits_sent": result.dtmf_digits_sent,
+                "anonymous_dialout": _anonymous_dialout_probe,
                 "working_prefixes": [
                     {"prefix": p, "destination": d, "from_ext": e}
                     for p, d, e in all_working_prefixes
                 ],
             }
+
+            if result.success and _anonymous_dialout_probe:
+                _finding("critical",
+                         f"ANONYMOUS DIAL-OUT CONFIRMED — PBX routes PSTN calls from ANY "
+                         f"unauthenticated SIP endpoint with no extension registration required. "
+                         f"Attacker needs only network access to {h.ip}:5060. "
+                         f"Extension {call_from} was never registered or authenticated.",
+                         col)
 
             if result.success:
                 _finding("critical",
