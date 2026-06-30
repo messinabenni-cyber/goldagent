@@ -18,6 +18,9 @@ import argparse
 import getpass
 import os
 import random
+import re
+import socket
+import subprocess
 import sys
 import time
 from dataclasses import asdict
@@ -157,7 +160,7 @@ def parse_args() -> argparse.Namespace:
             "Add --call-test --call-to <number> to demonstrate live toll fraud."
         ),
     )
-    p.add_argument("--target", required=True,
+    p.add_argument("--target", default="",
                    help="IP, CIDR, hostname, or file:hosts.txt")
     p.add_argument("--operator",
                    help="Name/handle of the operator (defaults to $USER)")
@@ -250,6 +253,10 @@ def parse_args() -> argparse.Namespace:
                    help="Asterisk HTTP API port (default 8088)")
     t.add_argument("--source-ip", default="",
                    help="Bind local sockets to this IP (for multi-NIC hosts)")
+    t.add_argument("--network", default="",
+                   help="Select outbound network interface by index (0, 1, …) or name "
+                        "(e.g. en0, eth0). Run with --list-networks to see available "
+                        "interfaces. Sets --source-ip automatically.")
     t.add_argument("--stun",
                    help="Resolve public IP via STUN before scan. "
                         "Use '--stun auto' to try well-known public STUN servers, "
@@ -265,6 +272,8 @@ def parse_args() -> argparse.Namespace:
                    help="Directory for report.html and report.json (default reports/<timestamp>)")
     o.add_argument("--no-color", action="store_true",
                    help="Disable ANSI colour output")
+    o.add_argument("--list-networks", action="store_true",
+                   help="Print available network interfaces and exit (use with --network)")
 
     return p.parse_args()
 
@@ -282,6 +291,71 @@ def _parse_port_range(spec: str | None) -> tuple[int, int] | None:
     return (lo, hi)
 
 
+def _list_interfaces() -> list[tuple[str, str]]:
+    """Return [(name, ipv4), ...] for non-loopback IPv4 interfaces."""
+    try:
+        import netifaces  # type: ignore[import]
+        result = []
+        for name in netifaces.interfaces():
+            for addr in netifaces.ifaddresses(name).get(netifaces.AF_INET, []):
+                ip = addr.get("addr", "")
+                if ip and not ip.startswith("127."):
+                    result.append((name, ip))
+        return result
+    except ImportError:
+        pass
+
+    # stdlib fallback: ifconfig (macOS/BSD) or ip addr (Linux)
+    try:
+        if sys.platform == "darwin":
+            raw = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+            ifaces, current = [], None
+            for line in raw.splitlines():
+                m = re.match(r'^(\S+):', line)
+                if m:
+                    current = m.group(1)
+                elif current:
+                    m = re.match(r'\s+inet (\d+\.\d+\.\d+\.\d+)', line)
+                    if m and not m.group(1).startswith("127."):
+                        ifaces.append((current, m.group(1)))
+            return ifaces
+        else:
+            raw = subprocess.check_output(["ip", "-4", "addr"], text=True, stderr=subprocess.DEVNULL)
+            ifaces, current = [], None
+            for line in raw.splitlines():
+                m = re.match(r'^\d+: (\S+?)[@:]', line)
+                if m:
+                    current = m.group(1)
+                elif current:
+                    m = re.match(r'\s+inet (\d+\.\d+\.\d+\.\d+)', line)
+                    if m and not m.group(1).startswith("127."):
+                        ifaces.append((current, m.group(1)))
+            return ifaces
+    except Exception:
+        return []
+
+
+def _resolve_network_arg(value: str) -> str:
+    """Resolve --network INDEX-or-NAME to an IPv4 address string."""
+    ifaces = _list_interfaces()
+    if not ifaces:
+        raise SystemExit("ERROR: --network: could not enumerate network interfaces. "
+                         "Use --source-ip directly.")
+    # Try numeric index
+    if re.fullmatch(r'\d+', value):
+        idx = int(value)
+        if idx >= len(ifaces):
+            lines = "\n".join(f"  {i}: {n}  {ip}" for i, (n, ip) in enumerate(ifaces))
+            raise SystemExit(f"ERROR: --network {idx} out of range. Available:\n{lines}")
+        return ifaces[idx][1]
+    # Try interface name
+    for name, ip in ifaces:
+        if name == value:
+            return ip
+    lines = "\n".join(f"  {i}: {n}  {ip}" for i, (n, ip) in enumerate(ifaces))
+    raise SystemExit(f"ERROR: --network {value!r} not found. Available:\n{lines}")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -291,6 +365,29 @@ def main() -> int:
     args = parse_args()
 
     col = Colours(force=False if args.no_color else None)
+
+    # --list-networks: print interfaces and exit (no --target needed)
+    if args.list_networks:
+        ifaces = _list_interfaces()
+        if not ifaces:
+            print("No non-loopback IPv4 interfaces found.")
+        else:
+            print("Available network interfaces:")
+            for i, (name, ip) in enumerate(ifaces):
+                print(f"  {i}: {name:<12}  {ip}")
+            print("\nUse:  --network 0   or   --network en0")
+        return 0
+
+    if not args.target:
+        print("ERROR: --target is required", file=sys.stderr)
+        return 2
+
+    # --network resolves to --source-ip; explicit --source-ip takes precedence
+    if args.network and not args.source_ip:
+        args.source_ip = _resolve_network_arg(args.network)
+        _info(f"Network {args.network!r} → source IP {args.source_ip}", col)
+    elif args.network and args.source_ip:
+        _warn("Both --network and --source-ip given; --source-ip takes precedence", col)
 
     # --full is an alias for --auto (backwards compat)
     if args.full and not args.auto:
