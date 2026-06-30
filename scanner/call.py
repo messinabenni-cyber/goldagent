@@ -368,9 +368,72 @@ def place_call(
 # Dial-plan prefix discovery
 # ---------------------------------------------------------------------------
 
-# Common PSTN access prefixes tried in order.
-# Empty string = bare E.164 (try first — direct is always cheapest).
-DIALPLAN_PREFIXES: list[str] = ["", "9", "0", "00", "+", "1", "011"]
+# Comprehensive PSTN access prefix list, ordered most-common-first.
+# Empty string = bare E.164 (direct routing — try first, cheapest path).
+DIALPLAN_PREFIXES: list[str] = [
+    "",      # bare E.164 — direct SIP-to-PSTN
+    "9",     # North American outbound (FreePBX/Asterisk default)
+    "0",     # Europe/PSTN single-zero
+    "00",    # European IDD
+    "+",     # E.164 plus notation
+    "1",     # legacy/direct North American
+    "011",   # North American IDD
+    "001",   # alternate North American IDD
+    "8",     # post-Soviet/CIS (Russia, Ukraine, Kazakhstan)
+    "0011",  # Australian IDD
+]
+
+# Platform-tuned prefix order: lead with the most likely prefix for each platform.
+_FINGERPRINT_PREFIX_HINTS: dict[str, list[str]] = {
+    "FreePBX":     ["9", "", "0", "00", "+", "1", "011", "001", "8", "0011"],
+    "Asterisk":    ["9", "", "0", "00", "+", "1", "011", "001", "8", "0011"],
+    "3CX":         ["0", "9", "", "00", "+", "1", "011", "001"],
+    "Grandstream": ["9", "0", "", "00", "+", "1", "011"],
+    "Mitel":       ["9", "8", "0", "", "00", "+", "1", "011"],
+    "Sangoma":     ["9", "", "0", "00", "+", "1", "011", "001"],
+}
+
+
+def prefixes_for_fingerprint(fingerprint: str) -> list[str]:
+    """Return the prefix list optimally ordered for the detected platform."""
+    return _FINGERPRINT_PREFIX_HINTS.get(fingerprint, DIALPLAN_PREFIXES)
+
+
+def discover_all_prefixes(
+    host: str,
+    call_to: str,
+    call_from: str,
+    *,
+    port: int = 5060,
+    username: str | None = None,
+    password: str | None = None,
+    timeout: float = 5.0,
+    traffic_log=None,
+    source_ip: str = "",
+    source_port_range: tuple[int, int] | None = None,
+    prefixes: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    """Exhaustively probe every prefix and return ALL that reach the dialplan.
+
+    Returns list of (prefix, full_destination) for every prefix that produced
+    a 100/180/183 response. Empty list if none worked. Use this in --auto mode
+    to fully map the PBX's outbound routing rules rather than stopping at first hit.
+    """
+    if prefixes is None:
+        prefixes = DIALPLAN_PREFIXES
+    hits: list[tuple[str, str]] = []
+    for prefix in prefixes:
+        dest = f"{prefix}{call_to}" if prefix else call_to
+        result = place_call(
+            host, dest, call_from,
+            port=port, username=username, password=password,
+            timeout=timeout, dry_run=True, max_wait=timeout + 2.0,
+            traffic_log=traffic_log,
+            source_ip=source_ip, source_port_range=source_port_range,
+        )
+        if result.reached_dialplan:
+            hits.append((prefix, dest))
+    return hits
 
 
 def discover_dialplan_prefix(
@@ -386,15 +449,15 @@ def discover_dialplan_prefix(
     source_ip: str = "",
     source_port_range: tuple[int, int] | None = None,
     prefixes: list[str] | None = None,
+    fingerprint: str = "",
 ) -> tuple[str | None, str]:
-    """Try common dial-plan prefixes until one produces a provisional response.
+    """Try dial-plan prefixes until one produces a provisional response.
 
     Returns (winning_prefix, full_destination) or (None, call_to) if none work.
-    The winner is the prefix that caused the PBX to return 100/180/183 — i.e.
-    the dialplan routed the call toward the PSTN rather than rejecting it.
+    Pass fingerprint= to use platform-tuned prefix ordering.
     """
     if prefixes is None:
-        prefixes = DIALPLAN_PREFIXES
+        prefixes = prefixes_for_fingerprint(fingerprint) if fingerprint else DIALPLAN_PREFIXES
 
     for prefix in prefixes:
         dest = f"{prefix}{call_to}" if prefix else call_to

