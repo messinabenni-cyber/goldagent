@@ -398,15 +398,12 @@ def main() -> int:
         sip_port = args.port
 
         sip_server_banner = sip_info.get("server", "")
-        srtp_state = (hr.get("call_test") or {}).get("srtp_state", "")
         cve_results = cve.check_all(
             h.ip,
             tcp_ports=tcp_ports,
             fingerprint=h.fingerprint,
             sip_server=sip_server_banner,
             sip_port=sip_port,
-            sip_transport=sip_transport,
-            srtp_downgraded=(srtp_state == "downgraded"),
             timeout=args.timeout,
         )
         hr["cve_findings"] = [
