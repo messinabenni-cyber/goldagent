@@ -12,15 +12,18 @@ from __future__ import annotations
 import ipaddress
 import socket
 import re
+import ssl as _ssl
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from typing import Optional
 
 from . import sip
 from .utils import RateLimiter, local_ip_for
 
 
 # Ports commonly running PBX management / SIP on internet-facing hosts.
-# (proto, port, service_label, fingerprint_hint)
+# (proto, port, service_label)
 DEFAULT_PORTS: list[tuple[str, int, str]] = [
     ("udp", 5060,  "SIP"),
     ("tcp", 5060,  "SIP-TCP"),
@@ -29,9 +32,14 @@ DEFAULT_PORTS: list[tuple[str, int, str]] = [
     ("tcp", 80,    "HTTP"),
     ("tcp", 443,   "HTTPS"),
     ("tcp", 4443,  "FreePBX-HTTPS"),
+    ("tcp", 5000,  "3CX-SIP"),
+    ("tcp", 5001,  "3CX-SIP-TLS"),
+    ("tcp", 5090,  "SIP-alt"),
+    ("tcp", 8080,  "HTTP-alt"),
     ("tcp", 8088,  "Asterisk-HTTP"),
     ("tcp", 8089,  "Grandstream-HTTPS"),
     ("tcp", 8443,  "PBX-HTTPS-alt"),
+    ("tcp", 10000, "Asterisk-RTP-check"),
 ]
 
 
@@ -41,6 +49,9 @@ class HostResult:
     open_ports: list[dict] = field(default_factory=list)
     sip: dict | None = None    # OPTIONS response summary
     fingerprint: str = "unknown"
+    version: str = ""
+    rdns: str = ""
+    ssl_cn: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -53,8 +64,8 @@ def expand_target(spec: str) -> list[str]:
     Accepts:
       - Single IP:          10.0.0.1
       - CIDR:               10.0.0.0/24
-      - Hostname:           pbx.example.com  → DNS resolved
-      - file:               file:hosts.txt   → one host per line
+      - Hostname:           pbx.example.com  -> DNS resolved
+      - file:               file:hosts.txt   -> one host per line
       - Comma-separated:    a, b, c
     """
     if spec.startswith("file:"):
@@ -113,7 +124,6 @@ def _tcp_probe(host: str, port: int, timeout: float) -> str | None:
 
 def _http_banner(host: str, port: int, timeout: float, use_tls: bool = False) -> str:
     """Send a minimal HTTP/1.0 GET and capture Server header for fingerprinting."""
-    import ssl as _ssl
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -144,6 +154,161 @@ def _http_banner(host: str, port: int, timeout: float, use_tls: bool = False) ->
             s.close()
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Version extraction
+# ---------------------------------------------------------------------------
+
+# Pattern order matters: more specific patterns must come before generic ones.
+_VERSION_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # FPBX-15.0.38(16.30.0) -> "FreePBX 15.0.38 / Asterisk 16.30.0"
+    (re.compile(r"FPBX-(\d[\d.]+)\((\d[\d.]+)\)", re.I), "FreePBX {1} / Asterisk {2}"),
+    # FreePBX 16.0.19
+    (re.compile(r"FreePBX\s+(\d[\d.]+)", re.I), "FreePBX {1}"),
+    # Asterisk PBX 18.12.1
+    (re.compile(r"Asterisk(?:\s+PBX)?\s+(\d[\d.]+)", re.I), "Asterisk {1}"),
+    # 3CXPhoneSystem 20.0 or 3CX 20.0
+    (re.compile(r"3CXPhoneSystem\s+(\d[\d.]+)", re.I), "3CX {1}"),
+    (re.compile(r"3CX\s+(\d[\d.]+)", re.I), "3CX {1}"),
+]
+
+
+def version_extract(banner: str) -> str | None:
+    """Extract a human-readable version string from a SIP/HTTP server banner.
+
+    Examples:
+      "FPBX-15.0.38(16.30.0)"   -> "FreePBX 15.0.38 / Asterisk 16.30.0"
+      "Asterisk PBX 18.12.1"    -> "Asterisk 18.12.1"
+      "3CXPhoneSystem 20.0"     -> "3CX 20.0"
+      "FreePBX 16.0.19"         -> "FreePBX 16.0.19"
+
+    Returns None if no recognisable version is found.
+    """
+    if not banner:
+        return None
+    for pattern, template in _VERSION_PATTERNS:
+        m = pattern.search(banner)
+        if m:
+            result = template
+            for i, group in enumerate(m.groups(), start=1):
+                result = result.replace("{" + str(i) + "}", group)
+            return result
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Reverse DNS lookup
+# ---------------------------------------------------------------------------
+
+def rdns_lookup(ip: str) -> str | None:
+    """Perform a PTR record lookup for *ip*.
+
+    Uses socket.gethostbyaddr with a 2-second timeout enforced via SIGALRM
+    (Unix only) or a best-effort approach on other platforms.
+    Returns the primary hostname string, or None on failure.
+    """
+    def _lookup() -> str | None:
+        try:
+            hostname, _aliases, _addrs = socket.gethostbyaddr(ip)
+            return hostname if hostname else None
+        except (socket.herror, socket.gaierror, OSError):
+            return None
+
+    # Use SIGALRM for a hard 2-second timeout where available (Linux/macOS).
+    try:
+        def _handler(signum, frame):
+            raise TimeoutError
+
+        old_handler = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(2)
+        try:
+            return _lookup()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    except (AttributeError, ValueError):
+        # SIGALRM not available (Windows); fall through without timeout.
+        return _lookup()
+
+
+# ---------------------------------------------------------------------------
+# TLS certificate CN/SAN extraction
+# ---------------------------------------------------------------------------
+
+def ssl_cn_extract(host: str, port: int, timeout: float) -> str | None:
+    """Connect TLS to *host*:*port* and return the certificate CN or SANs.
+
+    SANs (dNSName entries) are preferred over the Common Name.
+    Returns a comma-separated string of names, or None on any failure.
+    """
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE  # Accept self-signed certs common on PBXes
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+                if not cert:
+                    return None
+
+                # Prefer SANs
+                sans: list[str] = []
+                for kind, value in cert.get("subjectAltName", []):
+                    if kind.lower() == "dns":
+                        sans.append(value)
+                if sans:
+                    return ", ".join(sans)
+
+                # Fall back to CN from subject
+                for rdn in cert.get("subject", []):
+                    for key, value in rdn:
+                        if key == "commonName":
+                            return value
+    except (socket.timeout, OSError, _ssl.SSLError, ConnectionRefusedError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# PBX fingerprinting
+# ---------------------------------------------------------------------------
+
+PBX_SIGNATURES = [
+    ("FreePBX",      re.compile(r"FreePBX|FPBX-", re.I)),
+    ("Asterisk",     re.compile(r"Asterisk", re.I)),
+    ("Grandstream",  re.compile(r"Grandstream|GXP|GXV|UCM|HT[0-9]|DP[0-9]", re.I)),
+    ("Kamailio",     re.compile(r"Kamailio|OpenSER|SER", re.I)),
+    ("OpenSIPS",     re.compile(r"OpenSIPS", re.I)),
+    ("3CX",          re.compile(r"3CX|PhoneSystem|3CXPhoneSystem", re.I)),
+    ("FreeSWITCH",   re.compile(r"FreeSWITCH", re.I)),
+    ("Mitel",        re.compile(r"Mitel|MiVoice|MiCollab|ShoreTel", re.I)),
+    ("Yealink",      re.compile(r"Yealink", re.I)),
+    ("Cisco",        re.compile(r"Cisco-SIP|CUCM|Unified Communications", re.I)),
+    ("Avaya",        re.compile(r"Avaya|Aura|Communication Manager", re.I)),
+    ("Sangoma",      re.compile(r"Sangoma", re.I)),
+]
+
+
+def fingerprint_banner(banner: str) -> str:
+    if not banner:
+        return "unknown"
+    for name, rx in PBX_SIGNATURES:
+        if rx.search(banner):
+            return name
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Host probe
+# ---------------------------------------------------------------------------
+
+# Ports that carry HTTPS (TLS-wrapped HTTP).
+_HTTPS_PORTS: frozenset[int] = frozenset({443, 4443, 8443, 8089})
+
+# Ports where we fetch HTTP(S) banners.
+_HTTP_PROBE_PORTS: frozenset[int] = frozenset({80, 443, 4443, 8080, 8088, 8089, 8443})
 
 
 def probe_host(host: str, timeout: float = 2.0,
@@ -186,22 +351,46 @@ def probe_host(host: str, timeout: float = 2.0,
                     "transport": "udp",
                 }
                 result.fingerprint = fingerprint_banner(resp.server)
+                # Version from SIP banner
+                if not result.version:
+                    ver = version_extract(resp.server)
+                    if ver:
+                        result.version = ver
             continue
 
         # TCP
         banner = _tcp_probe(host, port, timeout)
         if banner is None:
             continue
-        entry = {"port": port, "proto": "tcp", "service": service, "banner": banner[:200]}
+        entry: dict = {"port": port, "proto": "tcp", "service": service,
+                        "banner": banner[:200]}
 
         # Extract HTTP server header where applicable
-        if port in (80, 443, 4443, 8088, 8089, 8443):
-            http_text = _http_banner(host, port, timeout,
-                                      use_tls=(port in (443, 4443, 8089, 8443)))
+        if port in _HTTP_PROBE_PORTS:
+            use_tls = port in _HTTPS_PORTS
+            http_text = _http_banner(host, port, timeout, use_tls=use_tls)
             entry["banner"] = http_text[:300]
-            srv = re.search(r"(?i)^server\s*:\s*([^\r\n]+)", http_text, re.MULTILINE)
-            if srv:
-                entry["server"] = srv.group(1).strip()
+            srv_m = re.search(r"(?i)^server\s*:\s*([^\r\n]+)", http_text, re.MULTILINE)
+            if srv_m:
+                srv_header = srv_m.group(1).strip()
+                entry["server"] = srv_header
+                # Fingerprint from HTTP Server header if SIP hasn't set one yet
+                if result.fingerprint == "unknown":
+                    fp = fingerprint_banner(srv_header)
+                    if fp != "unknown":
+                        result.fingerprint = fp
+                # Version from HTTP Server header
+                if not result.version:
+                    ver = version_extract(srv_header)
+                    if ver:
+                        result.version = ver
+
+            # TLS certificate CN/SAN
+            if use_tls and not result.ssl_cn:
+                cn = ssl_cn_extract(host, port, timeout)
+                if cn:
+                    result.ssl_cn = cn
+
         result.open_ports.append(entry)
 
     # --- TCP SIP fallback ---
@@ -225,6 +414,10 @@ def probe_host(host: str, timeout: float = 2.0,
                     "transport": transport,
                 }
                 result.fingerprint = fingerprint_banner(resp.server)
+                if not result.version:
+                    ver = version_extract(resp.server)
+                    if ver:
+                        result.version = ver
                 # Mark the TCP port as SIP
                 for p in result.open_ports:
                     if p["port"] == sip_port and p["proto"] == "tcp":
@@ -235,6 +428,7 @@ def probe_host(host: str, timeout: float = 2.0,
 
     if not result.open_ports:
         return None
+
     if result.fingerprint == "unknown":
         # Fall back to HTTP server banner fingerprint
         for op in result.open_ports:
@@ -242,32 +436,18 @@ def probe_host(host: str, timeout: float = 2.0,
                 fp = fingerprint_banner(op["server"])
                 if fp != "unknown":
                     result.fingerprint = fp
+                    if not result.version:
+                        ver = version_extract(op["server"])
+                        if ver:
+                            result.version = ver
                     break
+
+    # rDNS lookup (always, regardless of whether SIP/HTTP responded)
+    rdns = rdns_lookup(host)
+    if rdns:
+        result.rdns = rdns
+
     return result
-
-
-# ---------------------------------------------------------------------------
-# PBX fingerprinting
-# ---------------------------------------------------------------------------
-
-PBX_SIGNATURES = [
-    ("FreePBX",      re.compile(r"FreePBX|FPBX-", re.I)),
-    ("Asterisk",     re.compile(r"Asterisk", re.I)),
-    ("Grandstream",  re.compile(r"Grandstream|GXP|GXV|UCM|HT[0-9]|DP[0-9]", re.I)),
-    ("Kamailio",     re.compile(r"Kamailio|OpenSER|SER", re.I)),
-    ("OpenSIPS",     re.compile(r"OpenSIPS", re.I)),
-    ("3CX",          re.compile(r"3CX", re.I)),
-    ("FreeSWITCH",   re.compile(r"FreeSWITCH", re.I)),
-]
-
-
-def fingerprint_banner(banner: str) -> str:
-    if not banner:
-        return "unknown"
-    for name, rx in PBX_SIGNATURES:
-        if rx.search(banner):
-            return name
-    return "unknown"
 
 
 # ---------------------------------------------------------------------------
