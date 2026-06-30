@@ -18,6 +18,22 @@ from dataclasses import asdict
 from scanner import ami, auth, call, discovery, enumeration, http_probes, report
 from scanner.utils import TrafficLog, hash_file
 
+# Mode preset definitions: (rate, timeout, workers, jitter_label)
+_MODE_PRESETS: dict[str, dict] = {
+    "fast": {
+        "rate": 100.0, "timeout": 1.5, "workers": 64,
+        "desc": "aggressive speed (rate=100, timeout=1.5s, workers=64)",
+    },
+    "standard": {
+        "rate": 50.0, "timeout": 3.0, "workers": 32,
+        "desc": "balanced defaults (rate=50, timeout=3s, workers=32)",
+    },
+    "stealth": {
+        "rate": 5.0, "timeout": 5.0, "workers": 4,
+        "desc": "low-and-slow (rate=5, timeout=5s, workers=4)",
+    },
+}
+
 
 BANNER = r"""
   __      __   ___ ____    ____
@@ -138,20 +154,32 @@ def parse_args() -> argparse.Namespace:
                    help="Media-plane SRTP policy")
     c.add_argument("--call-dtmf",
                    help='DTMF sequence after answer (e.g. "1p500#"; pN = N-ms pause)')
+    c.add_argument("--discover-prefix", action="store_true",
+                   help="Auto-discover dial-plan prefix (9, 0, +, etc.) by trying "
+                        "common prefixes before the full call test. Updates --call-to "
+                        "with the working prefixed destination.")
 
     t = p.add_argument_group("Tuning")
-    t.add_argument("--rate", type=float, default=50.0,
-                   help="Max requests per second (default 50)")
-    t.add_argument("--timeout", type=float, default=3.0,
-                   help="Socket timeout in seconds (default 3)")
-    t.add_argument("--workers", type=int, default=32,
-                   help="Parallel workers for sweeps (default 32)")
+    t.add_argument("--mode", choices=["fast", "standard", "stealth"],
+                   default="standard",
+                   help="Preset: fast (aggressive), standard (default), stealth "
+                        "(low-and-slow). Overridden by explicit --rate/--timeout/--workers.")
+    t.add_argument("--rate", type=float, default=None,
+                   help="Max requests per second (default: from --mode)")
+    t.add_argument("--timeout", type=float, default=None,
+                   help="Socket timeout in seconds (default: from --mode)")
+    t.add_argument("--workers", type=int, default=None,
+                   help="Parallel workers for sweeps (default: from --mode)")
     t.add_argument("--port", type=int, default=5060,
                    help="SIP port (default 5060)")
     t.add_argument("--ami-port", type=int, default=5038,
                    help="AMI port (default 5038)")
     t.add_argument("--source-ip", default="",
                    help="Bind local sockets to this IP (for multi-NIC hosts)")
+    t.add_argument("--stun",
+                   help="Resolve public IP via STUN before scan and patch into SIP "
+                        "headers (e.g. 'stun.l.google.com' or 'host:port'). "
+                        "Use '--stun auto' to try public STUN servers automatically.")
     t.add_argument("--source-port-range",
                    help="Bind within port range, inclusive (e.g. '5060-5099')")
     t.add_argument("--max-failures-per-ext", type=int, default=5,
@@ -193,12 +221,36 @@ def main() -> int:
         args.spray = True
         args.ami_attack = True
 
+    # Apply mode preset first; explicit flags override it
+    preset = _MODE_PRESETS[args.mode]
+    if args.rate is None:
+        args.rate = preset["rate"]
+    if args.timeout is None:
+        args.timeout = preset["timeout"]
+    if args.workers is None:
+        args.workers = preset["workers"]
+    print(f"[*] Mode: {args.mode} — {preset['desc']}")
+
     if args.call_test and not args.call_to:
         print("ERROR: --call-test requires --call-to (a number YOU control)",
               file=sys.stderr)
         return 2
 
     source_port_range = _parse_port_range(args.source_port_range)
+
+    # STUN: resolve public IP to fix Via/Contact when behind NAT
+    if args.stun:
+        from scanner.stun import resolve_public_ip
+        stun_arg = None if args.stun.lower() == "auto" else args.stun
+        print("[*] Resolving public IP via STUN...")
+        public_ip = resolve_public_ip(stun_server=stun_arg, timeout=args.timeout)
+        if public_ip:
+            print(f"[+] Public IP (reflexive): {public_ip} — will be used in SIP headers")
+            if not args.source_ip:
+                args.source_ip = public_ip
+        else:
+            print("[!] STUN lookup failed — continuing with local IP (may fail behind NAT)",
+                  file=sys.stderr)
 
     operator, scope_sha = authorize(args)
 
@@ -345,10 +397,28 @@ def main() -> int:
                     call_from = call_from or openish[0]["extension"]
             call_from = call_from or "1000"
 
-            print(f"[+] {h.ip}: placing PoC call {call_from} → {args.call_to} "
+            # ---- Dial-plan prefix discovery ----
+            effective_call_to = args.call_to
+            if args.discover_prefix:
+                print(f"[*] {h.ip}: discovering dial-plan prefix for {args.call_to}...")
+                found_prefix, effective_call_to = call.discover_dialplan_prefix(
+                    h.ip, args.call_to, call_from,
+                    port=args.port, username=username, password=password,
+                    timeout=args.timeout, traffic_log=traffic_log,
+                    source_ip=args.source_ip,
+                    source_port_range=source_port_range,
+                )
+                if found_prefix is not None:
+                    label = repr(found_prefix) if found_prefix else "''"
+                    print(f"[+] Dial-plan prefix: {label} → dialling as {effective_call_to}")
+                else:
+                    print(f"[!] No prefix produced a provisional response; "
+                          f"using bare number {effective_call_to}")
+
+            print(f"[+] {h.ip}: placing PoC call {call_from} → {effective_call_to} "
                   f"(dry_run={args.call_dry_run})")
             result = call.place_call(
-                h.ip, args.call_to, call_from,
+                h.ip, effective_call_to, call_from,
                 port=args.port,
                 username=username, password=password,
                 timeout=args.timeout, dry_run=args.call_dry_run,
@@ -362,7 +432,7 @@ def main() -> int:
                 dtmf_digits=args.call_dtmf or "",
             )
             hr["call_test"] = {
-                "call_to": args.call_to, "call_from": call_from,
+                "call_to": effective_call_to, "call_from": call_from,
                 "success": result.success,
                 "reached_dialplan": result.reached_dialplan,
                 "status_code": result.status_code,

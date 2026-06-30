@@ -165,6 +165,23 @@ def build_findings(report: dict) -> list[dict]:
                 ),
             })
 
+        # SRTP downgrade
+        if ct and ct.get("srtp_state") == "downgraded":
+            findings.append({
+                "severity": "medium", "host": ip,
+                "title": "PBX silently accepted unencrypted media when SRTP was offered",
+                "detail": (
+                    f"An INVITE with a=crypto (AES_CM_128_HMAC_SHA1_80) was sent. "
+                    f"The 200 OK answer omitted a=crypto, indicating the PBX "
+                    f"downgraded the call to cleartext RTP without notifying either party."
+                ),
+                "remediation": (
+                    "Set rtp_encryption=yes (or media_encryption=sdes) on all "
+                    "trunks. Configure force_avp=no and set a deny rule for "
+                    "RTP/AVP when SAVP is offered."
+                ),
+            })
+
         # HTTP probes
         for f in host.get("http_findings", []):
             findings.append({
@@ -180,6 +197,103 @@ def build_findings(report: dict) -> list[dict]:
 
 def _esc(value) -> str:
     return _html.escape(str(value))
+
+
+def _auto_executive_summary(report: dict, findings: list[dict]) -> str:
+    """Build a one-paragraph plain-English summary from the scan data."""
+    hosts = report.get("hosts", [])
+    target = report.get("target", "the target")
+    counts = severity_counts(findings)
+
+    if not hosts:
+        return (
+            f"No VoIP services were discovered on <code>{_esc(target)}</code> "
+            "during the assessment window. This may indicate the target was "
+            "offline, protected by an upstream firewall, or the port range "
+            "was restricted. No findings to report."
+        )
+
+    # Gather first interesting host data
+    pbx_names: list[str] = []
+    pbx_ips: list[str] = []
+    toll_fraud_ip: str | None = None
+    anon_invite_count = 0
+    cred_count = 0
+    ami_pwned = False
+
+    for h in hosts:
+        fp = h.get("fingerprint", "unknown")
+        ip = h.get("ip", "")
+        if fp != "unknown":
+            label = fp
+            sip_server = (h.get("sip") or {}).get("server", "")
+            if sip_server and fp.lower() in sip_server.lower():
+                label = sip_server.split("/")[0].strip()
+            pbx_names.append(label)
+        pbx_ips.append(ip)
+
+        ct = h.get("call_test")
+        if ct and ct.get("success") and not toll_fraud_ip:
+            toll_fraud_ip = ip
+
+        anon_invite_count += sum(
+            1 for e in h.get("extensions", []) if e.get("anonymous_invite")
+        )
+        cred_count += len(h.get("credentials_found", []))
+        if (h.get("ami") or {}).get("success"):
+            ami_pwned = True
+
+    total = counts.get("critical", 0) + counts.get("high", 0)
+    host_desc = (
+        f"{pbx_names[0]} on {pbx_ips[0]}"
+        if (pbx_names and pbx_ips)
+        else f"{len(hosts)} PBX host(s)"
+    )
+
+    parts: list[str] = [
+        f"{counts.get('critical', 0)} critical and "
+        f"{counts.get('high', 0)} high severity finding(s) were identified "
+        f"against {_esc(host_desc)}."
+    ]
+
+    if toll_fraud_ip:
+        parts.append(
+            "Toll fraud is <strong>immediately exploitable</strong>: "
+            "the tool successfully placed an outbound call to the operator-"
+            "controlled destination via the PBX without authentication, "
+            "confirming that any caller on the internet can route calls at "
+            "the account-holder's expense."
+        )
+
+    if anon_invite_count:
+        parts.append(
+            f"{anon_invite_count} extension(s) accepted INVITE requests "
+            "without requiring authentication, enabling call routing, "
+            "eavesdropping setup, and service abuse without credentials."
+        )
+
+    if cred_count:
+        parts.append(
+            f"{cred_count} valid extension credential(s) were recovered via "
+            "default-password spraying — confirmed working on REGISTER."
+        )
+
+    if ami_pwned:
+        parts.append(
+            "The Asterisk Manager Interface authenticated with default "
+            "credentials, granting full call-plane control and access to "
+            "extension/voicemail enumeration via AMI commands."
+        )
+
+    if total == 0:
+        parts = [
+            f"No critical or high severity findings were identified against "
+            f"{_esc(host_desc)}. "
+            "Lower-severity findings (informational / medium) are detailed in "
+            "the findings table below."
+        ]
+
+    return " ".join(parts)
 
 
 def render_html(report: dict) -> str:
@@ -241,6 +355,8 @@ def render_html(report: dict) -> str:
 </table>
 """
 
+    exec_summary = _auto_executive_summary(report, findings)
+
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
 <title>VoIP Pentest Report — {target}</title>
@@ -277,12 +393,7 @@ th{{background:#0b1a33;color:#fff;font-weight:600;font-size:13px}}
 <h2>Executive Summary</h2>
 <div class="kpi-grid">{kpi_html}</div>
 
-<p>This report documents the findings of an authorised VoIP penetration
-test against <code>{target}</code>. The assessment targeted SIP/PBX
-infrastructure for weaknesses that enable unauthorised call routing,
-toll fraud, and management-plane compromise.
-{counts.get('critical', 0)} critical and {counts.get('high', 0)} high
-severity findings were identified.</p>
+<p>{exec_summary}</p>
 
 <h2>Findings</h2>
 <table>

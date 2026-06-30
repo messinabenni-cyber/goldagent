@@ -353,3 +353,50 @@ def place_call(
         srtp_state=srtp_state,
         dtmf_digits_sent=getattr(final, "_dtmf_sent", []),
     )
+
+
+# ---------------------------------------------------------------------------
+# Dial-plan prefix discovery
+# ---------------------------------------------------------------------------
+
+# Common PSTN access prefixes tried in order.
+# Empty string = bare E.164 (try first — direct is always cheapest).
+DIALPLAN_PREFIXES: list[str] = ["", "9", "0", "00", "+", "1", "011"]
+
+
+def discover_dialplan_prefix(
+    host: str,
+    call_to: str,
+    call_from: str,
+    *,
+    port: int = 5060,
+    username: str | None = None,
+    password: str | None = None,
+    timeout: float = 5.0,
+    traffic_log=None,
+    source_ip: str = "",
+    source_port_range: tuple[int, int] | None = None,
+    prefixes: list[str] | None = None,
+) -> tuple[str | None, str]:
+    """Try common dial-plan prefixes until one produces a provisional response.
+
+    Returns (winning_prefix, full_destination) or (None, call_to) if none work.
+    The winner is the prefix that caused the PBX to return 100/180/183 — i.e.
+    the dialplan routed the call toward the PSTN rather than rejecting it.
+    """
+    if prefixes is None:
+        prefixes = DIALPLAN_PREFIXES
+
+    for prefix in prefixes:
+        dest = f"{prefix}{call_to}" if prefix else call_to
+        result = place_call(
+            host, dest, call_from,
+            port=port, username=username, password=password,
+            timeout=timeout, dry_run=True, max_wait=timeout + 2.0,
+            traffic_log=traffic_log,
+            source_ip=source_ip, source_port_range=source_port_range,
+        )
+        if result.reached_dialplan:
+            return prefix, dest
+
+    return None, call_to
