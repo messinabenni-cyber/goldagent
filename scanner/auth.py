@@ -128,6 +128,7 @@ def spray(
     stop_on_first: bool = True,
     smart_self_password: bool = True,
     max_failures_per_ext: int = 5,
+    ami_cracked_passwords=None,
     source_ip: str = "",
     tcp: bool = False,
     use_tls: bool = False,
@@ -149,6 +150,10 @@ def spray(
 
     def _pairs_for(ext: str) -> list[tuple[str, str]]:
         pairs: list[tuple[str, str]] = []
+        if ami_cracked_passwords:
+            for p in ami_cracked_passwords:
+                if p:
+                    pairs.append((ext, p))
         if smart_self_password:
             pairs.append((ext, ext))
             pairs.append((ext, ""))
@@ -170,6 +175,9 @@ def spray(
         ok, ev = _try_register(host, ext, u, p, port=port, local_ip=local_ip,
                                 timeout=timeout, traffic_log=traffic_log,
                                 tcp=tcp, use_tls=use_tls)
+        if not ok and ("429" in ev or "503" in ev):
+            import time as _time
+            _time.sleep(2.0)
         return CredHit(ext, u, p, ok, ev)
 
     # Build the work list

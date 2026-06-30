@@ -401,7 +401,8 @@ def main() -> int:
         _ok(f"{len(hosts)} host(s) responded:", col)
         for h in hosts:
             ports_str = " ".join(f"{p['port']}/{p['proto']}" for p in h.open_ports)
-            _ok(f"  {col.BOLD}{h.ip}{col.RESET}  [{h.fingerprint}]  {ports_str}", col)
+            ver_str = ("  v:" + (getattr(h, "version", "") or "?")) if getattr(h, "version", "") else ""
+            _ok(f"  {col.BOLD}{h.ip}{col.RESET}  [{h.fingerprint}]{ver_str}  {ports_str}", col)
 
     host_reports: list[dict] = []
 

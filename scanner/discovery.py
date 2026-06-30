@@ -283,11 +283,11 @@ PBX_SIGNATURES = [
     ("OpenSIPS",     re.compile(r"OpenSIPS", re.I)),
     ("3CX",          re.compile(r"3CX|PhoneSystem|3CXPhoneSystem", re.I)),
     ("FreeSWITCH",   re.compile(r"FreeSWITCH", re.I)),
-    ("Mitel",        re.compile(r"Mitel|MiVoice|MiCollab|ShoreTel", re.I)),
-    ("Yealink",      re.compile(r"Yealink", re.I)),
-    ("Cisco",        re.compile(r"Cisco-SIP|CUCM|Unified Communications", re.I)),
-    ("Avaya",        re.compile(r"Avaya|Aura|Communication Manager", re.I)),
-    ("Sangoma",      re.compile(r"Sangoma", re.I)),
+    ("Mitel",      re.compile(r"Mitel|MiVoice|MiCollab|5000HCP", re.I)),
+    ("Sangoma",    re.compile(r"Sangoma|PBXact", re.I)),
+    ("Avaya",      re.compile(r"Avaya|Aura|IPOffice", re.I)),
+    ("Yealink",    re.compile(r"Yealink", re.I)),
+    ("Cisco",      re.compile(r"Cisco|CUCM|SPA[0-9]", re.I)),
 ]
 
 
@@ -298,6 +298,27 @@ def fingerprint_banner(banner: str) -> str:
         if rx.search(banner):
             return name
     return "unknown"
+
+
+def version_from_banner(banner):
+    if not banner:
+        return ""
+    m = re.search(r"FPBX-([\d.]+)\(([\d.]+)\)", banner, re.I)
+    if m:
+        return "FreePBX " + m.group(1) + " / Asterisk " + m.group(2)
+    m = re.search(r"FreePBX[\s/]+([\d.]+)", banner, re.I)
+    if m:
+        return "FreePBX " + m.group(1)
+    m = re.search(r"Asterisk[\s/]+([\d.]+)", banner, re.I)
+    if m:
+        return "Asterisk " + m.group(1)
+    m = re.search(r"3CX[a-zA-Z]*/?( [\d.]+)", banner, re.I)
+    if m:
+        return "3CX " + m.group(1)
+    m = re.search(r"(UCM\w+)\s+([\d.]+)", banner, re.I)
+    if m:
+        return "Grandstream " + m.group(1) + " " + m.group(2)
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +372,7 @@ def probe_host(host: str, timeout: float = 2.0,
                     "transport": "udp",
                 }
                 result.fingerprint = fingerprint_banner(resp.server)
+                result.version = version_from_banner(resp.server)
                 # Version from SIP banner
                 if not result.version:
                     ver = version_extract(resp.server)
@@ -414,6 +436,7 @@ def probe_host(host: str, timeout: float = 2.0,
                     "transport": transport,
                 }
                 result.fingerprint = fingerprint_banner(resp.server)
+                result.version = version_from_banner(resp.server)
                 if not result.version:
                     ver = version_extract(resp.server)
                     if ver:
