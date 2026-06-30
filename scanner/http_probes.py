@@ -26,6 +26,60 @@ class HttpFinding:
     remediation: str
 
 
+def _http_post(host: str, port: int, path: str, body: str, timeout: float,
+               use_tls: bool = False,
+               content_type: str = "application/json") -> tuple[int, str, bytes]:
+    """POST request. Returns (status, server_header, body_first_4k). (0,"",b"") on error."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            s = ctx.wrap_socket(s, server_hostname=host)
+        body_bytes = body.encode("utf-8")
+        req = (
+            f"POST {path} HTTP/1.0\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: {content_type}\r\n"
+            f"Content-Length: {len(body_bytes)}\r\n"
+            "User-Agent: Mozilla/5.0 VoIPScan/3.0\r\n"
+            "\r\n"
+        )
+        s.sendall(req.encode() + body_bytes)
+        raw = b""
+        while len(raw) < 16384:
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            raw += chunk
+        text = raw.decode("utf-8", errors="replace")
+        head, _, resp_body = text.partition("\r\n\r\n")
+        status = 0
+        try:
+            status = int(head.split(" ", 2)[1])
+        except (IndexError, ValueError):
+            pass
+        server = ""
+        for line in head.splitlines():
+            if line.lower().startswith("server:"):
+                server = line.split(":", 1)[1].strip()
+                break
+        return status, server, resp_body.encode("utf-8", errors="replace")[:4096]
+    except (socket.timeout, OSError, ssl.SSLError):
+        return 0, "", b""
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
 def _http_get(host: str, port: int, path: str, timeout: float,
               use_tls: bool = False) -> tuple[int, str, bytes]:
     """Return (status, server_header, body_first_4k). (0,"",b"") on error."""
@@ -181,6 +235,122 @@ def probe_grandstream_ui(host: str, port: int, use_tls: bool,
     return None
 
 
+def probe_grandstream_cve_2021_37748(host: str, port: int, use_tls: bool,
+                                      timeout: float = 3.0) -> HttpFinding | None:
+    """CVE-2021-37748: Grandstream UCM6xxx unauthenticated config disclosure."""
+    if port not in (80, 443, 8089, 8443):
+        return None
+    status, _, body = _http_get(host, port, "/cgi-bin/api-get_config",
+                                 timeout, use_tls)
+    text = body.decode("utf-8", errors="replace").lower()
+    if status == 200 and any(kw in text for kw in
+                              ("extension", "password", "sippassword", "secret",
+                               "peer", "trunk", "voicemail")):
+        return HttpFinding(
+            name="grandstream-cve-2021-37748",
+            severity="critical",
+            target=f"{host}:{port}",
+            title="CVE-2021-37748: Grandstream UCM config exposed without authentication",
+            evidence=(
+                f"GET /cgi-bin/api-get_config returned HTTP {status} with "
+                "config keywords (extension/password/secret) in the response "
+                "— no authentication required."
+            ),
+            remediation=(
+                "Update UCM firmware to 1.0.20.22 or later. Block "
+                "/cgi-bin/api-get_config at the perimeter firewall as an "
+                "immediate mitigation."
+            ),
+        )
+    return None
+
+
+def probe_grandstream_default_creds(host: str, port: int, use_tls: bool,
+                                     timeout: float = 3.0) -> HttpFinding | None:
+    """Try Grandstream UCM default admin/admin via the REST login API."""
+    if port not in (80, 443, 8089, 8443):
+        return None
+    import json as _json
+    body = _json.dumps({"action": "login", "user": "admin", "password": "admin"})
+    status, _, resp = _http_post(host, port, "/cgi-bin/api.values.get",
+                                  body, timeout, use_tls)
+    text = resp.decode("utf-8", errors="replace")
+    if status in (200, 201) and (
+        '"status":true' in text or '"authenticated"' in text
+        or '"session"' in text.lower()
+    ):
+        return HttpFinding(
+            name="grandstream-default-creds",
+            severity="critical",
+            target=f"{host}:{port}",
+            title="Grandstream UCM authenticated with default credentials (admin/admin)",
+            evidence=f"POST /cgi-bin/api.values.get with admin/admin returned HTTP {status} indicating login success.",
+            remediation=(
+                "Change the Grandstream admin password immediately via "
+                "System → User Management. Default credentials allow full "
+                "device takeover and SIP credential extraction."
+            ),
+        )
+    return None
+
+
+def probe_freepbx_rest_api(host: str, port: int, use_tls: bool,
+                            timeout: float = 3.0) -> HttpFinding | None:
+    """FreePBX REST API (/admin/api) reachability check."""
+    if port not in (80, 443, 4443, 8443):
+        return None
+    status, _, body = _http_get(host, port, "/admin/api/api/version",
+                                 timeout, use_tls)
+    text = body.decode("utf-8", errors="replace").lower()
+    if status in (200, 401, 403) and any(kw in text for kw in
+                                          ("freepbx", "fpbx", "version",
+                                           "api", "unauthorized")):
+        return HttpFinding(
+            name="freepbx-rest-api-exposed",
+            severity="high",
+            target=f"{host}:{port}",
+            title="FreePBX REST API exposed to the internet",
+            evidence=(
+                f"GET /admin/api/api/version returned HTTP {status}. "
+                "The REST API uses the same admin credentials as the web UI "
+                "and allows full PBX control via authenticated requests."
+            ),
+            remediation=(
+                "Restrict /admin/api to an IP allow-list or VPN. "
+                "Enable HTTP basic auth or API key requirements."
+            ),
+        )
+    return None
+
+
+def probe_asterisk_rawman(host: str, port: int, use_tls: bool,
+                           timeout: float = 3.0) -> HttpFinding | None:
+    """Asterisk built-in HTTP management API (/rawman) reachability check."""
+    if port not in (8088, 8089):
+        return None
+    status, server, body = _http_get(host, port, "/rawman", timeout, use_tls)
+    text = body.decode("utf-8", errors="replace")
+    if status != 0 and ("Response:" in text or "Asterisk" in server
+                         or "rawman" in text.lower()):
+        return HttpFinding(
+            name="asterisk-rawman-exposed",
+            severity="high",
+            target=f"{host}:{port}",
+            title="Asterisk HTTP management API (/rawman) reachable",
+            evidence=(
+                f"GET /rawman returned HTTP {status}; Server: {server!r}. "
+                "/rawman provides call-plane control equivalent to AMI over "
+                "plain HTTP — Originate, Hangup, SIPpeers, etc."
+            ),
+            remediation=(
+                "Set enabled=no in /etc/asterisk/http.conf unless the "
+                "Asterisk built-in HTTP server is required. If needed, bind "
+                "to 127.0.0.1 and reverse-proxy with strong authentication."
+            ),
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -190,6 +360,10 @@ PROBES = [
     probe_freepbx_recordings,
     probe_asterisk_arf,
     probe_grandstream_ui,
+    probe_grandstream_cve_2021_37748,
+    probe_grandstream_default_creds,
+    probe_freepbx_rest_api,
+    probe_asterisk_rawman,
 ]
 
 

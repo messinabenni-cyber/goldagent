@@ -113,3 +113,79 @@ def severity_counts(findings: list[dict]) -> dict[str, int]:
         if sev in out:
             out[sev] += 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# Terminal colours + live progress
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+import threading as _threading
+
+
+class Colours:
+    """ANSI escape codes. Degrades to empty strings when stdout is not a TTY."""
+
+    def __init__(self, force: bool | None = None):
+        on = _sys.stdout.isatty() if force is None else force
+        self.RED    = "\033[91m" if on else ""
+        self.GREEN  = "\033[92m" if on else ""
+        self.YELLOW = "\033[93m" if on else ""
+        self.CYAN   = "\033[96m" if on else ""
+        self.BOLD   = "\033[1m"  if on else ""
+        self.DIM    = "\033[2m"  if on else ""
+        self.RESET  = "\033[0m"  if on else ""
+
+    def for_severity(self, sev: str) -> str:
+        return {
+            "critical": self.RED + self.BOLD,
+            "high":     self.RED,
+            "medium":   self.YELLOW,
+            "low":      self.GREEN,
+            "info":     self.CYAN,
+        }.get(sev.lower(), "")
+
+
+class Progress:
+    """Thread-safe in-place terminal progress counter.
+
+    Pass `prog.tick` as the `progress_cb` argument to enumeration sweeps.
+    Call `prog.close()` when done to emit a trailing newline.
+    """
+
+    def __init__(self, label: str, total: int, col: "Colours | None" = None):
+        self._label = label
+        self._total = max(total, 1)
+        self._done  = 0
+        self._hits  = 0
+        self._col   = col
+        self._tty   = _sys.stdout.isatty()
+        self._lock  = _threading.Lock()
+
+    def tick(self, hit: bool = False) -> None:
+        with self._lock:
+            self._done += 1
+            if hit:
+                self._hits += 1
+            self._draw()
+
+    def _draw(self) -> None:
+        if not self._tty:
+            return
+        pct    = int(100 * self._done / self._total)
+        bw     = 26
+        filled = min(bw, int(bw * self._done / self._total))
+        bar    = "=" * filled + (">" if filled < bw else "") + " " * max(0, bw - filled - 1)
+        c = self._col
+        g, r = (c.GREEN, c.RESET) if c else ("", "")
+        hits_str = f"  hits:{g}{self._hits}{r}" if self._hits else ""
+        _sys.stdout.write(
+            f"\r  {self._label}: [{bar}] {self._done}/{self._total} ({pct}%)"
+            f"{hits_str}    "
+        )
+        _sys.stdout.flush()
+
+    def close(self) -> None:
+        if self._tty:
+            _sys.stdout.write("\n")
+            _sys.stdout.flush()

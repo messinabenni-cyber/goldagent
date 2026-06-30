@@ -175,6 +175,7 @@ def sweep(
     timeout: float = 3.0,
     max_workers: int = 20,
     traffic_log=None,
+    progress_cb=None,   # Callable[[bool], None] — called with hit=True/False per result
 ) -> list[ExtensionResult]:
     """Parallel sweep over a list of extension candidates. Returns only hits."""
     local_ip = local_ip_for(host)
@@ -190,9 +191,14 @@ def sweep(
         for fut in as_completed(futures):
             try:
                 r = fut.result()
-                if r.exists:
+                hit = r.exists
+                if hit:
                     hits.append(r)
+                if progress_cb:
+                    progress_cb(hit)
             except Exception:
+                if progress_cb:
+                    progress_cb(False)
                 continue
     return sorted(hits, key=lambda r: (len(r.extension), r.extension))
 
@@ -207,6 +213,7 @@ def adaptive_sweep(
     timeout: float = 3.0,
     max_workers: int = 20,
     traffic_log=None,
+    progress_cb=None,
 ) -> list[ExtensionResult]:
     """Two-pass sweep: every Nth extension first, then ±radius around each hit.
 
@@ -215,7 +222,7 @@ def adaptive_sweep(
     coarse_cands = [str(n) for n in range(low, high + 1, coarse_step)]
     coarse_hits = sweep(host, coarse_cands, port=port,
                         timeout=timeout, max_workers=max_workers,
-                        traffic_log=traffic_log)
+                        traffic_log=traffic_log, progress_cb=progress_cb)
     by_ext = {r.extension: r for r in coarse_hits}
 
     fill: set[int] = set()
@@ -232,7 +239,8 @@ def adaptive_sweep(
     if fill:
         fill_cands = [str(n) for n in sorted(fill)]
         for r in sweep(host, fill_cands, port=port, timeout=timeout,
-                       max_workers=max_workers, traffic_log=traffic_log):
+                       max_workers=max_workers, traffic_log=traffic_log,
+                       progress_cb=progress_cb):
             by_ext[r.extension] = r
 
     return sorted(by_ext.values(),
@@ -246,11 +254,12 @@ def probe_invite_acceptance(
     timeout: float = 3.0,
     max_workers: int = 20,
     traffic_log=None,
+    progress_cb=None,
 ) -> dict[str, ExtensionResult]:
     """INVITE-probe a set of extensions to capture anonymous-call acceptance."""
     results = sweep(host, extensions, port=port, method="INVITE",
                     timeout=timeout, max_workers=max_workers,
-                    traffic_log=traffic_log)
+                    traffic_log=traffic_log, progress_cb=progress_cb)
     return {r.extension: r for r in results}
 
 
