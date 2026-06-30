@@ -251,7 +251,7 @@ def probe_host(host: str, timeout: float = 2.0,
 # ---------------------------------------------------------------------------
 
 PBX_SIGNATURES = [
-    ("FreePBX",      re.compile(r"FreePBX", re.I)),
+    ("FreePBX",      re.compile(r"FreePBX|FPBX-", re.I)),
     ("Asterisk",     re.compile(r"Asterisk", re.I)),
     ("Grandstream",  re.compile(r"Grandstream|GXP|GXV|UCM|HT[0-9]|DP[0-9]", re.I)),
     ("Kamailio",     re.compile(r"Kamailio|OpenSER|SER", re.I)),
