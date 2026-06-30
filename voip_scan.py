@@ -961,8 +961,35 @@ def main() -> int:
     traffic_log.close()
 
     counts = final_report.get("severity_counts", {})
-    rs = final_report.get("risk_score", {})
-    tf = final_report.get("toll_fraud_cost", {})
+
+    # risk_score is stored as an int by write_all(); normalise to dict for display
+    _rs_raw = final_report.get("risk_score", 0)
+    if isinstance(_rs_raw, dict):
+        rs = _rs_raw
+    else:
+        _score_int = int(_rs_raw) if _rs_raw else 0
+        rs = {
+            "score": _score_int,
+            "band": (
+                "CRITICAL" if _score_int >= 75 else
+                "HIGH"     if _score_int >= 50 else
+                "MEDIUM"   if _score_int >= 25 else
+                "LOW"
+            ),
+        }
+
+    # toll_fraud_estimate uses monthly_estimate_usd; map to display keys
+    _tf_raw = final_report.get("toll_fraud_estimate", {})
+    if _tf_raw and "high_usd" not in _tf_raw:
+        _monthly = _tf_raw.get("monthly_estimate_usd", 0)
+        tf = {
+            "high_usd": int(_monthly * 1.5),
+            "low_usd": int(_monthly * 0.5),
+            "proven": _tf_raw.get("risk_level", "LOW") == "CRITICAL",
+            "scenario": _tf_raw.get("calculation_basis", ""),
+        }
+    else:
+        tf = _tf_raw
 
     # Findings summary banner
     print()
@@ -999,7 +1026,6 @@ def main() -> int:
         high_usd = tf.get("high_usd", 0)
         proven_label = (f"{col.RED}PROVEN{col.RESET}" if proven
                         else f"{col.YELLOW}ESTIMATED{col.RESET}")
-        # Format as dollars with commas; use k notation only for >= 10000
         def _fmt_usd(v: int) -> str:
             if v >= 10000:
                 return f"${v // 1000}k"
