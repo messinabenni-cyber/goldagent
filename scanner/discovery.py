@@ -64,6 +64,7 @@ def expand_target(spec: str) -> list[str]:
     Accepts:
       - Single IP:          10.0.0.1
       - CIDR:               10.0.0.0/24
+      - Dash range:         10.0.0.50-100  or  10.0.0.50-10.0.0.100
       - Hostname:           pbx.example.com  -> DNS resolved
       - file:               file:hosts.txt   -> one host per line
       - Comma-separated:    a, b, c
@@ -86,6 +87,25 @@ def expand_target(spec: str) -> list[str]:
             return [str(ip) for ip in net.hosts()]
         except ValueError:
             return []
+
+    # Dash range: 10.0.0.50-100  or  10.0.0.50-10.0.0.100
+    if "-" in spec:
+        parts = spec.split("-", 1)
+        start_s, end_s = parts[0].strip(), parts[1].strip()
+        try:
+            start_ip = ipaddress.IPv4Address(start_s)
+            # Short form: end is just the last octet
+            if re.fullmatch(r'\d+', end_s):
+                prefix = ".".join(str(start_ip).split(".")[:3])
+                end_ip = ipaddress.IPv4Address(f"{prefix}.{end_s}")
+            else:
+                end_ip = ipaddress.IPv4Address(end_s)
+            if int(end_ip) < int(start_ip):
+                return []
+            return [str(ipaddress.IPv4Address(i))
+                    for i in range(int(start_ip), int(end_ip) + 1)]
+        except (ipaddress.AddressValueError, ValueError):
+            pass  # fall through to hostname resolution
 
     # Try resolving as hostname first; fall back to treating as IP literal
     try:
