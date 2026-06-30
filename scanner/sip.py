@@ -274,6 +274,8 @@ def send_and_recv(
 ) -> bytes | None:
     """Send one UDP datagram, return first response or None on timeout/error.
 
+    source_ip is used only for socket binding — pass the local interface IP,
+    not a public/NAT address (use local_ip in build_message for SIP headers).
     source_port_range: (lo, hi) inclusive — walks the range until one binds.
     """
     if source_port_range:
@@ -284,6 +286,16 @@ def send_and_recv(
                 f"got ({lo}, {hi})"
             )
 
+    # Never bind to a non-local (public/NAT) IP — use INADDR_ANY instead
+    bind_ip = source_ip
+    try:
+        import ipaddress as _ip
+        addr = _ip.ip_address(source_ip)
+        if addr.is_global:
+            bind_ip = ""
+    except (ValueError, Exception):
+        pass
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
     bound = False
@@ -291,7 +303,7 @@ def send_and_recv(
         lo, hi = source_port_range
         for p in range(lo, hi + 1):
             try:
-                s.bind((source_ip, p))
+                s.bind((bind_ip, p))
                 local_port = p
                 bound = True
                 break
@@ -299,9 +311,9 @@ def send_and_recv(
                 continue
     if not bound:
         try:
-            s.bind((source_ip, local_port))
+            s.bind((bind_ip, local_port))
         except OSError:
-            s.bind((source_ip, 0))
+            s.bind(("", 0))
             local_port = s.getsockname()[1]
 
     try:
@@ -425,11 +437,20 @@ def options_probe(
     local_port: int = 5062,
     timeout: float = 3.0,
     traffic_log=None,
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> SipResponse | None:
-    """Standard SIP OPTIONS probe."""
+    """Standard SIP OPTIONS probe. Supports UDP (default), TCP, and TLS."""
     if not local_ip:
         from .utils import local_ip_for
         local_ip = local_ip_for(host)
+    if use_tls:
+        tcp = True
+        transport = "TLS"
+    elif tcp:
+        transport = "TCP"
+    else:
+        transport = "UDP"
     msg = build_message(
         "OPTIONS", f"sip:{host}",
         from_user="scanner", to_user="scanner",
@@ -437,8 +458,14 @@ def options_probe(
         local_ip=local_ip, local_port=local_port,
         call_id=rand_call_id(), cseq=1, from_tag=rand_tag(),
         extra_headers=["Accept: application/sdp"],
+        transport=transport,
     )
-    data = send_and_recv(msg, host, port, local_port, timeout, traffic_log=traffic_log)
+    if tcp:
+        data = send_and_recv_tcp(msg, host, port, timeout=timeout,
+                                  use_tls=use_tls, traffic_log=traffic_log)
+    else:
+        data = send_and_recv(msg, host, port, local_port, timeout,
+                              traffic_log=traffic_log)
     return parse_response(data) if data else None
 
 

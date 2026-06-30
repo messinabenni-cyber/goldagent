@@ -148,15 +148,17 @@ def _http_banner(host: str, port: int, timeout: float, use_tls: bool = False) ->
 
 def probe_host(host: str, timeout: float = 2.0,
                traffic_log=None,
-               extra_udp_ports: list[int] | None = None) -> HostResult | None:
+               extra_udp_ports: list[int] | None = None,
+               source_ip: str = "") -> HostResult | None:
     """Probe one host across all DEFAULT_PORTS + SIP OPTIONS. Returns None if
     no port/service responded.
 
-    extra_udp_ports: additional UDP ports to SIP-probe (e.g. when the user
-    specifies a non-standard --port on the CLI).
+    source_ip: if set, used as local_ip in SIP headers (e.g. STUN public IP).
+    extra_udp_ports: additional UDP ports to SIP-probe (e.g. non-standard --port).
     """
     result = HostResult(ip=host)
-    local_ip = local_ip_for(host)
+    # local_ip for SIP headers: prefer caller-supplied public/reflexive IP
+    local_ip = source_ip if source_ip else local_ip_for(host)
 
     ports_to_probe = list(DEFAULT_PORTS)
     if extra_udp_ports:
@@ -181,6 +183,7 @@ def probe_host(host: str, timeout: float = 2.0,
                     "reason": resp.reason,
                     "server": resp.server,
                     "allow": sip.parse_allowed_methods(resp),
+                    "transport": "udp",
                 }
                 result.fingerprint = fingerprint_banner(resp.server)
             continue
@@ -200,6 +203,35 @@ def probe_host(host: str, timeout: float = 2.0,
             if srv:
                 entry["server"] = srv.group(1).strip()
         result.open_ports.append(entry)
+
+    # --- TCP SIP fallback ---
+    # If UDP gave no SIP response but TCP/5060 or TCP/5061 is open, try SIP/TCP
+    # and SIP/TLS. Many internet-facing PBXes only accept SIP over TCP/TLS.
+    if result.sip is None:
+        for sip_port, use_tls in [(5060, False), (5061, True)]:
+            if not any(p["port"] == sip_port and p["proto"] == "tcp"
+                       for p in result.open_ports):
+                continue
+            transport = "tls" if use_tls else "tcp"
+            resp = sip.options_probe(host, port=sip_port, local_ip=local_ip,
+                                      timeout=timeout, traffic_log=traffic_log,
+                                      tcp=True, use_tls=use_tls)
+            if resp:
+                result.sip = {
+                    "status": resp.status_code,
+                    "reason": resp.reason,
+                    "server": resp.server,
+                    "allow": sip.parse_allowed_methods(resp),
+                    "transport": transport,
+                }
+                result.fingerprint = fingerprint_banner(resp.server)
+                # Mark the TCP port as SIP
+                for p in result.open_ports:
+                    if p["port"] == sip_port and p["proto"] == "tcp":
+                        p["service"] = f"SIP-{transport.upper()}"
+                        p["status"] = resp.status_code
+                        p["banner"] = resp.server[:200]
+                break
 
     if not result.open_ports:
         return None
@@ -249,6 +281,7 @@ def sweep(
     workers: int = 32,
     traffic_log=None,
     extra_udp_ports: list[int] | None = None,
+    source_ip: str = "",
 ) -> list[HostResult]:
     """Run probe_host concurrently over a target list. Returns hosts that
     responded on at least one port."""
@@ -258,7 +291,7 @@ def sweep(
     def _probe(host: str) -> HostResult | None:
         rate.wait()
         return probe_host(host, timeout=timeout, traffic_log=traffic_log,
-                           extra_udp_ports=extra_udp_ports)
+                           extra_udp_ports=extra_udp_ports, source_ip=source_ip)
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_probe, t): t for t in targets}

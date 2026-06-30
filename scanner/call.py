@@ -85,6 +85,12 @@ def place_call(
     Grandstream toll-fraud demonstrations.
     """
     local_ip = source_ip or local_ip_for(host)
+    # Determine bind IP: never bind to a public/NAT address (use INADDR_ANY)
+    try:
+        import ipaddress as _ip
+        bind_ip = "" if _ip.ip_address(local_ip).is_global else local_ip
+    except (ValueError, Exception):
+        bind_ip = local_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
 
@@ -93,13 +99,16 @@ def place_call(
         lo, hi = source_port_range
         for p in range(lo, hi + 1):
             try:
-                s.bind((source_ip, p))
+                s.bind((bind_ip, p))
                 bound = True
                 break
             except OSError:
                 continue
     if not bound:
-        s.bind((source_ip, 0))
+        try:
+            s.bind((bind_ip, 0))
+        except OSError:
+            s.bind(("", 0))
     local_port = s.getsockname()[1]
 
     call_id = rand_call_id()

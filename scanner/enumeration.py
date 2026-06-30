@@ -101,11 +101,19 @@ def probe(
     local_ip: str | None = None,
     timeout: float = 3.0,
     traffic_log=None,
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> ExtensionResult:
     if not local_ip:
-        local_ip = local_ip_for(host)
+        # Prefer caller-supplied public/reflexive IP for SIP headers
+        local_ip = source_ip if source_ip else local_ip_for(host)
     call_id = rand_call_id()
     tag = rand_tag()
+
+    if use_tls:
+        tcp = True
+    transport = "TLS" if use_tls else ("TCP" if tcp else "UDP")
 
     if method == "REGISTER":
         request_uri = f"sip:{host}"
@@ -114,7 +122,6 @@ def probe(
     else:   # INVITE
         request_uri = f"sip:{ext}@{host}"
         extras = []
-        # Minimal SDP so the PBX doesn't 488 us on missing media
         body = (
             "v=0\r\n"
             f"o=scanner 0 0 IN IP4 {local_ip}\r\n"
@@ -132,8 +139,14 @@ def probe(
         local_ip=local_ip, local_port=0,
         call_id=call_id, cseq=1, from_tag=tag,
         body=body, extra_headers=extras,
+        transport=transport,
     )
-    data = sip.send_and_recv(msg, host, port, 0, timeout, traffic_log=traffic_log)
+    if tcp:
+        data = sip.send_and_recv_tcp(msg, host, port, timeout=timeout,
+                                      use_tls=use_tls, traffic_log=traffic_log)
+    else:
+        data = sip.send_and_recv(msg, host, port, 0, timeout,
+                                  traffic_log=traffic_log)
     if not data:
         return ExtensionResult(ext, exists=False, evidence="no response")
     resp = sip.parse_response(data)
@@ -176,15 +189,17 @@ def sweep(
     max_workers: int = 20,
     traffic_log=None,
     progress_cb=None,   # Callable[[bool], None] — called with hit=True/False per result
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> list[ExtensionResult]:
     """Parallel sweep over a list of extension candidates. Returns only hits."""
-    local_ip = local_ip_for(host)
     hits: list[ExtensionResult] = []
 
     def _probe(ext: str) -> ExtensionResult:
         return probe(host, ext, port=port, method=method,
-                     local_ip=local_ip, timeout=timeout,
-                     traffic_log=traffic_log)
+                     timeout=timeout, traffic_log=traffic_log,
+                     source_ip=source_ip, tcp=tcp, use_tls=use_tls)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(_probe, e): e for e in extensions}
@@ -214,6 +229,9 @@ def adaptive_sweep(
     max_workers: int = 20,
     traffic_log=None,
     progress_cb=None,
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> list[ExtensionResult]:
     """Two-pass sweep: every Nth extension first, then ±radius around each hit.
 
@@ -222,7 +240,8 @@ def adaptive_sweep(
     coarse_cands = [str(n) for n in range(low, high + 1, coarse_step)]
     coarse_hits = sweep(host, coarse_cands, port=port,
                         timeout=timeout, max_workers=max_workers,
-                        traffic_log=traffic_log, progress_cb=progress_cb)
+                        traffic_log=traffic_log, progress_cb=progress_cb,
+                        source_ip=source_ip, tcp=tcp, use_tls=use_tls)
     by_ext = {r.extension: r for r in coarse_hits}
 
     fill: set[int] = set()
@@ -240,7 +259,8 @@ def adaptive_sweep(
         fill_cands = [str(n) for n in sorted(fill)]
         for r in sweep(host, fill_cands, port=port, timeout=timeout,
                        max_workers=max_workers, traffic_log=traffic_log,
-                       progress_cb=progress_cb):
+                       progress_cb=progress_cb,
+                       source_ip=source_ip, tcp=tcp, use_tls=use_tls):
             by_ext[r.extension] = r
 
     return sorted(by_ext.values(),
@@ -255,11 +275,15 @@ def probe_invite_acceptance(
     max_workers: int = 20,
     traffic_log=None,
     progress_cb=None,
+    source_ip: str = "",
+    tcp: bool = False,
+    use_tls: bool = False,
 ) -> dict[str, ExtensionResult]:
     """INVITE-probe a set of extensions to capture anonymous-call acceptance."""
     results = sweep(host, extensions, port=port, method="INVITE",
                     timeout=timeout, max_workers=max_workers,
-                    traffic_log=traffic_log, progress_cb=progress_cb)
+                    traffic_log=traffic_log, progress_cb=progress_cb,
+                    source_ip=source_ip, tcp=tcp, use_tls=use_tls)
     return {r.extension: r for r in results}
 
 

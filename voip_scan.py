@@ -321,6 +321,7 @@ def main() -> int:
         targets, timeout=args.timeout, rate_per_second=args.rate,
         workers=args.workers, traffic_log=traffic_log,
         extra_udp_ports=extra_udp,
+        source_ip=args.source_ip,
     )
 
     if not hosts:
@@ -367,15 +368,19 @@ def main() -> int:
         else:
             _info("No TCP ports open — skipping HTTP probes.", col)
 
-        if not h.sip:
-            _warn(f"{h.ip}: no SIP response — skipping SIP/AMI phases.", col)
-            host_reports.append(hr)
-            continue
+        # Determine SIP transport for later phases
+        sip_transport = (h.sip or {}).get("transport", "udp")
+        sip_tcp = sip_transport in ("tcp", "tls")
+        sip_tls = sip_transport == "tls"
+        sip_port = args.port  # use CLI --port (default 5060)
 
-        sip_srv = (h.sip or {}).get("server", "")
-        _ok(f"SIP: {h.sip.get('status')} {h.sip.get('reason')}  "
-            f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
-            f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
+        if h.sip:
+            sip_srv = h.sip.get("server", "")
+            _ok(f"SIP/{sip_transport.upper()}: {h.sip.get('status')} {h.sip.get('reason')}  "
+                f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
+                f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
+        else:
+            _warn(f"{h.ip}: no SIP response on UDP/TCP — SIP phases will be skipped.", col)
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 3 · AMI / MANAGEMENT ATTACK  [{h.ip}]", col)
@@ -420,6 +425,11 @@ def main() -> int:
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 4 · EXTENSION ENUMERATION  [{h.ip}]", col)
 
+        if not h.sip:
+            _warn(f"{h.ip}: no SIP response — skipping extension enumeration, spray, and call PoC.", col)
+            host_reports.append(hr)
+            continue
+
         ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
 
         if args.enum:
@@ -428,52 +438,52 @@ def main() -> int:
                 ext_list = ami_dumped_exts
                 _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
                 found = enumeration.sweep(
-                    h.ip, ext_list, port=args.port,
+                    h.ip, ext_list, port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                 )
             elif args.ext_range:
                 ext_list = enumeration.expand_ext_range(args.ext_range)
                 _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
                 prog = Progress("REGISTER sweep", len(ext_list), col)
                 found = enumeration.sweep(
-                    h.ip, ext_list, port=args.port,
+                    h.ip, ext_list, port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log, progress_cb=prog.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                 )
                 prog.close()
             else:
                 # Auto-select ranges based on fingerprint (full mode) or wordlist
                 if args.full:
                     ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
-                    # Also probe special/feature-code extensions first
                     specials = enumeration.SPECIAL_EXTENSIONS[:]
                     _info(f"Fingerprint: {h.fingerprint} — using adaptive sweep "
                           f"over ranges {ranges}", col)
                     found_all: list[enumeration.ExtensionResult] = []
-                    # Specials first (fast)
                     sf = enumeration.sweep(
-                        h.ip, specials, port=args.port,
+                        h.ip, specials, port=sip_port,
                         timeout=args.timeout, max_workers=args.workers,
                         traffic_log=traffic_log,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                     )
                     found_all.extend(sf)
                     if sf:
                         _ok(f"Special extensions: {[r.extension for r in sf]}", col)
-                    # Adaptive sweep per range
                     for (lo, hi) in ranges:
                         total_coarse = (hi - lo) // 10 + 1
                         _info(f"Adaptive sweep {lo}–{hi} (coarse step 10, "
                               f"~{total_coarse} coarse probes)...", col)
                         prog = Progress(f"{lo}-{hi}", total_coarse, col)
                         batch = enumeration.adaptive_sweep(
-                            h.ip, port=args.port, low=lo, high=hi,
+                            h.ip, port=sip_port, low=lo, high=hi,
                             timeout=args.timeout, max_workers=args.workers,
                             traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                         )
                         prog.close()
                         found_all.extend(batch)
-                    # Deduplicate
                     seen_exts: set[str] = set()
                     found = []
                     for r in found_all:
@@ -485,9 +495,10 @@ def main() -> int:
                     _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
                     prog = Progress("REGISTER sweep", len(ext_list), col)
                     found = enumeration.sweep(
-                        h.ip, ext_list, port=args.port,
+                        h.ip, ext_list, port=sip_port,
                         timeout=args.timeout, max_workers=args.workers,
                         traffic_log=traffic_log, progress_cb=prog.tick,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                     )
                     prog.close()
 
@@ -496,9 +507,10 @@ def main() -> int:
                 _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
                 prog2 = Progress("INVITE probe", len(found), col)
                 inv_map = enumeration.probe_invite_acceptance(
-                    h.ip, [r.extension for r in found], port=args.port,
+                    h.ip, [r.extension for r in found], port=sip_port,
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log, progress_cb=prog2.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                 )
                 prog2.close()
                 for r in found:
@@ -543,10 +555,11 @@ def main() -> int:
                 prog = Progress("Spray", len(targets_for_spray), col)
                 hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
-                    port=args.port, timeout=args.timeout,
+                    port=sip_port, timeout=args.timeout,
                     max_workers=min(args.workers, 10),
                     max_failures_per_ext=args.max_failures_per_ext,
                     traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                 )
                 prog.close()
                 successes = [asdict(c) for c in hits_spray if c.success]
@@ -681,8 +694,9 @@ def main() -> int:
     print(f"  {'─' * 60}")
     print()
     for k, pth in paths.items():
-        _ok(f"{k:<6} : {pth}", col)
-    _ok(f"traffic: {os.path.join(report_dir, 'traffic.log')}", col)
+        label = k if k != "findings" else "findings (actionable)"
+        _ok(f"{label:<26} : {pth}", col)
+    _ok(f"{'traffic':<26} : {os.path.join(report_dir, 'traffic.log')}", col)
     print()
 
     return 0
