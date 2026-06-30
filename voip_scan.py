@@ -1104,6 +1104,50 @@ def main() -> int:
                          f"Extension {call_from} was never registered or authenticated.",
                          col)
 
+                # Weak-line sweep: enumerate which extensions the PBX routes
+                # without authentication (every one = a usable toll-fraud launch point).
+                # Run dry_run so the destination only gets a brief ring per candidate.
+                _wl_numeric = [
+                    e for e in enumeration.SPECIAL_EXTENSIONS
+                    if e.isdigit() and e != call_from
+                ]
+                _wl_extra = [str(n) for n in range(1001, 1006)] + \
+                            ["100", "200", "300", "400", "500",
+                             "2000", "3000", "4000"]
+                _wl_cands = list(dict.fromkeys(_wl_numeric[:8] + _wl_extra))
+                _wl_cands = [e for e in _wl_cands if e != call_from][:18]
+
+                _info(f"Weak-line sweep: testing {len(_wl_cands)} extensions "
+                      f"for unauthenticated outbound routing...", col)
+                _weak_lines: list[str] = [call_from]  # already confirmed
+                for _wext in _wl_cands:
+                    _wr = call.place_call(
+                        h.ip, effective_call_to, _wext,
+                        port=args.port, timeout=min(args.timeout, 3.0),
+                        dry_run=True, max_wait=3.5,
+                        traffic_log=traffic_log,
+                        source_ip=args.source_ip,
+                        source_port_range=source_port_range,
+                    )
+                    status = _wr.status_code or "timeout"
+                    if _wr.reached_dialplan:
+                        _weak_lines.append(_wext)
+                        _warn(f"  Weak line: ext {col.BOLD}{_wext}{col.RESET} → "
+                              f"dialplan accepted  [{status}]", col)
+                    else:
+                        _info(f"  {_wext}: rejected  [{status}]", col)
+
+                hr["call_test"]["weak_lines"] = _weak_lines
+                _warn(f"{col.RED}{col.BOLD}{len(_weak_lines)} weak line(s) confirmed{col.RESET}: "
+                      f"{_weak_lines}", col)
+                if len(_weak_lines) > 1:
+                    _finding("high",
+                             f"WEAK LINES: PBX routes unauthenticated calls from "
+                             f"{len(_weak_lines)} distinct extensions — "
+                             f"any SIP device on the network is a toll-fraud launch point: "
+                             f"{_weak_lines}",
+                             col)
+
             if result.success:
                 _finding("critical",
                          f"TOLL FRAUD CONFIRMED — call placed to {effective_call_to}  "
