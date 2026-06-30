@@ -624,10 +624,11 @@ def main() -> int:
                 # Auto-select ranges based on fingerprint (full mode) or wordlist
                 if args.full:
                     ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
-                    specials = enumeration.SPECIAL_EXTENSIONS[:]
-                    _info(f"Fingerprint: {h.fingerprint} — using adaptive sweep "
-                          f"over ranges {ranges}", col)
                     found_all: list[enumeration.ExtensionResult] = []
+                    seen_exts: set[str] = set()
+
+                    # Pass 1: special / feature-code extensions
+                    specials = enumeration.SPECIAL_EXTENSIONS[:]
                     _jitter_sleep(args.jitter)
                     sf = enumeration.sweep(
                         h.ip, specials, port=sip_port,
@@ -635,13 +636,48 @@ def main() -> int:
                         traffic_log=traffic_log,
                         source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                     )
-                    found_all.extend(sf)
+                    for r in sf:
+                        if r.extension not in seen_exts:
+                            seen_exts.add(r.extension)
+                            found_all.append(r)
                     if sf:
                         _ok(f"Special extensions: {[r.extension for r in sf]}", col)
+
+                    # Pass 2: priority extensions — 1000+ most common across all
+                    # brands, probed before the adaptive sweep to surface hits fast
+                    prio_path = os.path.join(
+                        os.path.dirname(__file__),
+                        "wordlists", "extensions_priority.txt"
+                    )
+                    if os.path.exists(prio_path):
+                        prio_list = [
+                            e for e in enumeration.expand_ext_range(f"file:{prio_path}")
+                            if e not in seen_exts
+                        ]
+                        _info(f"Priority sweep: {len(prio_list)} common extensions "
+                              f"({h.fingerprint} platform)...", col)
+                        prog = Progress("Priority sweep", len(prio_list), col)
+                        _jitter_sleep(args.jitter)
+                        pf = enumeration.sweep(
+                            h.ip, prio_list, port=sip_port,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                        )
+                        prog.close()
+                        for r in pf:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+                        if pf:
+                            _ok(f"Priority hits: {[r.extension for r in pf]}", col)
+
+                    # Pass 3: adaptive sweep over 100-5000 to fill gaps
+                    _info(f"Fingerprint: {h.fingerprint} — adaptive sweep "
+                          f"over ranges {ranges} (filling gaps)...", col)
                     for (lo, hi) in ranges:
                         total_coarse = (hi - lo) // 10 + 1
-                        _info(f"Adaptive sweep {lo}–{hi} (coarse step 10, "
-                              f"~{total_coarse} coarse probes)...", col)
+                        _info(f"Adaptive sweep {lo}–{hi} (~{total_coarse} coarse probes)...", col)
                         prog = Progress(f"{lo}-{hi}", total_coarse, col)
                         _jitter_sleep(args.jitter)
                         batch = enumeration.adaptive_sweep(
@@ -651,13 +687,12 @@ def main() -> int:
                             source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                         )
                         prog.close()
-                        found_all.extend(batch)
-                    seen_exts: set[str] = set()
-                    found = []
-                    for r in found_all:
-                        if r.extension not in seen_exts:
-                            seen_exts.add(r.extension)
-                            found.append(r)
+                        for r in batch:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+
+                    found = found_all
                 else:
                     ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
                     _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)

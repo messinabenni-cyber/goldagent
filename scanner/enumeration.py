@@ -20,24 +20,33 @@ _MAX_RANGE = 10_000   # cap any single range expansion to prevent runaway sweeps
 
 # Special / feature-code extensions seen on the target platforms
 SPECIAL_EXTENSIONS: list[str] = [
-    # Asterisk dial-plan labels
+    # Operator / reception shortcuts (highest hit rate — probed first)
+    "0", "9", "00", "000", "0000",
+    # Asterisk dial-plan context labels
     "s", "i", "h", "t",
-    # Role aliases
-    "operator", "reception", "info", "support", "sales",
-    "voicemail", "vm", "conference", "conf",
+    # Role aliases common across all PBX brands
+    "operator", "reception", "info", "support", "sales", "helpdesk",
+    "voicemail", "vm", "conference", "conf", "meeting",
     "anonymous", "guest", "default", "trunk",
-    # Asterisk feature codes (echo test, voicemail, etc.)
-    "*43", "*97", "*98", "*60", "*65",
-    # Common low / high targets
-    "0", "00", "000",
+    "fax", "it", "hr", "accounts", "finance", "ceo", "admin",
+    # Asterisk feature codes
+    "*43", "*97", "*98", "*60", "*65", "*69", "*70", "*72", "*73",
+    # Common round-number targets
+    "1", "2", "3", "99", "999", "9999",
 ]
 
-# Per-fingerprint dial-plan ranges (probed in coarse + fill passes)
+# Per-fingerprint dial-plan ranges (probed in coarse + fill passes).
+# 100-5000 covers the vast majority of real deployments and completes
+# significantly faster than sweeping to 9999.
 DIALPLAN_RANGES: dict[str, list[tuple[int, int]]] = {
-    "FreePBX":     [(1000, 9999), (100, 999)],
-    "Asterisk":    [(1000, 9999), (100, 999)],
-    "Grandstream": [(1000, 9999), (100, 999)],
-    "default":     [(100, 9999)],
+    "FreePBX":     [(100, 5000)],
+    "Asterisk":    [(100, 5000)],
+    "Grandstream": [(100, 5000)],
+    "3CX":         [(100, 5000)],
+    "Kamailio":    [(100, 5000)],
+    "OpenSIPS":    [(100, 5000)],
+    "FreeSWITCH":  [(100, 5000)],
+    "default":     [(100, 5000)],
 }
 
 
