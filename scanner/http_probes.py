@@ -1,8 +1,8 @@
 """HTTP probes against PBX management interfaces.
 
 Scoped tightly to the platforms you actually target — FreePBX, vanilla
-Asterisk web UIs, and Grandstream UCM/GXP/HT/DP. Each probe returns either
-a finding dict or None.
+Asterisk web UIs, Grandstream UCM/GXP/HT/DP, 3CX Phone System, Sangoma
+Connect, and Mitel MiVoice. Each probe returns either a finding dict or None.
 
 All probes are read-only — they identify exposed admin surfaces but do not
 attempt login. The credential testing pipeline (auth.py) handles that
@@ -10,6 +10,7 @@ separately.
 """
 from __future__ import annotations
 
+import re
 import socket
 import ssl
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -131,7 +132,7 @@ def _http_get(host: str, port: int, path: str, timeout: float,
 
 
 # ---------------------------------------------------------------------------
-# Probes
+# Probes — existing
 # ---------------------------------------------------------------------------
 
 def probe_freepbx_admin(host: str, port: int, use_tls: bool,
@@ -352,6 +353,278 @@ def probe_asterisk_rawman(host: str, port: int, use_tls: bool,
 
 
 # ---------------------------------------------------------------------------
+# Probes — new
+# ---------------------------------------------------------------------------
+
+def probe_3cx_admin(host: str, port: int, use_tls: bool,
+                    timeout: float = 3.0) -> HttpFinding | None:
+    """3CX Phone System management interface and REST API exposure."""
+    if port not in (80, 443, 4443, 5000, 5001, 8088, 8443):
+        return None
+
+    paths = ["/webclient/", "/api/v1/Parameters/List", "/api/v1/UserSettings"]
+    unauthenticated_api = False
+    matched_path = ""
+    matched_status = 0
+    matched_server = ""
+
+    for path in paths:
+        status, server, body = _http_get(host, port, path, timeout, use_tls)
+        if status == 0:
+            continue
+        text = body.decode("utf-8", errors="replace")
+        text_lower = text.lower()
+        server_lower = server.lower()
+        hit = ("3cx" in text_lower or "phonesystem" in server_lower or
+               "3cx" in server_lower or "phonesystem" in text_lower)
+        if hit or (path.startswith("/api/v1/") and status == 200):
+            matched_path = path
+            matched_status = status
+            matched_server = server
+            if path.startswith("/api/v1/") and status == 200:
+                unauthenticated_api = True
+            break
+
+    if not matched_path:
+        return None
+
+    severity = "critical" if unauthenticated_api else "high"
+    title = (
+        "3CX REST API responds without authentication"
+        if unauthenticated_api
+        else "3CX Phone System management interface exposed"
+    )
+    evidence = (
+        f"GET {matched_path} returned HTTP {matched_status}; "
+        f"Server: {matched_server!r}"
+    )
+    if unauthenticated_api:
+        evidence += " — API path responded with HTTP 200 without credentials"
+
+    return HttpFinding(
+        name="3cx-admin-exposed",
+        severity=severity,
+        target=f"{host}:{port}",
+        title=title,
+        evidence=evidence,
+        remediation=(
+            "Restrict 3CX management ports to VPN or an IP allow-list. "
+            "Ensure /api/v1/ endpoints require authentication. "
+            "Apply all 3CX security updates — the 2023 supply-chain attack "
+            "(CVE-2023-29059) was facilitated by exposed management surfaces."
+        ),
+    )
+
+
+def probe_freepbx_ajax(host: str, port: int, use_tls: bool,
+                       timeout: float = 3.0) -> HttpFinding | None:
+    """FreePBX AJAX endpoint — sensitive system data exposed without authentication."""
+    if port not in (80, 443, 4443, 8088, 8443):
+        return None
+
+    path = "/admin/ajax.php?module=dashboard&command=getSummary"
+    status, server, body = _http_get(host, port, path, timeout, use_tls)
+    if status == 0:
+        return None
+
+    text = body.decode("utf-8", errors="replace").strip()
+    # Detect a JSON response: starts with '{' or '[', and no auth-challenge
+    # indicators (login redirect, 401, 403).
+    is_json = text.startswith(("{", "["))
+    no_auth_challenge = status not in (401, 403) and "login" not in text.lower()[:200]
+
+    if is_json and no_auth_challenge:
+        return HttpFinding(
+            name="freepbx-ajax-unauthenticated",
+            severity="high",
+            target=f"{host}:{port}",
+            title="FreePBX AJAX endpoint returns data without authentication",
+            evidence=(
+                f"GET {path} returned HTTP {status} with a JSON response "
+                f"(no auth challenge). Server: {server!r}. "
+                f"Response preview: {text[:200]!r}"
+            ),
+            remediation=(
+                "Restrict /admin/ajax.php to authenticated sessions only. "
+                "Apply available FreePBX security patches and restrict "
+                "/admin/ to a management network or VPN."
+            ),
+        )
+    return None
+
+
+def probe_freepbx_recordings_dir(host: str, port: int, use_tls: bool,
+                                  timeout: float = 3.0) -> HttpFinding | None:
+    """FreePBX call recordings directory — voicemail and call recordings exposed."""
+    if port not in (80, 443, 4443, 8088, 8443):
+        return None
+
+    status, server, body = _http_get(host, port, "/recordings/", timeout, use_tls)
+    if status == 0:
+        return None
+
+    text = body.decode("utf-8", errors="replace").lower()
+    # Directory listing indicators or audio file extensions in links
+    dir_listing = ("index of" in text or "parent directory" in text)
+    recording_files = any(ext in text for ext in (".wav", ".mp3", ".gsm", ".ogg",
+                                                    ".opus", ".g722"))
+
+    if status == 200 and (dir_listing or recording_files):
+        detail = "directory listing" if dir_listing else "recording file links"
+        return HttpFinding(
+            name="freepbx-recordings-exposed",
+            severity="high",
+            target=f"{host}:{port}",
+            title="FreePBX call recordings directory exposed",
+            evidence=(
+                f"GET /recordings/ returned HTTP {status} with {detail}. "
+                f"Server: {server!r}"
+            ),
+            remediation=(
+                "Disable directory listing for /recordings/ in the web server "
+                "configuration. Require authentication to access recording "
+                "files. Consider serving recordings only through the FreePBX "
+                "UCP with proper session validation."
+            ),
+        )
+    return None
+
+
+def probe_sangoma_connect(host: str, port: int, use_tls: bool,
+                           timeout: float = 3.0) -> HttpFinding | None:
+    """Sangoma Connect portal exposure."""
+    if port not in (80, 443, 4443, 8088, 8443):
+        return None
+
+    status, server, body = _http_get(host, port, "/sangoma-connect/",
+                                      timeout, use_tls)
+    if status == 0:
+        return None
+
+    text = body.decode("utf-8", errors="replace").lower()
+    if status in (200, 302) and "sangoma" in text:
+        return HttpFinding(
+            name="sangoma-connect-exposed",
+            severity="medium",
+            target=f"{host}:{port}",
+            title="Sangoma Connect portal reachable from the internet",
+            evidence=(
+                f"GET /sangoma-connect/ returned HTTP {status} with "
+                f"'Sangoma' in the response body. Server: {server!r}"
+            ),
+            remediation=(
+                "Restrict the Sangoma Connect portal to known IP ranges or "
+                "a VPN. Ensure multi-factor authentication is enabled for "
+                "all portal accounts."
+            ),
+        )
+    return None
+
+
+def probe_mitel_uc(host: str, port: int, use_tls: bool,
+                   timeout: float = 3.0) -> HttpFinding | None:
+    """Mitel MiVoice / MiCollab UC interface exposure."""
+    if port not in (80, 443, 4443, 8080, 8443):
+        return None
+
+    paths = ["/bcmslite/", "/mitel/", "/MiCollab/"]
+    for path in paths:
+        status, server, body = _http_get(host, port, path, timeout, use_tls)
+        if status == 0:
+            continue
+        text = body.decode("utf-8", errors="replace")
+        text_lower = text.lower()
+        if status in (200, 302) and any(kw in text_lower for kw in
+                                         ("mitel", "mivoice", "micollab")):
+            return HttpFinding(
+                name="mitel-uc-exposed",
+                severity="high",
+                target=f"{host}:{port}",
+                title="Mitel MiVoice/MiCollab UC interface exposed",
+                evidence=(
+                    f"GET {path} returned HTTP {status} with Mitel signature "
+                    f"('mitel'/'mivoice'/'micollab') in the response. "
+                    f"Server: {server!r}"
+                ),
+                remediation=(
+                    "Restrict Mitel UC management paths to VPN or an IP "
+                    "allow-list. Apply Mitel security advisories — "
+                    "CVE-2022-41765, CVE-2023-25597, and related "
+                    "vulnerabilities affect exposed MiVoice instances. "
+                    "Disable unused web components via the Mitel admin console."
+                ),
+            )
+    return None
+
+
+def probe_version_extract(host: str, port: int, use_tls: bool,
+                           timeout: float = 3.0) -> HttpFinding | None:
+    """Extract software version strings from HTTP responses (version disclosure)."""
+    if port not in (80, 443, 4443, 5000, 8080, 8088, 8443):
+        return None
+
+    paths = ["/", "/admin/", "/admin/config.php"]
+    version_found = ""
+    source_path = ""
+    source_server = ""
+
+    # Patterns to detect version strings
+    _ver_patterns = [
+        re.compile(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']',
+                   re.IGNORECASE),
+        re.compile(r'<title>([^<]{3,80})</title>', re.IGNORECASE),
+        re.compile(r'(?:version|ver|release)[^\d]{0,10}(\d+\.\d[\d.a-zA-Z-]{0,20})',
+                   re.IGNORECASE),
+        re.compile(r'v(\d+\.\d[\d.]{0,10})', re.IGNORECASE),
+    ]
+
+    for path in paths:
+        status, server, body = _http_get(host, port, path, timeout, use_tls)
+        if status == 0:
+            continue
+
+        candidates: list[str] = []
+
+        # Server header
+        if server:
+            candidates.append(f"Server: {server}")
+
+        text = body.decode("utf-8", errors="replace")
+        for pat in _ver_patterns:
+            m = pat.search(text)
+            if m:
+                snippet = m.group(0).strip()
+                if len(snippet) <= 120:
+                    candidates.append(snippet)
+
+        if candidates:
+            version_found = "; ".join(candidates[:4])
+            source_path = path
+            source_server = server
+            break
+
+    if not version_found:
+        return None
+
+    return HttpFinding(
+        name="http-version-disclosure",
+        severity="info",
+        target=f"{host}:{port}",
+        title="Software version information disclosed via HTTP",
+        evidence=(
+            f"GET {source_path} revealed version strings: {version_found!r}. "
+            f"Server header: {source_server!r}"
+        ),
+        remediation=(
+            "Suppress the Server header (ServerTokens Prod in Apache, "
+            "server_tokens off in nginx). Remove or genericise meta generator "
+            "tags and version strings from login pages. Version disclosure "
+            "assists targeted exploit selection."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -364,7 +637,19 @@ PROBES = [
     probe_grandstream_default_creds,
     probe_freepbx_rest_api,
     probe_asterisk_rawman,
+    # new probes
+    probe_3cx_admin,
+    probe_freepbx_ajax,
+    probe_freepbx_recordings_dir,
+    probe_sangoma_connect,
+    probe_mitel_uc,
+    probe_version_extract,
 ]
+
+# Ports that carry HTTPS in some deployments even though the number is not
+# the standard TLS port (e.g. some 3CX and Asterisk configs use 8088 for
+# HTTPS as well as HTTP).
+_DUAL_TLS_PORTS = frozenset({8088})
 
 
 def run_all(host: str, tcp_ports: list[int],
@@ -379,6 +664,11 @@ def run_all(host: str, tcp_ports: list[int],
         use_tls = port in (443, 4443, 8089, 8443)
         for probe in PROBES:
             work.append((probe, host, port, use_tls))
+        # For ports that some deployments serve over HTTPS, also try TLS=True
+        # when we have not already scheduled a TLS pass.
+        if port in _DUAL_TLS_PORTS and not use_tls:
+            for probe in PROBES:
+                work.append((probe, host, port, True))
 
     findings: list[HttpFinding] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:

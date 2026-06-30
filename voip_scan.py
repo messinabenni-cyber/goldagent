@@ -1,10 +1,13 @@
 #!/usr/bin/env python3.12
 """voip_scan.py — VoIP penetration testing scanner.
 
-Tuned for FreePBX / Asterisk / Grandstream engagements on internet-facing
-targets. One CLI, one HTML report, one job: prove the toll-fraud risk.
+Tuned for FreePBX / Asterisk / Grandstream / 3CX engagements on internet-
+facing targets. One CLI, one HTML report, one job: prove the toll-fraud risk.
 
-ONE-CLICK FULL AUDIT:
+ONE-CLICK FULL AUDIT (--auto):
+  voip_scan.py --target <IP> --auto --call-to <YOUR_NUMBER> --i-have-authorization
+
+STANDARD FULL AUDIT:
   voip_scan.py --target <IP> --full --call-test --call-to <YOUR_NUMBER>
 
 USE ONLY ON SYSTEMS YOU OWN OR ARE EXPLICITLY AUTHORISED TO TEST.
@@ -18,7 +21,7 @@ import sys
 import time
 from dataclasses import asdict
 
-from scanner import ami, auth, call, discovery, enumeration, http_probes, report
+from scanner import ami, auth, call, cve, discovery, enumeration, http_probes, report
 from scanner.utils import Colours, Progress, TrafficLog, hash_file
 
 # Mode preset definitions
@@ -44,7 +47,7 @@ BANNER = r"""
     \ \/ / (_) | ||  __/   ___) | (_| (_| | | | | | | |  __/ |
      \__/ \___/___|_|     |____/ \___\__,_|_| |_|_| |_|\___|_|
 
-  v3.0 — FreePBX / Asterisk / Grandstream  |  Authorised use only
+  v4.0 — FreePBX · Asterisk · Grandstream · 3CX  |  Authorised use only
 """
 
 # ---------------------------------------------------------------------------
@@ -94,7 +97,8 @@ def authorize(args, col: Colours) -> tuple[str, str | None]:
             sys.exit(2)
         scope_hash = hash_file(args.scope_file)
 
-    intrusive = any([args.enum, args.spray, args.call_test, args.full, args.ami_attack])
+    intrusive = any([args.enum, args.spray, args.call_test, args.full, args.ami_attack,
+                     getattr(args, "auto", False)])
     if intrusive and not args.scope_file:
         if not args.i_have_authorization:
             print()
@@ -148,11 +152,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--i-have-authorization", action="store_true",
                    help="Skip interactive auth prompt (still requires scope-file for record)")
 
+    p.add_argument("--auto", action="store_true",
+                   help="One-command full audit: enables --full + CVE scan + stealth "
+                        "mode + STUN. The most comprehensive single flag. "
+                        "Add --call-to to also demonstrate live toll fraud. "
+                        "Requires --i-have-authorization.")
+
     g = p.add_argument_group("Checks (default: discover only)")
     g.add_argument("--full", action="store_true",
                    help="Run all checks: enum + spray + ami-attack + HTTP probes + "
-                        "Asterisk HTTP API. Automatically enables --stun auto and "
-                        "--discover-prefix when --call-to is provided.")
+                        "CVE scan + Asterisk HTTP API. Automatically enables --stun "
+                        "auto and --discover-prefix when --call-to is provided.")
     g.add_argument("--enum", action="store_true",
                    help="Enumerate extensions via REGISTER+INVITE")
     g.add_argument("--ext-range",
@@ -259,6 +269,15 @@ def main() -> int:
 
     col = Colours(force=False if args.no_color else None)
 
+    # --auto: one-command maximum-depth audit
+    if args.auto:
+        args.full = True
+        if args.mode == "standard":
+            args.mode = "stealth"
+        if not args.i_have_authorization:
+            _err("--auto requires --i-have-authorization", col)
+            return 2
+
     # --full expands into constituent checks
     if args.full:
         args.enum = True
@@ -343,6 +362,7 @@ def main() -> int:
             "extensions": [],
             "credentials_found": [],
             "http_findings": [],
+            "cve_findings": [],
             "ami": None,
             "ami_http": None,
             "call_test": None,
@@ -368,11 +388,42 @@ def main() -> int:
         else:
             _info("No TCP ports open — skipping HTTP probes.", col)
 
-        # Determine SIP transport for later phases
-        sip_transport = (h.sip or {}).get("transport", "udp")
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 2b · CVE / VULNERABILITY SCAN  [{h.ip}]", col)
+
+        sip_info = h.sip or {}
+        sip_transport = sip_info.get("transport", "udp")
         sip_tcp = sip_transport in ("tcp", "tls")
         sip_tls = sip_transport == "tls"
-        sip_port = args.port  # use CLI --port (default 5060)
+        sip_port = args.port
+
+        sip_server_banner = sip_info.get("server", "")
+        srtp_state = (hr.get("call_test") or {}).get("srtp_state", "")
+        cve_results = cve.check_all(
+            h.ip,
+            tcp_ports=tcp_ports,
+            fingerprint=h.fingerprint,
+            sip_server=sip_server_banner,
+            sip_port=sip_port,
+            sip_transport=sip_transport,
+            srtp_downgraded=(srtp_state == "downgraded"),
+            timeout=args.timeout,
+        )
+        hr["cve_findings"] = [
+            {
+                "cve_id": r.cve_id, "platform": r.platform,
+                "severity": r.severity, "host": r.host, "port": r.port,
+                "title": r.title, "evidence": r.evidence,
+                "remediation": r.remediation,
+                "affected_version": r.affected_version,
+            }
+            for r in cve_results
+        ]
+        if cve_results:
+            for r in cve_results:
+                _finding(r.severity, f"{r.cve_id} — {r.title}", col)
+        else:
+            _info("No CVE/config findings on this host.", col)
 
         if h.sip:
             sip_srv = h.sip.get("server", "")
@@ -679,6 +730,8 @@ def main() -> int:
     traffic_log.close()
 
     counts = final_report.get("severity_counts", {})
+    rs = final_report.get("risk_score", {})
+    tf = final_report.get("toll_fraud_cost", {})
 
     # Findings summary banner
     print()
@@ -692,6 +745,34 @@ def main() -> int:
         bar = "█" * min(n, 30)
         print(f"  {col.for_severity(sev)}{sev.upper():8}{col.RESET}  {bar} {n}")
     print(f"  {'─' * 60}")
+
+    # Risk score
+    if rs:
+        score = rs.get("score", 0)
+        band = rs.get("band", "")
+        band_col = col.for_severity(
+            "critical" if score >= 75 else
+            "high"     if score >= 50 else
+            "medium"   if score >= 25 else "info"
+        )
+        print()
+        print(f"  {col.BOLD}RISK SCORE{col.RESET}  "
+              f"{band_col}{score}/100{col.RESET}  "
+              f"{col.BOLD}{band}{col.RESET}")
+
+    # Toll-fraud exposure
+    if tf and tf.get("high_usd", 0) > 0:
+        proven = tf.get("proven", False)
+        low_k = tf.get("low_usd", 0) // 1000
+        high_k = tf.get("high_usd", 0) // 1000
+        proven_label = (f"{col.RED}PROVEN{col.RESET}" if proven
+                        else f"{col.YELLOW}ESTIMATED{col.RESET}")
+        print(f"  {col.BOLD}TOLL-FRAUD EXPOSURE{col.RESET}  "
+              f"{proven_label}  "
+              f"${low_k}k–${high_k}k/month")
+        print(f"  {tf.get('scenario', '')}")
+
+    print(f"\n  {'─' * 60}")
     print()
     for k, pth in paths.items():
         label = k if k != "findings" else "findings (actionable)"
