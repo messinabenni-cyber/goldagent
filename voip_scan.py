@@ -748,6 +748,9 @@ def parse_args() -> argparse.Namespace:
     o = p.add_argument_group("Output")
     o.add_argument("--report-dir",
                    help="Directory for report.html and report.json (default reports/<timestamp>)")
+    o.add_argument("--json-output",
+                   metavar="FILE",
+                   help="Write machine-readable JSON findings to FILE (e.g. findings.json)")
     o.add_argument("--no-color", action="store_true",
                    help="Disable ANSI colour output")
     o.add_argument("--list-networks", action="store_true",
@@ -2101,6 +2104,19 @@ def main() -> int:
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 6 · CREDENTIAL SPRAY  [{h.ip}]", col)
 
+        # Adaptive injection: if enum phase was skipped but AMI dumped extensions,
+        # synthesise extension records so the spray phase has targets.
+        if not hr["extensions"] and ami_dumped_exts:
+            _info(
+                f"Adaptive: injecting {len(ami_dumped_exts)} AMI-dumped extension(s) "
+                f"into spray targets (enum phase was skipped or found nothing).",
+                col,
+            )
+            hr["extensions"] = [
+                {"extension": e, "auth_required": True, "anonymous_invite": False,
+                 "open_register": False, "source": "ami_dump"}
+                for e in ami_dumped_exts
+            ]
 
         if args.spray and hr["extensions"]:
             creds = auth.load_credentials(args.cred_file)
@@ -2116,9 +2132,20 @@ def main() -> int:
                       f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
                 prog = Progress("Spray", len(targets_for_spray), col)
                 _jitter_sleep(args.jitter)
-                ami_pwds = []
+                # Build priority password pool: AMI-cracked + SIP-cracked passwords tried first
+                ami_pwds: list[str] = []
                 if hr.get("ami") and hr["ami"].get("success") and hr["ami"].get("password"):
-                    ami_pwds = [hr["ami"]["password"]]
+                    ami_pwds.append(hr["ami"]["password"])
+                for _cc in hr.get("cracked_credentials", []):
+                    _p = _cc.get("password", "")
+                    if _p and _p not in ami_pwds:
+                        ami_pwds.append(_p)
+                if ami_pwds:
+                    _info(
+                        f"Adaptive: {len(ami_pwds)} pre-cracked password(s) promoted to "
+                        f"front of spray queue.",
+                        col,
+                    )
                 hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
                     port=sip_port, timeout=args.timeout,
@@ -2216,6 +2243,49 @@ def main() -> int:
     }
     paths = report.write_all(report_dir, final_report)
     traffic_log.close()
+
+    # --json-output: write machine-readable findings to a user-specified path
+    if args.json_output:
+        import json as _json
+        _json_out = {
+            "scan_meta": {
+                "target": final_report.get("target", ""),
+                "timestamp": final_report.get("timestamp", ""),
+                "tool_version": final_report.get("tool_version", ""),
+            },
+            "summary": {
+                "critical": counts.get("critical", 0),
+                "high":     counts.get("high", 0),
+                "medium":   counts.get("medium", 0),
+                "low":      counts.get("low", 0),
+                "total_findings": sum(counts.get(s, 0)
+                                      for s in ("critical", "high", "medium", "low")),
+            },
+            "cve_findings": [
+                f for h in final_report.get("hosts", [])
+                for f in h.get("cve_findings", [])
+            ],
+            "credential_hits": [
+                c for h in final_report.get("hosts", [])
+                for c in h.get("credentials_found", [])
+            ],
+            "ami_findings": [
+                {"host": h["ip"], **h["ami"]}
+                for h in final_report.get("hosts", [])
+                if h.get("ami") and h["ami"].get("success")
+            ],
+            "call_results": [
+                h["call_test"]
+                for h in final_report.get("hosts", [])
+                if h.get("call_test")
+            ],
+        }
+        try:
+            with open(args.json_output, "w") as _jf:
+                _json.dump(_json_out, _jf, indent=2, default=str)
+            _ok(f"{'JSON findings':<26} : {args.json_output}", col)
+        except OSError as _je:
+            _warn(f"Could not write JSON output to {args.json_output}: {_je}", col)
 
     counts = final_report.get("severity_counts", {})
 
