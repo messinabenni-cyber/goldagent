@@ -100,6 +100,205 @@ def _jitter_sleep(jitter: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SIP no-response deep diagnostics
+# ---------------------------------------------------------------------------
+
+_SIP_ALT_PROBE_PORTS: list[tuple[str, int, str, bool]] = [
+    # (transport, port, label, use_tls)
+    ("UDP",  5060, "SIP/UDP standard",       False),
+    ("UDP",  5080, "SIP/UDP alt (some PBX)", False),
+    ("UDP",  5090, "SIP/UDP alt",            False),
+    ("UDP",  5160, "SIP/UDP alt (3CX)",      False),
+    ("TCP",  5060, "SIP/TCP standard",       False),
+    ("TCP",  5061, "SIP/TLS standard",       True),
+    ("TCP",  5080, "SIP/TCP 5080",           False),
+    ("TCP",  5090, "SIP/TCP 5090",           False),
+    ("TCP",  5000, "SIP/TCP 3CX",            False),
+    ("TCP",  5001, "SIP/TLS 3CX",            True),
+    ("TCP",  5066, "SIP/WSS 5066",           True),
+    ("TCP",  8088, "SIP/WS Asterisk HTTP",   False),
+    ("TCP",  8089, "SIP/WSS Asterisk HTTPS", True),
+]
+
+# Maps open TCP port → what that service might be (for context hints)
+_PORT_CONTEXT: dict[int, str] = {
+    80:    "HTTP — likely FreePBX/Asterisk/3CX web admin panel",
+    443:   "HTTPS — PBX admin panel (TLS). Try --port 443 + TLS probe",
+    4443:  "HTTPS alt — common FreePBX admin HTTPS port",
+    5038:  "Asterisk AMI (TCP) — management interface, not SIP",
+    5066:  "SIP/WSS port — SIP-over-WebSocket (RFC 7118) may be present",
+    8080:  "HTTP alt — Grandstream / Yeastar web admin",
+    8088:  "Asterisk HTTP + SIP/WebSocket (RFC 7118). Try WS transport",
+    8089:  "Asterisk HTTPS/WSS — encrypted WebSocket SIP",
+    8443:  "HTTPS alt — PBX TLS admin or SIP/WSS",
+    10000: "Asterisk RTP range start — signaling likely on UDP/5060",
+    3478:  "STUN — confirms NAT/media relay infrastructure",
+    3479:  "STUN alt port",
+    5349:  "TURNS (STUN over TLS)",
+}
+
+
+def _sip_no_response_diagnosis(
+    host: str,
+    open_ports: list[dict],
+    args_port: int,
+    timeout: float,
+    source_ip: str,
+    col: "Colours",
+) -> None:
+    """Print a rich diagnostic block when no SIP response was obtained.
+
+    Actively probes alternative SIP ports/transports, explains each outcome,
+    and emits numbered actionable recommendations.
+    """
+    from scanner import sip as sip_mod
+
+    tcp_open = {p["port"] for p in open_ports if p["proto"] == "tcp"}
+    udp_open = {p["port"] for p in open_ports if p["proto"] == "udp"}
+
+    print()
+    print(f"  {col.BOLD}{col.YELLOW}╔══ SIP REACHABILITY DEEP-PROBE  [{host}] ══╗{col.RESET}")
+    print(f"  {col.YELLOW}║{col.RESET}  Probing {len(_SIP_ALT_PROBE_PORTS)} transport/port combinations…")
+    print()
+
+    probe_results: list[tuple[str, int, str, str, str | None]] = []  # transport, port, label, status, code
+
+    for transport, port, label, use_tls in _SIP_ALT_PROBE_PORTS:
+        is_tcp = (transport in ("TCP", "TLS"))
+        # Skip TCP ports that aren't open (saves time / avoids noise)
+        if is_tcp and port not in tcp_open:
+            status = "CLOSED"
+            code_str: str | None = None
+        else:
+            try:
+                resp = sip_mod.options_probe(
+                    host, port=port,
+                    local_ip=source_ip or None,
+                    timeout=min(timeout, 2.0),
+                    tcp=is_tcp,
+                    use_tls=use_tls,
+                )
+                if resp:
+                    status = "OPEN"
+                    code_str = f"{resp.status_code} {resp.reason[:40]}"
+                else:
+                    status = "NO-RESP"
+                    code_str = None
+            except Exception as exc:
+                status = "ERR"
+                code_str = str(exc)[:60]
+
+        probe_results.append((transport, port, label, status, code_str))
+
+        icon = (f"{col.GREEN}✓{col.RESET}" if status == "OPEN" else
+                f"{col.RED}✗{col.RESET}" if status == "CLOSED" else
+                f"{col.YELLOW}?{col.RESET}")
+        code_display = f"  → {col.CYAN}{code_str}{col.RESET}" if code_str else ""
+        print(f"    {icon} {label:<36} [{transport:3}/{port:<5}]  {status}{code_display}")
+
+    print()
+
+    # Context clues from open TCP ports
+    if open_ports:
+        print(f"  {col.BOLD}Open port context:{col.RESET}")
+        for p in open_ports:
+            hint = _PORT_CONTEXT.get(p["port"], "")
+            hint_str = f"  → {hint}" if hint else ""
+            print(f"    • {p['port']}/{p['proto']}  {p.get('service','')}{hint_str}")
+        print()
+
+    # Find any alt ports that responded
+    open_alts = [(t, p, l, c) for t, p, l, s, c in probe_results if s == "OPEN"]
+
+    # Build actionable recommendations
+    recs: list[str] = []
+
+    # 1. Any alt port got a SIP response?
+    for transport, port, label, code_str in open_alts:
+        flag = "--tcp" if transport in ("TCP", "TLS") else ""
+        recs.append(
+            f"SIP found on {transport}/{port}  ({label}  {code_str})\n"
+            f"       Re-run with: {col.BOLD}--port {port}{' ' + flag if flag else ''}{col.RESET}"
+        )
+
+    # 2. Port 80/443/8080 open → web admin surface
+    web_ports = tcp_open & {80, 443, 4443, 8080, 8443}
+    if web_ports:
+        recs.append(
+            f"Web admin surface detected on TCP {sorted(web_ports)}.\n"
+            f"       Browse to http(s)://{host}/ — may expose FreePBX/3CX/Grandstream admin.\n"
+            f"       FreePBX default login: admin/admin  |  3CX: admin/<serial>  |  Grandstream: admin/admin"
+        )
+
+    # 3. Port 8088/8089 open → WebSocket SIP
+    if 8088 in tcp_open or 8089 in tcp_open:
+        recs.append(
+            f"Asterisk HTTP detected on TCP 8088/8089 — SIP/WebSocket (RFC 7118) may be active.\n"
+            f"       Try: {col.BOLD}ws://{host}:8088/ws{col.RESET}  or  {col.BOLD}wss://{host}:8089/wss{col.RESET}\n"
+            f"       Run with: {col.BOLD}--port 8088{col.RESET} or inspect /httpstatus for module list."
+        )
+
+    # 4. Firewall/SIP-ALG likely blocking
+    if not open_alts:
+        recs.append(
+            "Firewall or SIP-ALG likely dropping UDP/5060 packets.\n"
+            "       Try from a different network (mobile hotspot vs same ISP).\n"
+            "       Use: --mode stealth --timeout 10  (slower probes bypass some rate-limit rules).\n"
+            "       UDP OPTIONS are sometimes blocked; TCP/TLS SIP may pass through enterprise FW."
+        )
+
+    # 5. NAT / ISP SIP-ALG
+    recs.append(
+        "ISP SIP-ALG may be rewriting/dropping SIP packets.\n"
+        "       Try tunnelling over TCP port 443 (mimics HTTPS): --port 443 --tcp\n"
+        "       Or try a VPN/proxy that bypasses SIP-ALG."
+    )
+
+    # 6. AMI / HTTP admin alternative path
+    if 5038 in tcp_open:
+        recs.append(
+            f"Asterisk AMI open on TCP/5038 — add {col.BOLD}--ami-attack{col.RESET} flag.\n"
+            f"       AMI can originate calls without SIP: brute-force creds then use 'originate' action."
+        )
+
+    if 8088 in tcp_open:
+        recs.append(
+            f"Asterisk HTTP rawman reachable — try {col.BOLD}--ami-attack{col.RESET} (uses /rawman endpoint).\n"
+            f"       Also check: http://{host}:8088/httpstatus  for exposed modules."
+        )
+
+    # 7. Port knocking / IDS evasion
+    recs.append(
+        "Target may be using port-knocking or fail2ban (IDS evasion).\n"
+        "       Wait 15+ min then retry from a fresh IP.\n"
+        "       Use: --mode stealth  to reduce probe rate below most IDS thresholds."
+    )
+
+    # 8. Different source port
+    recs.append(
+        "Some PBXes only reply to SIP from privileged ports (<1024).\n"
+        "       Try: --source-port-range 5060-5060  (forces source port = 5060)."
+    )
+
+    print(f"  {col.BOLD}Actionable recommendations:{col.RESET}")
+    for i, rec in enumerate(recs, 1):
+        lines = rec.split("\n")
+        print(f"    {col.YELLOW}{i}.{col.RESET} {lines[0]}")
+        for line in lines[1:]:
+            print(f"       {line}")
+    print()
+
+    if not open_alts:
+        print(f"  {col.RED}{col.BOLD}  No SIP response on any probed port/transport.{col.RESET}")
+        print(f"  {col.YELLOW}  The PBX may be firewalled, behind a SIP proxy, or unreachable from this network.{col.RESET}")
+    else:
+        print(f"  {col.GREEN}{col.BOLD}  SIP found on {len(open_alts)} alt port(s) above — re-run with the --port flag shown.{col.RESET}")
+
+    print(f"  {col.BOLD}{col.YELLOW}╚{'═'*50}╝{col.RESET}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Authorisation gate
 # ---------------------------------------------------------------------------
 
@@ -591,7 +790,10 @@ def main() -> int:
                 f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
                 f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
         else:
-            _warn(f"{h.ip}: no SIP response on UDP/TCP — SIP phases will be skipped.", col)
+            _warn(f"{h.ip}: no SIP response on UDP/TCP — running deep diagnostics…", col)
+            _sip_no_response_diagnosis(
+                h.ip, h.open_ports, args.port, args.timeout, args.source_ip, col
+            )
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 3 · AMI / MANAGEMENT ATTACK  [{h.ip}]", col)
@@ -687,7 +889,8 @@ def main() -> int:
         _phase(f"PHASE 4 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
 
         if not h.sip:
-            _warn(f"{h.ip}: no SIP response — skipping extension enumeration, spray, and call PoC.", col)
+            _warn(f"{h.ip}: no SIP response — extension enumeration, spray, and call PoC skipped.", col)
+            _info("Tip: if deep-probe above found an alt port, re-run with --port <port> to reach dialplan.", col)
             host_reports.append(hr)
             continue
 
