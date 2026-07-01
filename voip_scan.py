@@ -2671,19 +2671,10 @@ def main() -> int:
                 col,
             )
 
-        # Phase 5 extension enumeration block was moved above the call test
-        # (now runs as part of the Phase 5 block inserted before Phase 4).
-        # The ami_dumped_exts variable is still accessible from the moved block.
+        # ── Extension enum and credential spray both ran above (Phase 5 / 6). ──
+        # Dead duplicate blocks removed.
 
-        # In --auto mode, use platform-specific extension ranges after fingerprinting
-        if args.auto and not args.ext_range and ami_dumped_exts == []:
-            auto_ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
-            _info(
-                f"AUTO mode: using platform-specific ranges for {h.fingerprint}: {auto_ranges}",
-                col,
-            )
-
-        if args.enum:
+        if False and args.enum:  # DEAD — Phase 5 already ran above
             if ami_dumped_exts:
                 # AMI gave us ground truth — skip wordlist
                 ext_list = ami_dumped_exts
