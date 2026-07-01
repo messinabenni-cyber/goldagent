@@ -2587,12 +2587,12 @@ def main() -> int:
                                 cseq=1, from_tag=rand_tag(),
                                 transport="UDP",
                             )
-                            _ok, _diag = raw_udp_spoof(
+                            _spoof_ok, _diag = raw_udp_spoof(
                                 _ba.raw_spoof_src, h.ip, args.port, _raw_msg
                             )
-                            _sym = f"{col.GREEN}✓{col.RESET}" if _ok else f"{col.RED}✗{col.RESET}"
+                            _sym = f"{col.GREEN}✓{col.RESET}" if _spoof_ok else f"{col.RED}✗{col.RESET}"
                             _info(f"  {_sym} {_ba.description}: {_diag}", col)
-                            if _ok:
+                            if _spoof_ok:
                                 _finding("medium",
                                          f"Raw UDP IP spoof accepted by PBX "
                                          f"(source {_ba.raw_spoof_src} → {h.ip}) — "
