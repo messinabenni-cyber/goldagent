@@ -619,6 +619,8 @@ def check_grandstream_cve_2021_37748(
     if not matched:
         return None
 
+    gs_ver = _extract_grandstream_version(body + " " + _headers.get("server", ""))
+
     return CveResult(
         cve_id="CVE-2021-37748",
         platform="Grandstream",
@@ -637,6 +639,7 @@ def check_grandstream_cve_2021_37748(
             "the perimeter firewall. "
             "Rotate all SIP credentials exposed in the dump."
         ),
+        affected_version=gs_ver,
         references=[
             "https://nvd.nist.gov/vuln/detail/CVE-2021-37748",
         ],
@@ -692,6 +695,8 @@ def check_grandstream_cve_2023_37315(
     if not (_is_json_response(body) or "<" in body):
         return None
 
+    gs_ver = _extract_grandstream_version(body)
+
     return CveResult(
         cve_id="CVE-2023-37315",
         platform="Grandstream",
@@ -709,6 +714,7 @@ def check_grandstream_cve_2023_37315(
             "Restrict access to the UCM admin interface to trusted networks only. "
             "Rotate all SIP account credentials immediately."
         ),
+        affected_version=gs_ver,
         references=[
             "https://nvd.nist.gov/vuln/detail/CVE-2023-37315",
         ],
@@ -1141,6 +1147,43 @@ def check_sip_version_disclosure(
                 )
             )
 
+    # Also extract the Asterisk version embedded in an FPBX banner such as
+    # "FPBX-15.0.17.34(17.9.3)" — the parenthetical is the Asterisk version.
+    # _extract_asterisk_version already handles this via _FPBX_AST_PAREN_RE.
+
+    # Check Grandstream firmware version — report disclosure of version string
+    # (the banner itself leaks the exact firmware, aiding targeted exploitation).
+    gs_ver = _extract_grandstream_version(sip_server)
+    if gs_ver:
+        results.append(
+            CveResult(
+                cve_id="CONFIG-GRANDSTREAM-VERSION-DISCLOSURE",
+                platform="Grandstream",
+                severity="info",
+                host=host,
+                port=sip_port,
+                title=f"Grandstream UCM firmware version {gs_ver} disclosed in SIP banner",
+                evidence=(
+                    f"SIP banner reveals Grandstream firmware version {gs_ver!r} "
+                    f"(from: {sip_server!r}). Exposing the exact firmware version "
+                    "enables attackers to identify devices affected by known CVEs "
+                    "such as CVE-2021-37748 and CVE-2023-37315."
+                ),
+                remediation=(
+                    "Configure the Grandstream UCM to suppress the firmware version "
+                    "from SIP User-Agent/Server headers where possible. "
+                    "Ensure firmware is updated to the latest stable release."
+                ),
+                affected_version=gs_ver,
+                references=[
+                    "https://nvd.nist.gov/vuln/detail/CVE-2021-37748",
+                    "https://nvd.nist.gov/vuln/detail/CVE-2023-37315",
+                ],
+                confirmed=False,
+                confidence="version_based",
+            )
+        )
+
     return results
 
 
@@ -1360,6 +1403,55 @@ def check_sip_tls_missing(
 # Check 14: CONFIG-SIP-WSS — SIP-over-WebSocket security check
 # ---------------------------------------------------------------------------
 
+def _probe_ws_upgrade(
+    host: str,
+    port: int,
+    timeout: float,
+    use_tls: bool = False,
+    extra_headers: dict[str, str] | None = None,
+) -> str:
+    """Send an HTTP/1.1 WebSocket upgrade request and return the response.
+
+    Returns the raw response string (up to 2048 bytes) or "" on failure.
+    Used to confirm that a port is actually serving a WebSocket endpoint
+    (ws:// on 8088 or wss:// on 8089) rather than an arbitrary TCP service,
+    avoiding false positives on CONFIG-SIP-WS-PLAIN findings.
+    """
+    extra = ""
+    if extra_headers:
+        for k, v in extra_headers.items():
+            extra += f"{k}: {v}\r\n"
+    ws_upgrade_req = (
+        "GET / HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "Sec-WebSocket-Protocol: sip\r\n"
+        f"{extra}"
+        "\r\n"
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        if use_tls:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+        sock.sendall(ws_upgrade_req.encode())
+        return sock.recv(2048).decode("utf-8", errors="replace")
+    except (OSError, ssl.SSLError):
+        return ""
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
 def check_sip_wss_security(
     host: str,
     tcp_ports: list[int],
@@ -1367,26 +1459,74 @@ def check_sip_wss_security(
 ) -> list["CveResult"]:
     """CONFIG: SIP-over-WebSocket (RFC 7118) security assessment.
 
-    SIP-WSS on port 8089 is common for FreePBX/Asterisk WebRTC endpoints.
-    Tests: (a) plain WS on 8088 (unencrypted), (b) Origin header not validated
-    (potential CSWSH), (c) WSS TLS cipher strength.
+    Port 8088 = plain ws:// (no TLS).  Port 8089 = wss:// (TLS-wrapped).
+
+    Tests:
+      (a) Plain WS on port 8088 (ws://, unencrypted) — CONFIG-SIP-WS-PLAIN.
+          A WebSocket upgrade probe is sent to confirm the port is actually
+          serving a WebSocket endpoint and not an unrelated TCP service.
+          The evidence notes whether wss:// (8089) is also available.
+      (b) Origin header not validated on port 8089 (wss://) — CONFIG-SIP-WSS-CSWSH.
     """
     results: list[CveResult] = []
 
-    # Check for plain WS (port 8088) — unencrypted WebSocket SIP
+    # ── Step 1: detect plain WS on port 8088 (ws://, no TLS) ─────────────
     ws_plain_open = 8088 in tcp_ports
     if not ws_plain_open:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
         try:
-            s.connect((host, 8088))
+            sock.connect((host, 8088))
             ws_plain_open = True
         except OSError:
             pass
         finally:
-            s.close()
+            try:
+                sock.close()
+            except OSError:
+                pass
 
+    ws_upgrade_resp = ""
     if ws_plain_open:
+        # Confirm the port is serving a WebSocket endpoint by sending a real
+        # WS upgrade.  The server should reply with 101 Switching Protocols or
+        # at minimum an HTTP response including the Upgrade header.
+        ws_upgrade_resp = _probe_ws_upgrade(host, 8088, timeout, use_tls=False)
+
+    # ── Step 2: check whether WSS (port 8089, wss://) is available ───────
+    wss_open = 8089 in tcp_ports
+    if not wss_open:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, 8089))
+            wss_open = True
+        except OSError:
+            pass
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    # ── Emit CONFIG-SIP-WS-PLAIN when port 8088 is open ──────────────────
+    # The finding fires on port-open alone — some servers return HTTP 400/426
+    # rather than 101 on a probe, but the port is still plaintext SIP-WS.
+    # confirmed=True only when a live 101 WS handshake was observed.
+    if ws_plain_open:
+        ws_confirmed = bool(
+            ws_upgrade_resp and "101 switching" in ws_upgrade_resp.lower()
+        )
+        wss_note = (
+            "Port 8089/tcp (wss://) is also open; however, WebRTC clients that "
+            "connect to ws://8088 still transmit in cleartext regardless."
+            if wss_open else
+            "Port 8089/tcp (wss://) is NOT open — no TLS-protected alternative exists."
+        )
+        ws_probe_note = (
+            f" WebSocket upgrade probe response: {ws_upgrade_resp[:120].strip()!r}."
+            if ws_upgrade_resp else ""
+        )
         results.append(CveResult(
             cve_id="CONFIG-SIP-WS-PLAIN",
             platform="Generic",
@@ -1398,87 +1538,62 @@ def check_sip_wss_security(
                 "signaling exposed to eavesdropping (RFC 7118 §14)"
             ),
             evidence=(
-                "Port 8088/tcp is open and accepting connections. SIP-over-WebSocket "
-                "without TLS allows full call session capture, credential theft, and "
-                "call injection by any network observer. Credentials in WWW-Authenticate "
-                "are transmitted in cleartext over the WebSocket transport."
+                f"Port 8088/tcp is open and serving a plain (non-TLS) WebSocket "
+                f"endpoint (ws://). SIP-over-WebSocket without TLS allows full call "
+                f"session capture, credential theft, and call injection by any "
+                f"on-path network observer. Credentials in WWW-Authenticate/"
+                f"Authorization headers are transmitted in cleartext over the "
+                f"WebSocket transport.{ws_probe_note} {wss_note}"
             ),
             remediation=(
                 "Disable plain WS (port 8088). Use WSS only (port 8089). "
                 "FreePBX: Admin → Asterisk SIP Settings → WebRTC → force WSS. "
-                "Ensure all WebRTC clients use wss:// URI scheme."
+                "Asterisk: set tlsenable=yes in http.conf and set bindport=8089. "
+                "Ensure all WebRTC clients use a wss:// URI scheme."
             ),
-            references=["https://datatracker.ietf.org/doc/html/rfc7118#section-14"],
-            confirmed=False,  # config-based: port is open but we didn't capture live creds yet
+            references=[
+                "https://datatracker.ietf.org/doc/html/rfc7118#section-14",
+                "https://datatracker.ietf.org/doc/html/rfc3261#section-26",
+            ],
+            confirmed=ws_confirmed,
+            confidence="confirmed" if ws_confirmed else "version_based",
         ))
 
-    # Check for WSS (port 8089) — probe for TLS availability (positive indicator)
-    wss_open = 8089 in tcp_ports
-    if not wss_open:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        try:
-            s.connect((host, 8089))
-            wss_open = True
-        except OSError:
-            pass
-        finally:
-            s.close()
-
+    # ── Step 3: probe WSS (port 8089) for CSWSH ──────────────────────────
     if wss_open:
-        # Probe for Origin header CSWSH: send a WS upgrade without proper Origin
-        # A vulnerable server accepts any Origin header
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(timeout)
-            s.connect((host, 8089))
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            tls = ctx.wrap_socket(s, server_hostname=host)
-            ws_upgrade = (
-                "GET / HTTP/1.1\r\n"
-                f"Host: {host}:8089\r\n"
-                "Upgrade: websocket\r\n"
-                "Connection: Upgrade\r\n"
-                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-                "Sec-WebSocket-Version: 13\r\n"
-                "Sec-WebSocket-Protocol: sip\r\n"
-                "Origin: https://evil.example.com\r\n"
-                "\r\n"
-            )
-            tls.sendall(ws_upgrade.encode())
-            resp = tls.recv(2048).decode("utf-8", errors="replace")
-            tls.close()
-            if "101 switching" in resp.lower():
-                results.append(CveResult(
-                    cve_id="CONFIG-SIP-WSS-CSWSH",
-                    platform="Generic",
-                    severity="medium",
-                    host=host,
-                    port=8089,
-                    title=(
-                        "SIP-WSS accepts arbitrary Origin headers — "
-                        "Cross-Site WebSocket Hijacking (CSWSH) possible"
-                    ),
-                    evidence=(
-                        "Sent WS upgrade with Origin: https://evil.example.com. "
-                        "Server responded 101 Switching Protocols — no Origin "
-                        "validation. Browser-based CSWSH can hijack SIP sessions "
-                        "of authenticated WebRTC users."
-                    ),
-                    remediation=(
-                        "Configure allowed WebSocket origins. "
-                        "FreePBX/Asterisk: set websocket_allowed_origins in "
-                        "http.conf. Restrict to your own domain(s) only."
-                    ),
-                    references=[
-                        "https://datatracker.ietf.org/doc/html/rfc7118#section-14",
-                        "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking",
-                    ],
-                ))
-        except (OSError, ssl.SSLError):
-            pass
+        # Send a cross-origin WS upgrade to verify whether the server validates
+        # the Origin header (required to prevent CSWSH attacks on WebRTC sessions).
+        cswsh_resp = _probe_ws_upgrade(
+            host, 8089, timeout, use_tls=True,
+            extra_headers={"Origin": "https://evil.example.com"},
+        )
+        if "101 switching" in cswsh_resp.lower():
+            results.append(CveResult(
+                cve_id="CONFIG-SIP-WSS-CSWSH",
+                platform="Generic",
+                severity="medium",
+                host=host,
+                port=8089,
+                title=(
+                    "SIP-WSS accepts arbitrary Origin headers — "
+                    "Cross-Site WebSocket Hijacking (CSWSH) possible"
+                ),
+                evidence=(
+                    "Sent WS upgrade with Origin: https://evil.example.com. "
+                    "Server responded 101 Switching Protocols — no Origin "
+                    "validation. Browser-based CSWSH can hijack SIP sessions "
+                    "of authenticated WebRTC users."
+                ),
+                remediation=(
+                    "Configure allowed WebSocket origins. "
+                    "FreePBX/Asterisk: set websocket_allowed_origins in "
+                    "http.conf. Restrict to your own domain(s) only."
+                ),
+                references=[
+                    "https://datatracker.ietf.org/doc/html/rfc7118#section-14",
+                    "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking",
+                ],
+            ))
 
     return results
 

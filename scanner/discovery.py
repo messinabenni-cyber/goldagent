@@ -623,28 +623,56 @@ def sweep(
     traffic_log=None,
     extra_udp_ports: list[int] | None = None,
     source_ip: str = "",
+    progress_callback=None,
 ) -> list[HostResult]:
     """Run probe_host concurrently over a target list. Returns hosts that
-    responded on at least one port."""
+    responded on at least one port.
+
+    workers: number of concurrent ThreadPoolExecutor workers (default 32).
+        The parameter is actively used — each worker thread probes one host at
+        a time, so throughput scales linearly up to network saturation.
+
+    progress_callback: optional callable(done: int, total: int) invoked after
+        each host completes (whether or not it responded).  Useful for CLI
+        progress bars.
+
+    KeyboardInterrupt is caught gracefully: already-collected results are
+    returned as partial output rather than discarding them.
+    """
     rate = RateLimiter(rate_per_second)
     results: list[HostResult] = []
+    total = len(targets)
 
     def _probe(host: str) -> HostResult | None:
         rate.wait()
         return probe_host(host, timeout=timeout, traffic_log=traffic_log,
                            extra_udp_ports=extra_udp_ports, source_ip=source_ip)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(_probe, t): t for t in targets}
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-                if r:
-                    results.append(r)
-            except OSError:
-                # FIX 3: catch only network/OS errors so programming errors
-                # (AttributeError, TypeError, etc.) propagate and are not
-                # silently swallowed.  Host unreachable / timeout is expected
-                # for the vast majority of IPs in a large range.
-                pass
+    done = 0
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(_probe, t): t for t in targets}
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    if r:
+                        results.append(r)
+                except OSError:
+                    # FIX 3: catch only network/OS errors so programming errors
+                    # (AttributeError, TypeError, etc.) propagate and are not
+                    # silently swallowed.  Host unreachable / timeout is expected
+                    # for the vast majority of IPs in a large range.
+                    pass
+                finally:
+                    done += 1
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(done, total)
+                        except Exception:
+                            pass
+    except KeyboardInterrupt:
+        # Return whatever partial results have been collected so far rather
+        # than raising and discarding all work done up to this point.
+        pass
+
     return sorted(results, key=lambda r: r.ip)
