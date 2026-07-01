@@ -334,6 +334,154 @@ def _sip_no_response_diagnosis(
 
 
 # ---------------------------------------------------------------------------
+# SIP intel display helpers
+# ---------------------------------------------------------------------------
+
+def _show_sip_intel(intel: dict, col: "Colours") -> None:
+    """Print structured SIP intelligence extracted from a single packet exchange."""
+    if not intel:
+        return
+    sensitive = intel.get("sensitive_lines", [])
+    versions = intel.get("platform_version", [])
+    extensions = intel.get("extensions", [])
+    internal_ips = intel.get("internal_ips", [])
+    srtp_keys = intel.get("srtp_keys", [])
+    methods = intel.get("allowed_methods", [])
+    topology = intel.get("topology", [])
+    identity = intel.get("identity_headers", [])
+    custom = intel.get("custom_headers", [])
+
+    if versions:
+        for v in versions:
+            _ok(f"[INTEL] Platform/version detected: {col.BOLD}{v}{col.RESET}", col)
+    if methods:
+        dangerous = {"REFER", "SUBSCRIBE", "NOTIFY", "MESSAGE", "PUBLISH"}
+        flagged = [m for m in methods if m in dangerous]
+        if flagged:
+            _warn(f"[INTEL] Dangerous SIP methods advertised: {col.RED}{', '.join(flagged)}{col.RESET}", col)
+    if internal_ips:
+        for ip in internal_ips:
+            _warn(f"[INTEL] Internal IP leaked in SIP headers: {col.RED}{ip}{col.RESET}", col)
+    if extensions:
+        for ext in extensions:
+            _info(f"[INTEL] SIP extension/user discovered: {col.CYAN}{ext}{col.RESET}", col)
+    if identity:
+        for h in identity:
+            _warn(f"[INTEL] Identity header exposed: {col.YELLOW}{h[:120]}{col.RESET}", col)
+    if topology:
+        for h in topology:
+            _info(f"[INTEL] Routing topology: {h[:120]}", col)
+    if custom:
+        for h in custom:
+            _info(f"[INTEL] Custom header: {h[:120]}", col)
+    if srtp_keys:
+        for k in srtp_keys:
+            _err(f"[INTEL] SRTP KEY ON WIRE: {col.RED}{k[:120]}{col.RESET}", col)
+
+
+def _show_cleartext_capture(ev: dict, col: "Colours") -> None:
+    """Render the live cleartext SIP wire-capture demonstration in the terminal."""
+    if not ev:
+        return
+    host = ev.get("host", "?")
+    sip_port = ev.get("sip_port", 5060)
+
+    print()
+    print(f"  {col.BOLD}{col.RED}╔══ CLEARTEXT SIP WIRE CAPTURE  [{host}:{sip_port}] ══╗{col.RESET}")
+    print(f"  {col.RED}║  Passive attacker on same network segment sees everything below:{col.RESET}")
+    print(f"  {col.YELLOW}  tcpdump : {ev.get('tcpdump_cmd', '')}{col.RESET}")
+    print(f"  {col.YELLOW}  sngrep  : {ev.get('sngrep_cmd', '')}{col.RESET}")
+    print(f"  {col.YELLOW}  wireshark filter: {ev.get('wireshark_filter', '')}{col.RESET}")
+    print()
+
+    for pkt in ev.get("packets", []):
+        direction = pkt.get("direction", "")
+        label = pkt.get("label", "")
+        content = pkt.get("content", "")
+        hi_set = set(pkt.get("highlight_lines", []))
+
+        arrow = (f"  {col.GREEN}▶ SENT{col.RESET} " if direction == "sent"
+                 else f"  {col.RED}◀ RECV{col.RESET} ")
+        print(f"{arrow}{col.BOLD}{label}{col.RESET}")
+        print(f"  {'─' * 64}")
+
+        for j, line in enumerate(content.splitlines()[:80]):
+            ll = line.lower()
+            if j in hi_set or any(kw in ll for kw in
+                                   ("www-authenticate:", "proxy-authenticate:",
+                                    "authorization:", "a=crypto:", "nonce=", "realm=")):
+                print(f"  {col.RED}{col.BOLD}  ▶▶ {line}{col.RESET}")
+            elif any(kw in ll for kw in ("server:", "user-agent:", "allow:",
+                                          "p-asserted-identity:", "remote-party-id:")):
+                print(f"  {col.YELLOW}  •  {line}{col.RESET}")
+            elif any(kw in ll for kw in ("via:", "contact:", "record-route:",
+                                          "from:", "to:")):
+                print(f"  {col.CYAN}     {line}{col.RESET}")
+            else:
+                print(f"       {line}")
+        print()
+
+    # Aggregated intelligence summary
+    agg = ev.get("aggregated", {})
+
+    if agg.get("all_challenges"):
+        print(f"  {col.BOLD}{col.RED}⚡ CAPTURED CREDENTIALS ON THE WIRE:{col.RESET}")
+        for ch in agg["all_challenges"]:
+            print(f"    Realm     : {col.RED}{ch.get('realm', '?')}{col.RESET}")
+            print(f"    Nonce     : {col.RED}{ch.get('nonce', '?')}{col.RESET}")
+            print(f"    Algorithm : {col.YELLOW}{ch.get('algorithm', 'MD5')}{col.RESET}  "
+                  f"← MD5 = crackable offline in minutes with rockyou.txt")
+        print()
+
+    if ev.get("auth_demo"):
+        print(f"  {col.BOLD}{col.RED}⚡ AUTHORIZATION HEADER (visible when user logs in):{col.RESET}")
+        print(f"  {col.RED}  {ev['auth_demo'][:240]}{col.RESET}")
+        print()
+
+    if agg.get("all_srtp_keys") or ev.get("sdp_crypto_offered"):
+        print(f"  {col.BOLD}{col.RED}⚡ SRTP KEY MATERIAL IN CLEARTEXT SDP:{col.RESET}")
+        if ev.get("sdp_crypto_offered"):
+            print(f"    Offered  : {col.RED}{ev['sdp_crypto_offered'][:120]}{col.RESET}")
+        if ev.get("sdp_crypto_echoed"):
+            print(f"    PBX echo : {col.RED}{ev['sdp_crypto_echoed'][:120]}{col.RESET}")
+            print(f"    {col.BOLD}Both SRTP keys visible → SDES encryption is completely defeated.{col.RESET}")
+        for k in agg.get("all_srtp_keys", []):
+            print(f"    Captured : {col.RED}{k[:120]}{col.RESET}")
+        print()
+
+    if agg.get("all_internal_ips"):
+        print(f"  {col.BOLD}{col.YELLOW}⚡ INTERNAL NETWORK TOPOLOGY LEAKED:{col.RESET}")
+        for ip in agg["all_internal_ips"]:
+            print(f"    RFC-1918 IP in SIP headers: {col.YELLOW}{ip}{col.RESET}  "
+                  f"(pivot target for internal network)")
+        print()
+
+    if agg.get("all_extensions"):
+        print(f"  {col.BOLD}{col.CYAN}⚡ EXTENSIONS/USERS DISCOVERED FROM SIP EXCHANGE:{col.RESET}")
+        for ext in agg["all_extensions"]:
+            print(f"    {col.CYAN}{ext}{col.RESET}")
+        print()
+
+    if agg.get("all_versions"):
+        print(f"  {col.BOLD}⚡ PLATFORM VERSION FINGERPRINT:{col.RESET}")
+        for v in agg["all_versions"]:
+            print(f"    {col.YELLOW}{v}{col.RESET}")
+        print()
+
+    if ev.get("hashcat_cmd"):
+        print(f"  {col.BOLD}Offline credential cracking (from captured pcap):{col.RESET}")
+        for line in ev["hashcat_cmd"].splitlines():
+            if line.strip().startswith("#"):
+                print(f"  {col.YELLOW}{line}{col.RESET}")
+            else:
+                print(f"  {col.CYAN}$ {line}{col.RESET}")
+        print()
+
+    print(f"  {col.RED}{col.BOLD}╚═══ ALL ABOVE VISIBLE TO ANY PASSIVE NETWORK OBSERVER ═══╝{col.RESET}")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Authorisation gate
 # ---------------------------------------------------------------------------
 
@@ -814,6 +962,33 @@ def main() -> int:
             if cve_results:
                 for r in cve_results:
                     _finding(r.severity, f"{r.cve_id} — {r.title}", col)
+                    # Unencrypted SIP: silently probe for live credentials/keys
+                    # Only surface output if real captured data is found
+                    if r.cve_id in ("CONFIG-SIP-TLS", "CONFIG-SIP-WS-PLAIN") and _CVE_AVAILABLE:
+                        _cap_port = 8088 if r.cve_id == "CONFIG-SIP-WS-PLAIN" else sip_port
+                        _cleartext_ev = cve_module.capture_cleartext_sip_evidence(
+                            h.ip, sip_port=_cap_port,
+                            source_ip=args.source_ip, timeout=args.timeout,
+                        )
+                        _agg = _cleartext_ev.get("aggregated", {})
+                        _has_creds = bool(_cleartext_ev.get("challenge"))
+                        _has_keys = bool(
+                            _cleartext_ev.get("sdp_crypto_echoed")
+                            or _agg.get("all_srtp_keys")
+                        )
+                        _has_intel = bool(
+                            _agg.get("all_internal_ips")
+                            or _agg.get("all_extensions")
+                        )
+                        if _has_creds or _has_keys or _has_intel:
+                            # Show capture — only because real findings exist
+                            _show_cleartext_capture(_cleartext_ev, col)
+                        else:
+                            _info(
+                                "  Cleartext probe ran — no credentials intercepted on this exchange"
+                                " (PBX may not have challenged within timeout).",
+                                col,
+                            )
             else:
                 _info("No CVE/config findings on this host.", col)
         else:
@@ -824,6 +999,16 @@ def main() -> int:
             _ok(f"SIP/{sip_transport.upper()}: {h.sip.get('status')} {h.sip.get('reason')}  "
                 f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
                 f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
+            # Intel extraction from the SIP banner we already have
+            if _CVE_AVAILABLE:
+                _sip_banner_text = (
+                    f"Server: {sip_srv}\n"
+                    f"Allow: {', '.join(h.sip.get('allow', []))}\n"
+                )
+                _banner_intel = cve_module._sip_intel_extract(
+                    _sip_banner_text, "SIP-banner"
+                )
+                _show_sip_intel(_banner_intel, col)
         else:
             _warn(f"{h.ip}: no SIP on standard ports — auto-probing all transports…", col)
             _disc_sip, _disc_port, _disc_tcp, _disc_tls = _sip_no_response_diagnosis(

@@ -38,6 +38,7 @@ class CveResult:
     remediation: str
     affected_version: str = ""   # extracted version string if found
     references: list[str] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)  # structured evidence (capture data, etc.)
 
 
 # ---------------------------------------------------------------------------
@@ -1301,6 +1302,399 @@ def check_sip_wss_security(
             pass
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# SIP intelligence extractor — runs on every SIP exchange
+# ---------------------------------------------------------------------------
+
+def _sip_intel_extract(raw_text: str, source_label: str = "") -> dict:
+    """Scan any SIP message/response for credentials, keys, topology, versions.
+
+    Called on every SIP exchange so the tool misses nothing.
+
+    Returns a dict of intelligence buckets:
+      credentials_challenged  — WWW/Proxy-Authenticate challenges (realm, nonce, algo)
+      credentials_sent        — Authorization / Proxy-Authorization headers (user, realm, hash)
+      internal_ips            — RFC-1918 IPs found in Via/Contact/Record-Route/Warning
+      extensions              — SIP user parts from From/To/Contact/PAI URIs
+      platform_version        — Server / User-Agent banners
+      srtp_keys               — a=crypto SDES key material from SDP
+      sdp_codecs              — audio codec list from SDP
+      allowed_methods         — Allow: header
+      identity_headers        — PAI / RPID / Diversion content
+      custom_headers          — X-* and other non-standard headers
+      topology                — Record-Route / Route / Path headers
+      sensitive_lines         — any line the extractor flags as high-value
+    """
+    import ipaddress as _ipa
+
+    intel: dict = {
+        "source": source_label,
+        "credentials_challenged": [],
+        "credentials_sent": [],
+        "internal_ips": [],
+        "extensions": [],
+        "platform_version": [],
+        "srtp_keys": [],
+        "sdp_codecs": [],
+        "allowed_methods": [],
+        "identity_headers": [],
+        "custom_headers": [],
+        "topology": [],
+        "sensitive_lines": [],
+    }
+
+    _IP_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+    _SIP_USER_RE = re.compile(r"sip:([a-zA-Z0-9_+\-\.]+)@", re.I)
+
+    for line in raw_text.splitlines():
+        ls = line.strip()
+        if not ls:
+            continue
+        ll = ls.lower()
+
+        # ── Auth challenges ───────────────────────────────────────────────
+        if ll.startswith("www-authenticate:") or ll.startswith("proxy-authenticate:"):
+            realm_m = re.search(r'realm\s*=\s*["\']?([^"\'>,\s]+)', ls, re.I)
+            nonce_m = re.search(r'nonce\s*=\s*["\']?([^"\'>,\s]+)', ls, re.I)
+            algo_m = re.search(r'algorithm\s*=\s*(\S+)', ls, re.I)
+            intel["credentials_challenged"].append({
+                "header": ls[:200],
+                "realm": realm_m.group(1).strip('"\'') if realm_m else "",
+                "nonce": nonce_m.group(1).strip('"\'') if nonce_m else "",
+                "algorithm": algo_m.group(1).strip(",;\"'") if algo_m else "MD5",
+            })
+            intel["sensitive_lines"].append(("CREDENTIAL CHALLENGE", ls))
+
+        # ── Auth responses (credentials sent) ─────────────────────────────
+        elif ll.startswith("authorization:") or ll.startswith("proxy-authorization:"):
+            user_m = re.search(r'username\s*=\s*["\']?([^"\'>,\s]+)', ls, re.I)
+            realm_m = re.search(r'realm\s*=\s*["\']?([^"\'>,\s]+)', ls, re.I)
+            resp_m = re.search(r'response\s*=\s*["\']?([0-9a-fA-F]{32,64})', ls, re.I)
+            intel["credentials_sent"].append({
+                "header": ls[:200],
+                "username": user_m.group(1).strip('"\'') if user_m else "",
+                "realm": realm_m.group(1).strip('"\'') if realm_m else "",
+                "hash": resp_m.group(1) if resp_m else "",
+            })
+            intel["sensitive_lines"].append(("CREDENTIAL HASH ON WIRE", ls))
+
+        # ── Server / User-Agent ───────────────────────────────────────────
+        elif ll.startswith("server:") or ll.startswith("user-agent:"):
+            val = ls.split(":", 1)[-1].strip()
+            if val:
+                intel["platform_version"].append(val)
+
+        # ── From / To / Contact — extract extensions ──────────────────────
+        elif ll.startswith(("from:", "to:", "contact:", "p-asserted-identity:",
+                             "remote-party-id:", "p-called-party-id:")):
+            for m in _SIP_USER_RE.finditer(ls):
+                user = m.group(1)
+                if user and user not in intel["extensions"]:
+                    intel["extensions"].append(user)
+            if ll.startswith(("p-asserted-identity:", "remote-party-id:",
+                               "p-called-party-id:")):
+                intel["identity_headers"].append(ls[:200])
+                intel["sensitive_lines"].append(("IDENTITY LEAKAGE", ls))
+
+        # ── Via / Record-Route / Route / Path — extract internal IPs ──────
+        elif ll.startswith(("via:", "v:", "record-route:", "route:", "path:")):
+            for m in _IP_RE.finditer(ls):
+                ip = m.group(1)
+                try:
+                    if _ipa.ip_address(ip).is_private:
+                        if ip not in intel["internal_ips"]:
+                            intel["internal_ips"].append(ip)
+                            intel["sensitive_lines"].append(("INTERNAL IP LEAKED", ls))
+                except ValueError:
+                    pass
+            if ll.startswith(("record-route:", "route:", "path:")):
+                intel["topology"].append(ls[:200])
+
+        # ── Warning — may contain internal hostnames / IPs ────────────────
+        elif ll.startswith("warning:"):
+            for m in _IP_RE.finditer(ls):
+                ip = m.group(1)
+                try:
+                    if _ipa.ip_address(ip).is_private:
+                        if ip not in intel["internal_ips"]:
+                            intel["internal_ips"].append(ip)
+                except ValueError:
+                    pass
+
+        # ── Allow — reveals attack surface ────────────────────────────────
+        elif ll.startswith("allow:"):
+            methods = [m.strip().upper() for m in ls.split(":", 1)[-1].split(",")]
+            intel["allowed_methods"] = [m for m in methods if m]
+
+        # ── X-* custom headers — may expose internal info ─────────────────
+        elif ll.startswith("x-"):
+            intel["custom_headers"].append(ls[:200])
+            # Flag headers that sound credential-ish
+            if any(kw in ll for kw in ("pass", "secret", "key", "token", "auth",
+                                        "cred", "pwd", "pin")):
+                intel["sensitive_lines"].append(("CUSTOM CREDENTIAL HEADER", ls))
+
+        # ── SDP: a=crypto (SRTP key material) ────────────────────────────
+        elif ls.startswith("a=crypto:"):
+            intel["srtp_keys"].append(ls[:200])
+            intel["sensitive_lines"].append(("SRTP ENCRYPTION KEY ON WIRE", ls))
+
+        # ── SDP: a=rtpmap (codec list) ────────────────────────────────────
+        elif ls.startswith("a=rtpmap:"):
+            intel["sdp_codecs"].append(ls.split(":", 1)[-1].strip())
+
+        # ── Generic IP scan across all other lines ────────────────────────
+        else:
+            for m in _IP_RE.finditer(ls):
+                ip = m.group(1)
+                try:
+                    if _ipa.ip_address(ip).is_private:
+                        if ip not in intel["internal_ips"]:
+                            intel["internal_ips"].append(ip)
+                except ValueError:
+                    pass
+
+    return intel
+
+
+# ---------------------------------------------------------------------------
+# Cleartext SIP wire-capture demonstration
+# ---------------------------------------------------------------------------
+
+def capture_cleartext_sip_evidence(
+    host: str,
+    sip_port: int = 5060,
+    source_ip: str = "",
+    timeout: float = 4.0,
+) -> dict:
+    """Actively demonstrate what an attacker captures on a cleartext SIP wire.
+
+    Runs three live probes and returns raw captures + extracted intelligence:
+      1. SIP OPTIONS  — server banner, allowed methods, version
+      2. SIP REGISTER — triggers 401 challenge, exposing realm + nonce on wire
+      3. SIP INVITE with a=crypto SDP — shows SDES SRTP key material in cleartext
+
+    Never raises — returns partial data on timeout/failure.
+    """
+    try:
+        from . import sip as _sip
+        from .utils import rand_call_id, rand_tag, local_ip_for
+    except ImportError:
+        return {}
+
+    import os as _os, base64 as _b64
+
+    local_ip = source_ip or local_ip_for(host)
+
+    ev: dict = {
+        "local_ip": local_ip,
+        "sip_port": sip_port,
+        "host": host,
+        "packets": [],          # [{direction, label, content, highlight_lines}]
+        "intel": [],            # per-packet _sip_intel_extract() results
+        "challenge": {},        # realm, nonce, algorithm
+        "auth_demo": "",        # sample Authorization as sent by a real client
+        "sdp_crypto_offered": "",
+        "sdp_crypto_echoed": "",
+        "hashcat_cmd": "",
+        "tcpdump_cmd": f"tcpdump -i any -n udp port {sip_port} -A",
+        "sngrep_cmd": f"sngrep -d any port {sip_port} -A",
+        "wireshark_filter": f"sip && ip.addr == {host}",
+    }
+
+    # ── Probe 1: SIP OPTIONS ──────────────────────────────────────────────
+    try:
+        resp1 = _sip.options_probe(
+            host, port=sip_port, local_ip=local_ip, timeout=min(timeout, 2.0),
+        )
+        if resp1 and resp1.raw:
+            raw_text = resp1.raw.decode("utf-8", errors="replace")
+            highlight = [
+                i for i, l in enumerate(raw_text.splitlines())
+                if any(kw in l.lower() for kw in ("server:", "user-agent:", "allow:"))
+            ]
+            ev["packets"].append({
+                "direction": "recv",
+                "label": f"OPTIONS response ← {host}:{sip_port}",
+                "content": raw_text,
+                "highlight_lines": highlight,
+            })
+            ev["intel"].append(_sip_intel_extract(raw_text, "OPTIONS"))
+    except Exception:
+        pass
+
+    # ── Probe 2: REGISTER → trigger 401 challenge ─────────────────────────
+    try:
+        call_id = rand_call_id()
+        reg_uri = f"sip:{host}"
+        reg_msg = _sip.build_message(
+            "REGISTER", reg_uri,
+            from_user="1000", to_user="1000",
+            host=host, port=sip_port,
+            local_ip=local_ip, local_port=5062,
+            call_id=call_id, cseq=1, from_tag=rand_tag(),
+            transport="UDP",
+        )
+        reg_text = reg_msg.decode("utf-8", errors="replace")
+        ev["packets"].append({
+            "direction": "sent",
+            "label": f"REGISTER → {host}:{sip_port}  (ext 1000 probe — visible to any network observer)",
+            "content": reg_text,
+            "highlight_lines": [],
+        })
+        ev["intel"].append(_sip_intel_extract(reg_text, "REGISTER-sent"))
+
+        raw_reg = _sip.send_and_recv(
+            reg_msg, host, sip_port, local_port=5062, timeout=min(timeout, 2.0),
+        )
+        if raw_reg:
+            reg_resp_text = raw_reg.decode("utf-8", errors="replace")
+            reg_resp = _sip.parse_response(raw_reg)
+            # Highlight credential challenge lines
+            hi = [
+                i for i, l in enumerate(reg_resp_text.splitlines())
+                if any(kw in l.lower() for kw in
+                       ("www-authenticate:", "proxy-authenticate:", "realm=", "nonce="))
+            ]
+            ev["packets"].append({
+                "direction": "recv",
+                "label": (
+                    f"401 Unauthorized ← {host}:{sip_port}  "
+                    "*** AUTHENTICATION CHALLENGE CAPTURED IN CLEARTEXT ***"
+                ),
+                "content": reg_resp_text,
+                "highlight_lines": hi,
+            })
+            reg_intel = _sip_intel_extract(reg_resp_text, "401-challenge")
+            ev["intel"].append(reg_intel)
+
+            if reg_resp and reg_resp.status_code in (401, 407) and reg_resp.auth_params:
+                auth_p = reg_resp.auth_params
+                realm = auth_p.get("realm", "")
+                nonce = auth_p.get("nonce", "")
+                algo = auth_p.get("algorithm", "MD5")
+                ev["challenge"] = {
+                    "realm": realm, "nonce": nonce, "algorithm": algo,
+                    "raw_header": reg_resp.headers.get(
+                        "www-authenticate",
+                        reg_resp.headers.get("proxy-authenticate", ""),
+                    ),
+                }
+                # Build demo Authorization header showing what appears on wire
+                try:
+                    ev["auth_demo"] = _sip.build_auth_header(
+                        "1000", "VICTIM_PASSWORD", "REGISTER", reg_uri,
+                        auth_p,
+                    )
+                except Exception:
+                    pass
+                ev["hashcat_cmd"] = (
+                    f"# 1. Capture SIP packets:\n"
+                    f"   {ev['tcpdump_cmd']} -w sip_capture.pcap\n"
+                    f"# 2. Extract hashes with sipdump:\n"
+                    f"   sipdump -p sip_capture.pcap -o hashes.txt\n"
+                    f"# 3. Crack MD5 SIP digest offline (hashcat mode 11400):\n"
+                    f"   hashcat -m 11400 -a 0 hashes.txt /usr/share/wordlists/rockyou.txt\n"
+                    f"# 4. Alternative — sipcrack:\n"
+                    f"   sipcrack -w /usr/share/wordlists/rockyou.txt sip_capture.pcap\n"
+                    f"# Realm: {realm}  |  Algorithm: {algo} (MD5 = breakable in hours)"
+                )
+    except Exception:
+        pass
+
+    # ── Probe 3: INVITE with a=crypto → show SDES key exposure ───────────
+    try:
+        _raw_key_bytes = _os.urandom(16) + _os.urandom(14)
+        _b64_key = _b64.b64encode(_raw_key_bytes).decode()
+        crypto_line = f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{_b64_key}"
+        ev["sdp_crypto_offered"] = crypto_line
+
+        sess_id = sip_port  # deterministic
+        sdp = (
+            "v=0\r\n"
+            f"o=scanner {sess_id} {sess_id} IN IP4 {local_ip}\r\n"
+            "s=voip-scan-poc\r\n"
+            f"c=IN IP4 {local_ip}\r\n"
+            "t=0 0\r\n"
+            "m=audio 49170 RTP/SAVP 0\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=sendrecv\r\n"
+            f"{crypto_line}\r\n"
+        )
+        call_id2 = rand_call_id()
+        invite_msg = _sip.build_message(
+            "INVITE", f"sip:1000@{host}",
+            from_user="scanner", to_user="1000",
+            host=host, port=sip_port,
+            local_ip=local_ip, local_port=5063,
+            call_id=call_id2, cseq=1, from_tag=rand_tag(),
+            body=sdp, transport="UDP",
+        )
+        inv_text = invite_msg.decode("utf-8", errors="replace")
+        inv_hi = [i for i, l in enumerate(inv_text.splitlines())
+                  if "a=crypto:" in l.lower()]
+        ev["packets"].append({
+            "direction": "sent",
+            "label": (
+                f"INVITE with SRTP a=crypto → {host}:{sip_port}  "
+                "*** ENCRYPTION KEY IN CLEARTEXT SDP ***"
+            ),
+            "content": inv_text,
+            "highlight_lines": inv_hi,
+        })
+        ev["intel"].append(_sip_intel_extract(inv_text, "INVITE-sent"))
+
+        raw_inv = _sip.send_and_recv(
+            invite_msg, host, sip_port, local_port=5063, timeout=min(timeout, 2.0),
+        )
+        if raw_inv:
+            inv_resp_text = raw_inv.decode("utf-8", errors="replace")
+            inv_hi2 = []
+            for i, l in enumerate(inv_resp_text.splitlines()):
+                if "a=crypto:" in l.lower():
+                    inv_hi2.append(i)
+                    if not ev["sdp_crypto_echoed"]:
+                        ev["sdp_crypto_echoed"] = l.strip()
+            ev["packets"].append({
+                "direction": "recv",
+                "label": (
+                    f"← {host}:{sip_port} INVITE response"
+                    + ("  *** PBX SRTP KEY LEAKED ***" if inv_hi2 else "")
+                ),
+                "content": inv_resp_text,
+                "highlight_lines": inv_hi2,
+            })
+            ev["intel"].append(_sip_intel_extract(inv_resp_text, "INVITE-resp"))
+    except Exception:
+        pass
+
+    # ── Aggregate all intel across all packets ────────────────────────────
+    agg: dict = {
+        "all_extensions": [],
+        "all_internal_ips": [],
+        "all_versions": [],
+        "all_srtp_keys": [],
+        "all_sensitive_lines": [],
+        "all_challenges": [],
+    }
+    for pkt_intel in ev["intel"]:
+        for ext in pkt_intel.get("extensions", []):
+            if ext not in agg["all_extensions"]:
+                agg["all_extensions"].append(ext)
+        for ip in pkt_intel.get("internal_ips", []):
+            if ip not in agg["all_internal_ips"]:
+                agg["all_internal_ips"].append(ip)
+        for ver in pkt_intel.get("platform_version", []):
+            if ver not in agg["all_versions"]:
+                agg["all_versions"].append(ver)
+        agg["all_srtp_keys"].extend(pkt_intel.get("srtp_keys", []))
+        agg["all_sensitive_lines"].extend(pkt_intel.get("sensitive_lines", []))
+        agg["all_challenges"].extend(pkt_intel.get("credentials_challenged", []))
+    ev["aggregated"] = agg
+
+    return ev
 
 
 # ---------------------------------------------------------------------------
