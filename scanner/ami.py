@@ -31,6 +31,12 @@ DEFAULT_AMI_CREDS: list[tuple[str, str]] = [
     ("root", "root"),
     ("ami", "ami"),
     ("super", "secret"),
+    ("", ""),                  # blank username/password (some installs have no auth)
+    ("asterisk", "asterisk"),
+    ("admin", ""),             # blank password admin
+    ("pbxadmin", "pbxadmin"),
+    ("freepbx", "freepbx"),
+    ("user", "user"),
 ]
 
 
@@ -48,6 +54,17 @@ class AmiResult:
     voicemail_boxes: list[str] = field(default_factory=list)
     active_channels: list[str] = field(default_factory=list)
     sip_registrations: list[str] = field(default_factory=list)
+
+
+def try_login(host: str, username: str, password: str,
+              port: int = 5038, timeout: float = 3.0) -> dict | None:
+    """Public helper: attempt a single AMI login. Returns a dict with 'success'
+    key (and 'username'/'password' on success), or None if the port is unreachable."""
+    ok, banner, resp = _try_login(host, port, username, password, timeout)
+    if not banner:
+        return None
+    return {"success": ok, "username": username, "password": password,
+            "evidence": resp[:200] if ok else ""}
 
 
 def _send(sock: socket.socket, data: str) -> str:

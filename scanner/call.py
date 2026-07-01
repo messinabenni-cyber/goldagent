@@ -37,10 +37,12 @@ class CallResult:
 
 def _build_sdp(local_ip: str, rtp_port: int = 49170,
                srtp_offer: str | None = None) -> str:
+    import time as _t
+    sess_id = int(_t.time())
     proto = "RTP/SAVP" if srtp_offer else "RTP/AVP"
     lines = [
         "v=0",
-        f"o=scanner 0 0 IN IP4 {local_ip}",
+        f"o=scanner {sess_id} {sess_id} IN IP4 {local_ip}",
         "s=voip-scan-poc",
         f"c=IN IP4 {local_ip}",
         "t=0 0",
@@ -228,12 +230,14 @@ def place_call(
                 send(ack)
                 trace.append("> ACK (to 401)")
 
+                # Fresh transaction for auth retry (RFC 3261 §17.1.1.3)
+                call_id = rand_call_id()
                 invite2 = sip.build_message(
                     "INVITE", uri,
                     from_user=call_from, to_user=call_to,
                     host=host, port=port,
                     local_ip=local_ip, local_port=local_port,
-                    call_id=call_id, cseq=2, from_tag=tag_from,
+                    call_id=call_id, cseq=1, from_tag=tag_from,
                     auth_header=auth_header,
                     body=_build_sdp(local_ip, srtp_offer=srtp_offer_line),
                     **identity_kwargs,
@@ -241,6 +245,10 @@ def place_call(
                 send(invite2)
                 trace.append("> INVITE (auth)")
                 continue
+            elif resp.is_auth_required and auth_attempted:
+                trace.append(f"< {resp.status_code} second auth challenge — giving up (loop guard)")
+                final = resp
+                break
 
             if 200 <= resp.status_code < 300:
                 final = resp
@@ -282,7 +290,19 @@ def place_call(
                 if call_duration > 0:
                     hold_s = max(0.0, min(call_duration, 3600.0))
                     trace.append(f"* Call established — holding {hold_s:.0f}s then BYE")
-                    time.sleep(hold_s)
+                    _hold_deadline = time.monotonic() + hold_s
+                    s.settimeout(1.0)
+                    while time.monotonic() < _hold_deadline:
+                        try:
+                            _pkt, _ = s.recvfrom(65535)
+                            _pr = sip.parse_response(_pkt)
+                            if _pr:
+                                trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
+                        except socket.timeout:
+                            pass
+                        except OSError:
+                            break
+                    s.settimeout(timeout)
 
                 dtmf_sent: list[str] = []
                 bye_cseq = ack_cseq + 1
@@ -332,10 +352,34 @@ def place_call(
                 final._dtmf_sent = dtmf_sent  # type: ignore[attr-defined]
                 break
 
+            if 300 <= resp.status_code < 400:
+                redirect = resp.headers.get("contact", "")
+                trace.append(f"< {resp.status_code} redirect → {redirect}")
+                # Treat as dialplan engaged (routing is happening)
+                reached_dialplan = True
+                final = resp
+                break
+
             if resp.status_code >= 400:
                 final = resp
                 break
     finally:
+        # Send CANCEL if we broke out on a provisional (dry_run) — prevents ghost call legs
+        if dry_run and reached_dialplan and (final is None or (final.status_code and final.status_code < 200)):
+            try:
+                cancel_cseq = 1
+                cancel = sip.build_message(
+                    "CANCEL", uri,
+                    from_user=call_from, to_user=call_to,
+                    host=host, port=port,
+                    local_ip=local_ip, local_port=local_port,
+                    call_id=call_id, cseq=cancel_cseq, from_tag=tag_from,
+                    to_tag=last_to_tag,
+                )
+                send(cancel)
+                trace.append("> CANCEL (dry-run teardown)")
+            except Exception:
+                pass
         s.close()
 
     if not final:

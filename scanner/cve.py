@@ -553,7 +553,8 @@ def check_grandstream_cve_2021_37748(
         title="CVE-2021-37748: Grandstream UCM SIP configuration exposed without authentication",
         evidence=(
             f"GET {path} returned HTTP 200 with SIP configuration keywords: {matched}. "
-            f"Body snippet: {body[:300]!r}"
+            f"Body snippet: {body[:300]!r} "
+            "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
         ),
         remediation=(
             "Update Grandstream UCM firmware to 1.0.20.22 or later. "
@@ -904,7 +905,7 @@ def check_sip_version_disclosure(
                 CveResult(
                     cve_id="AST-2022-MULTIPLE",
                     platform="Asterisk",
-                    severity="high",
+                    severity="critical",
                     host=host,
                     port=sip_port,
                     title=f"Asterisk {ast_ver} is below 18.12.0 — multiple known CVEs",
@@ -913,7 +914,8 @@ def check_sip_version_disclosure(
                         "Asterisk versions below 18.12.0 are affected by multiple "
                         "security advisories including AST-2022-002 (heap overflow in "
                         "STIR/SHAKEN), AST-2022-006 (res_pjsip_t38 use-after-free), "
-                        "and AST-2022-008 (pjproject RTCP MR/SR overflow)."
+                        "and AST-2022-008 (pjproject RTCP MR/SR overflow). "
+                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
                     ),
                     remediation=(
                         "Upgrade Asterisk to 18.12.0 or later (LTS branch). "
@@ -945,7 +947,8 @@ def check_sip_version_disclosure(
                         "FreePBX versions below 16.0.19.9 are vulnerable to "
                         "CVE-2022-2347: authenticated path traversal and arbitrary "
                         "file read via the file manager module, which can expose "
-                        "system files including /etc/passwd and Asterisk SIP credentials."
+                        "system files including /etc/passwd and Asterisk SIP credentials. "
+                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
                     ),
                     remediation=(
                         "Upgrade FreePBX to 16.0.19.9 or later. "
@@ -1007,11 +1010,13 @@ def check_all(
     if not http_port_tls:
         http_port_tls = [(80, False), (443, True)]
 
-    is_freepbx_or_asterisk = any(
-        kw in fp_lower for kw in ("freepbx", "asterisk", "unknown", "")
+    is_freepbx_or_asterisk = not fingerprint or any(
+        kw in fp_lower for kw in ("freepbx", "asterisk", "unknown")
     )
-    is_grandstream = any(kw in fp_lower for kw in ("grandstream", "ucm", "unknown", ""))
-    is_3cx = any(kw in fp_lower for kw in ("3cx", "unknown", ""))
+    is_grandstream = not fingerprint or any(
+        kw in fp_lower for kw in ("grandstream", "ucm", "unknown")
+    )
+    is_3cx = not fingerprint or any(kw in fp_lower for kw in ("3cx", "unknown"))
 
     # Check 1: FreePBX CVE-2019-19006
     if is_freepbx_or_asterisk:

@@ -20,8 +20,9 @@ _MAX_RANGE = 10_000   # cap any single range expansion to prevent runaway sweeps
 
 # Adaptive rate limiter — starts fast, backs off when 429/503 detected.
 # Shared across threads; .wait() is GIL-safe for a single float mutation.
-_rate_limiter = RateLimiter(rate_per_second=200.0)
-_rate_limited = False   # set True when 429/503 seen; sweep slows automatically
+import threading as _threading
+_rate_limited = False
+_rate_limited_lock = _threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +122,11 @@ def expand_ext_range(spec: str) -> list[str]:
         out: list[str] = []
         for part in spec.split(","):
             out.extend(expand_ext_range(part.strip()))
+        if len(out) > _MAX_RANGE:
+            raise ValueError(
+                f"Combined extension list expands to {len(out)} entries (max {_MAX_RANGE}). "
+                "Split into smaller batches."
+            )
         return out
 
     if "-" in spec:
@@ -205,8 +211,11 @@ def _classify(resp: sip.SipResponse, method: str, ext: str) -> ExtensionResult:
         # Decline — callee explicitly rejected the request; extension is real
         return ExtensionResult(ext, exists=True, evidence=ev + " (declined)")
 
-    if code in (404, 604):
+    if code in (404, 410, 604):
         return ExtensionResult(ext, exists=False, evidence=ev)
+
+    if code == 501:
+        return ExtensionResult(ext, exists=False, evidence=ev + " (method not supported)")
 
     # 500, 488, 485, and everything else — conservative: assume exists
     return ExtensionResult(ext, exists=True,
@@ -314,7 +323,8 @@ def probe(
 
     # Rate-limit detection — back off to protect the scan and the target
     if resp.status_code in (429, 503):
-        _rate_limited = True
+        with _rate_limited_lock:
+            _rate_limited = True
         time.sleep(2.0 + attempt * 1.0)   # per-thread backoff
         return ExtensionResult(ext, exists=True,
                                evidence=f"{method} -> {resp.status_code} (rate-limited)")
@@ -363,9 +373,12 @@ def sweep(
                     hits.append(r)
                 if progress_cb:
                     progress_cb(hit)
-            except Exception:
+            except Exception as _exc:
                 if progress_cb:
                     progress_cb(False)
+                # Log unexpected errors so they're visible in traffic log
+                if traffic_log:
+                    traffic_log.log("ERR", f"{host}:probe", str(_exc).encode())
                 continue
     return sorted(hits, key=lambda r: (len(r.extension), r.extension))
 
@@ -376,7 +389,7 @@ def adaptive_sweep(
     low: int,
     high: int,
     coarse_step: int = 10,
-    fill_radius: int = 9,
+    fill_radius: int = 11,
     max_fill_passes: int = 4,
     timeout: float = 3.0,
     max_workers: int = 20,
@@ -395,6 +408,9 @@ def adaptive_sweep(
 
     This converges on dense clusters (e.g. 1000-1049 all active) in O(cluster)
     rather than O(range) probes while still covering the full coarse grid.
+
+    Zero-padded extensions (e.g. 001, 0100) are not covered here — include them
+    in SPECIAL_EXTENSIONS sweeps before calling this function.
     """
     coarse_cands = [str(n) for n in range(low, high + 1, coarse_step)]
     coarse_hits = sweep(host, coarse_cands, port=port,

@@ -276,16 +276,35 @@ def probe_grandstream_default_creds(host: str, port: int, use_tls: bool,
     status, _, resp = _http_post(host, port, "/cgi-bin/api.values.get",
                                   body, timeout, use_tls)
     text = resp.decode("utf-8", errors="replace")
-    if status in (200, 201) and (
+    text_lower = text.lower()
+    # Success indicators: HTTP 200 AND (positive auth token/session in response)
+    # AND NOT still on the login form (login form contains "password" input field)
+    # OR response contains "logout" link (post-login page)
+    login_success = (
+        status == 200
+        and (
+            '"status":true' in text
+            or '"authenticated"' in text
+            or '"session"' in text_lower
+            or "logout" in text_lower
+        )
+        and "password" not in text_lower[:500]
+    )
+    # Also accept 201 with explicit auth markers regardless of password field
+    if not login_success and status == 201 and (
         '"status":true' in text or '"authenticated"' in text
-        or '"session"' in text.lower()
     ):
+        login_success = True
+    if login_success:
         return HttpFinding(
             name="grandstream-default-creds",
             severity="critical",
             target=f"{host}:{port}",
             title="Grandstream UCM authenticated with default credentials (admin/admin)",
-            evidence=f"POST /cgi-bin/api.values.get with admin/admin returned HTTP {status} indicating login success.",
+            evidence=(
+                f"POST /cgi-bin/api.values.get with admin/admin returned HTTP {status} "
+                "indicating login success (auth token/session present, no login form in response)."
+            ),
             remediation=(
                 "Change the Grandstream admin password immediately via "
                 "System → User Management. Default credentials allow full "
@@ -297,31 +316,60 @@ def probe_grandstream_default_creds(host: str, port: int, use_tls: bool,
 
 def probe_freepbx_rest_api(host: str, port: int, use_tls: bool,
                             timeout: float = 3.0) -> HttpFinding | None:
-    """FreePBX REST API (/admin/api) reachability check."""
+    """FreePBX REST API (/admin/api) reachability check with default cred attempt."""
     if port not in (80, 443, 4443, 8443):
         return None
     status, _, body = _http_get(host, port, "/admin/api/api/version",
                                  timeout, use_tls)
     text = body.decode("utf-8", errors="replace").lower()
-    if status in (200, 401, 403) and any(kw in text for kw in
-                                          ("freepbx", "fpbx", "version",
-                                           "api", "unauthorized")):
-        return HttpFinding(
-            name="freepbx-rest-api-exposed",
-            severity="high",
-            target=f"{host}:{port}",
-            title="FreePBX REST API exposed to the internet",
-            evidence=(
-                f"GET /admin/api/api/version returned HTTP {status}. "
-                "The REST API uses the same admin credentials as the web UI "
-                "and allows full PBX control via authenticated requests."
-            ),
-            remediation=(
-                "Restrict /admin/api to an IP allow-list or VPN. "
-                "Enable HTTP basic auth or API key requirements."
-            ),
+    if not (status in (200, 401, 403) and any(kw in text for kw in
+                                               ("freepbx", "fpbx", "version",
+                                                "api", "unauthorized"))):
+        return None
+
+    # Endpoint confirmed reachable — try default credentials via config.php
+    _default_cred_pairs = [
+        ("admin", "admin"),
+        ("admin", "freepbx"),
+    ]
+    cred_note = ""
+    for _u, _p in _default_cred_pairs:
+        _body = f"username={_u}&password={_p}"
+        _cs, _, _cr = _http_post(
+            host, port, "/admin/config.php", _body, timeout, use_tls,
+            content_type="application/x-www-form-urlencoded",
         )
-    return None
+        _ct = _cr.decode("utf-8", errors="replace").lower()
+        # Successful login: response contains "Logged in" or lacks "login" form
+        _logged_in = (
+            _cs == 200
+            and ("logged in" in _ct or "logout" in _ct)
+            and "login" not in _ct[:300]
+        )
+        if _logged_in:
+            cred_note = f" DEFAULT CREDENTIALS WORK: {_u}/{_p} grants admin access."
+            break
+
+    return HttpFinding(
+        name="freepbx-rest-api-exposed",
+        severity="critical" if cred_note else "high",
+        target=f"{host}:{port}",
+        title=(
+            "FreePBX REST API exposed with working default credentials"
+            if cred_note
+            else "FreePBX REST API exposed to the internet"
+        ),
+        evidence=(
+            f"GET /admin/api/api/version returned HTTP {status}. "
+            "The REST API uses the same admin credentials as the web UI "
+            f"and allows full PBX control via authenticated requests.{cred_note}"
+        ),
+        remediation=(
+            "Restrict /admin/api to an IP allow-list or VPN. "
+            "Enable HTTP basic auth or API key requirements. "
+            "Change default admin credentials immediately."
+        ),
+    )
 
 
 def probe_asterisk_rawman(host: str, port: int, use_tls: bool,
@@ -679,7 +727,7 @@ def run_all(host: str, tcp_ports: list[int],
                 f = fut.result()
                 if f:
                     findings.append(f)
-            except Exception:
+            except (OSError, ConnectionError, TimeoutError):
                 continue
 
     # Deduplicate (name, target)

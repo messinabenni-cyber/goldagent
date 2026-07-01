@@ -120,6 +120,40 @@ def _try_register(
         return False, "unparseable authed REGISTER response"
     if resp2.status_code == 200:
         return True, f"200 OK (realm={params.get('realm', '')})"
+    # Stale nonce: server says credentials may be right, just retry with fresh nonce
+    if resp2.is_auth_required:
+        params2 = resp2.auth_params
+        if params2.get("stale", "").lower() == "true" and params2:
+            hdr_name2 = "Proxy-Authorization" if resp2.status_code == 407 else "Authorization"
+            try:
+                auth_header2 = sip.build_auth_header(
+                    username, password, "REGISTER", uri, params2, header_name=hdr_name2,
+                )
+            except ValueError as exc:
+                return False, f"stale retry skipped: {exc}"
+            msg3 = sip.build_message(
+                "REGISTER", uri,
+                from_user=ext, to_user=ext,
+                host=host, port=port, local_ip=local_ip, local_port=0,
+                call_id=call_id, cseq=3, from_tag=tag,
+                auth_header=auth_header2,
+                extra_headers=["Expires: 30"],
+                transport=transport,
+            )
+            if tcp:
+                data3 = sip.send_and_recv_tcp(msg3, host, port, timeout=timeout,
+                                               use_tls=use_tls, traffic_log=traffic_log)
+            else:
+                data3 = sip.send_and_recv(msg3, host, port, 0, timeout,
+                                           traffic_log=traffic_log)
+            if not data3:
+                return False, "no response to stale-nonce retry"
+            resp3 = sip.parse_response(data3)
+            if not resp3:
+                return False, "unparseable stale-nonce retry response"
+            if resp3.status_code == 200:
+                return True, f"200 OK (stale nonce retried, realm={params2.get('realm','')})"
+            return False, f"{resp3.status_code} {resp3.reason}"
     return False, f"{resp2.status_code} {resp2.reason}"
 
 
@@ -190,13 +224,21 @@ def spray(
         ok, ev = _try_register(host, ext, u, p, port=port, local_ip=local_ip,
                                 timeout=timeout, traffic_log=traffic_log,
                                 tcp=tcp, use_tls=use_tls)
-        if not ok and ("429" in ev or "503" in ev):
-            import time as _t
-            _t.sleep(2.0)
-        # Return only on success or lockout signal; discard plain misses
+        if not ok:
+            ev_lower = ev.lower()
+            if "429" in ev or "503" in ev or "too many" in ev_lower:
+                import time as _t
+                _t.sleep(3.0)
+                # Signal lockout so the extension gets stopped
+                with lock:
+                    stop_for_ext[ext].set()
+                return CredHit(ext, u, p, False, f"LOCKOUT: {ev}")
+            if "403" in ev and ("forbidden" in ev_lower or "too many" in ev_lower):
+                import time as _t
+                _t.sleep(2.0)
         if ok:
             return CredHit(ext, u, p, True, ev)
-        return None   # drop failed attempts — no memory accumulation
+        return None
 
     # Bounded submission: keep at most max_workers*2 futures in flight
     WINDOW = max_workers * 2

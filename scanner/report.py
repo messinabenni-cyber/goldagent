@@ -15,6 +15,18 @@ from pathlib import Path
 from .utils import severity_counts, severity_rank
 
 
+def _iso_now() -> str:
+    """Return current UTC time as a proper ISO 8601 string with colon in offset.
+
+    time.strftime("%z") produces "+0000"; ISO 8601 requires "+00:00".
+    """
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    # Insert colon in timezone offset: +0000 → +00:00
+    if len(ts) > 5 and ts[-5] in ('+', '-') and ':' not in ts[-5:]:
+        ts = ts[:-2] + ':' + ts[-2:]
+    return ts
+
+
 SEVERITY_COLOUR = {
     "critical": "#8b0000",
     "high":     "#c0392b",
@@ -158,12 +170,19 @@ def build_findings(report: dict) -> list[dict]:
         # Toll-fraud PoC result
         ct = host.get("call_test")
         if ct and ct.get("success"):
+            _anon_dialout = ct.get("anonymous_dialout", False)
+            _tf_title = (
+                "TOLL FRAUD WITHOUT CREDENTIALS — Outbound call placed anonymously"
+                if _anon_dialout
+                else "TOLL FRAUD (CREDENTIALED) — Outbound call placed via PBX"
+            )
             findings.append({
                 "severity": "critical", "host": ip,
-                "title": "Outbound call placed via PBX (toll-fraud PoC)",
+                "title": _tf_title,
                 "detail": (
                     f"Called {ct['call_to']} from {ct['call_from']}. "
-                    f"{ct.get('evidence', '')}"
+                    + ("No authentication required — call placed without any credentials. " if _anon_dialout else "")
+                    + f"{ct.get('evidence', '')}"
                 ),
                 "remediation": (
                     "Configure egress dial-plan restrictions: deny "
@@ -345,7 +364,7 @@ def render_html(report: dict) -> str:
 
     target = _esc(report.get("target", "?"))
     operator = _esc(report.get("operator", "?"))
-    timestamp = _esc(report.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S")))
+    timestamp = _esc(report.get("timestamp", _iso_now()))
     scope_file = _esc(report.get("scope_file", ""))
     scope_sha = _esc(report.get("scope_sha256", ""))
 
@@ -386,6 +405,17 @@ def render_html(report: dict) -> str:
         ) or "—"
         exts_count = len(h.get("extensions", []))
         creds_count = len(h.get("credentials_found", []))
+
+        # SIP trace from call_test
+        _ct = h.get("call_test")
+        _sip_trace_html = ""
+        if _ct and _ct.get("trace"):
+            _trace_html = _html.escape("\n".join(str(line) for line in _ct["trace"]))
+            _sip_trace_html = (
+                '<details><summary>SIP Trace</summary>'
+                f'<pre>{_trace_html}</pre></details>'
+            )
+
         host_sections += f"""
 <h3>{_esc(h['ip'])} <span class="muted">{_esc(h.get('fingerprint','unknown'))}</span></h3>
 <table class="kv">
@@ -393,9 +423,34 @@ def render_html(report: dict) -> str:
 <tr><th>Extensions found</th><td>{exts_count}</td></tr>
 <tr><th>Credentials cracked</th><td>{creds_count}</td></tr>
 </table>
+{_sip_trace_html}
 """
 
     exec_summary = _auto_executive_summary(report, findings)
+
+    # Attack chain section
+    attack_chain: list[str] = []
+    if any(
+        f.get('title', '').upper().startswith('ANONYMOUS')
+        or 'DIAL-OUT' in f.get('title', '').upper()
+        or 'WITHOUT CREDENTIALS' in f.get('title', '').upper()
+        for f in findings
+    ):
+        attack_chain = [
+            "1. PBX accepts unauthenticated SIP INVITE from any source IP",
+            "2. Attacker discovers working dial-plan prefix (9, 0, 00, etc.)",
+            "3. Attacker places outbound PSTN call — PBX bills the victim",
+            "4. Any device on the network (or internet if port 5060 exposed) is a launch point",
+        ]
+    attack_chain_html = ""
+    if attack_chain:
+        _chain_items = "".join(
+            f"<li>{_esc(step)}</li>" for step in attack_chain
+        )
+        attack_chain_html = (
+            "<h2>Attack Chain</h2>"
+            "<ol>" + _chain_items + "</ol>"
+        )
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
@@ -441,6 +496,8 @@ th{{background:#0b1a33;color:#fff;font-weight:600;font-size:13px}}
 <th>Finding</th></tr>
 {rows_html or '<tr><td colspan="3"><i>No findings.</i></td></tr>'}
 </table>
+
+{attack_chain_html}
 
 <h2>Host Detail</h2>
 {host_sections or '<p><i>No hosts responded.</i></p>'}
@@ -589,7 +646,7 @@ def render_sales_brief(report):
         "proven": _tf_raw.get("risk_level", "LOW") == "CRITICAL",
     }
     target = _esc(report.get("target", "?"))
-    ts = _esc(report.get("timestamp", time.strftime("%Y-%m-%dT%H:%M:%S")))
+    ts = _esc(report.get("timestamp", _iso_now()))
     score = rs.get("score", 0)
     band = rs.get("band", "")
     band_col = SEVERITY_COLOUR.get(
@@ -664,7 +721,7 @@ def write_findings(report_dir: str, findings: list[dict]) -> str:
         if f.get("severity") in _ACTIONABLE_SEVERITIES
     ]
     # Attach a per-finding timestamp for traceability
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    ts = _iso_now()
     for f in actionable:
         f.setdefault("timestamp", ts)
 

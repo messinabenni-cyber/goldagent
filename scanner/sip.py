@@ -47,6 +47,17 @@ class SipResponse:
         return self.status_code in (401, 407)
 
     @property
+    def allowed_methods(self) -> list[str]:
+        allow = self.headers.get("allow", "")
+        return [m.strip().upper() for m in allow.split(",") if m.strip()]
+
+    @property
+    def has_dangerous_methods(self) -> list[str]:
+        """Return dangerous SIP methods advertised by the server."""
+        dangerous = {"REFER", "SUBSCRIBE", "NOTIFY", "MESSAGE", "PUBLISH"}
+        return [m for m in self.allowed_methods if m in dangerous]
+
+    @property
     def auth_params(self) -> dict[str, str]:
         h = (self.headers.get("www-authenticate")
              or self.headers.get("proxy-authenticate", ""))
@@ -77,7 +88,13 @@ def parse_response(data: bytes) -> SipResponse | None:
         for line in lines[1:]:
             if ":" in line:
                 k, _, v = line.partition(":")
-                headers[k.strip().lower()] = v.strip()
+                key = k.strip().lower()
+                val = v.strip()
+                if key in ("www-authenticate", "proxy-authenticate") and key in headers:
+                    # Keep the Digest challenge, drop Basic if already have Digest
+                    if "digest" in headers[key].lower():
+                        continue
+                headers[key] = val
         return SipResponse(code, reason, headers,
                            body.decode("utf-8", errors="replace"), data)
     except (UnicodeDecodeError, ValueError, AttributeError, IndexError):
@@ -178,7 +195,7 @@ def build_message(
         to_hdr,
         f"Call-ID: {call_id}",
         f"CSeq: {cseq} {method}",
-        f"Contact: <sip:{from_user}@{local_ip}:{local_port};rport>",
+        f"Contact: <sip:{from_user}@{local_ip}:{local_port}>",
         f"User-Agent: {user_agent}",
     ]
     if pai:
@@ -217,6 +234,12 @@ def build_auth_header(
     realm = params.get("realm", "")
     nonce = params.get("nonce", "")
     algorithm = params.get("algorithm", "MD5").upper()
+    # Normalise non-standard variants seen in Kamailio/OEM firmware
+    algorithm = algorithm.replace("_", "-")
+    if algorithm == "SHA256":
+        algorithm = "SHA-256"
+    elif algorithm == "SHA256-SESS":
+        algorithm = "SHA-256-SESS"
     qop = params.get("qop", "")
     opaque = params.get("opaque")
 
@@ -423,6 +446,11 @@ def send_and_recv_tcp(
     except (socket.timeout, OSError, ssl.SSLError):
         return None
     finally:
+        try:
+            if 'sock' in dir() and sock is not raw_sock:
+                sock.close()
+        except Exception:
+            pass
         raw_sock.close()
 
 

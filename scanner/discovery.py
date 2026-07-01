@@ -34,10 +34,11 @@ DEFAULT_PORTS: list[tuple[str, int, str]] = [
     ("tcp", 4443,  "FreePBX-HTTPS"),
     ("tcp", 5000,  "3CX-SIP"),
     ("tcp", 5001,  "3CX-SIP-TLS"),
+    ("tcp", 5066,  "SIP-WSS"),           # FIX 4: WebSocket SIP (RFC 7118)
     ("tcp", 5090,  "SIP-alt"),
     ("tcp", 8080,  "HTTP-alt"),
     ("tcp", 8088,  "Asterisk-HTTP"),
-    ("tcp", 8089,  "Grandstream-HTTPS"),
+    ("tcp", 8089,  "Asterisk-HTTPS-WSS"), # FIX 4: Asterisk HTTPS/WSS
     ("tcp", 8443,  "PBX-HTTPS-alt"),
     ("tcp", 10000, "Asterisk-RTP-check"),
 ]
@@ -291,6 +292,45 @@ def ssl_cn_extract(host: str, port: int, timeout: float) -> str | None:
     return None
 
 
+def ssl_org_fingerprint(host: str, port: int, timeout: float) -> str | None:
+    """FIX 5: Check TLS cert O (Organisation) and OU fields for vendor fingerprinting.
+
+    Returns a vendor name string if a known vendor is identified, else None.
+    Example: O=Sangoma Technologies -> 'FreePBX', O=3CX Ltd -> '3CX'.
+    """
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                cert = tls.getpeercert()
+                if not cert:
+                    return None
+
+                # Check O (Organisation) field for vendor fingerprinting
+                for attr in cert.get("subject", ()):
+                    for key, val in attr:
+                        if key == "organizationName":
+                            org = val.lower()
+                            if "3cx" in org:
+                                return "3CX"
+                            if "sangoma" in org:
+                                return "FreePBX"
+                            if "grandstream" in org:
+                                return "Grandstream"
+                            if "cisco" in org:
+                                return "Cisco"
+                            if "avaya" in org:
+                                return "Avaya"
+                            if "mitel" in org:
+                                return "Mitel"
+    except (socket.timeout, OSError, _ssl.SSLError, ConnectionRefusedError):
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # PBX fingerprinting
 # ---------------------------------------------------------------------------
@@ -311,7 +351,33 @@ PBX_SIGNATURES = [
 ]
 
 
-def fingerprint_banner(banner: str) -> str:
+def fingerprint_banner(banner: str, realm: str = "") -> str:
+    """Fingerprint a PBX from a SIP/HTTP server banner and optional auth realm.
+
+    FIX 2: WWW-Authenticate realm is checked FIRST because it's a stronger
+    signal than the User-Agent/Server header (which vendors sometimes falsify).
+    realm="asterisk" -> Asterisk, realm="FreePBX" -> FreePBX, etc.
+    """
+    # --- Realm-based fingerprinting (FIX 2: takes priority over banner) ---
+    if realm:
+        r = realm.lower()
+        if "freepbx" in r or "fpbx" in r:
+            return "FreePBX"
+        if "3cx" in r or "3cx phone" in r:
+            return "3CX"
+        if "grandstream" in r:
+            return "Grandstream"
+        if "freeswitch" in r:
+            return "FreeSWITCH"
+        if "kamailio" in r:
+            return "Kamailio"
+        if "opensips" in r:
+            return "OpenSIPS"
+        # Only fall back to Asterisk from realm if banner doesn't override it
+        if "asterisk" in r and "freepbx" not in banner.lower():
+            return "Asterisk"
+
+    # --- Banner / Server-header fingerprinting ---
     if not banner:
         return "unknown"
     for name, rx in PBX_SIGNATURES:
@@ -346,10 +412,12 @@ def version_from_banner(banner):
 # ---------------------------------------------------------------------------
 
 # Ports that carry HTTPS (TLS-wrapped HTTP).
-_HTTPS_PORTS: frozenset[int] = frozenset({443, 4443, 8443, 8089})
+# FIX 4: 5066 = SIP/WSS (RFC 7118), 8089 = Asterisk HTTPS/WSS
+_HTTPS_PORTS: frozenset[int] = frozenset({443, 4443, 5066, 8443, 8089})
 
 # Ports where we fetch HTTP(S) banners.
-_HTTP_PROBE_PORTS: frozenset[int] = frozenset({80, 443, 4443, 8080, 8088, 8089, 8443})
+# FIX 4: include 5066 (SIP/WSS) — browser phones negotiate over WS/WSS here
+_HTTP_PROBE_PORTS: frozenset[int] = frozenset({80, 443, 4443, 5066, 8080, 8088, 8089, 8443})
 
 
 def probe_host(host: str, timeout: float = 2.0,
@@ -375,10 +443,18 @@ def probe_host(host: str, timeout: float = 2.0,
 
     for proto, port, service in ports_to_probe:
         if proto == "udp":
-            # Use SIP OPTIONS as the "is it alive on UDP/5060" probe
+            # Use SIP OPTIONS as the "is it alive on UDP/5060" probe.
+            # FIX 1: if resp is truthy the SIP module already parsed a valid
+            # SIP/2.0 response (1xx-5xx); bare TCP/firewall resets return None.
+            # The `if resp:` check is therefore correct — do NOT loosen it to
+            # check any non-None value; the sip module sets resp=None on network
+            # errors and returns a SipResponse only for well-formed SIP replies.
             resp = sip.options_probe(host, port=port, local_ip=local_ip,
                                       timeout=timeout, traffic_log=traffic_log)
             if resp:
+                # FIX 2: extract realm from WWW-Authenticate for fingerprinting
+                realm = (resp.auth_params.get("realm", "")
+                         if hasattr(resp, "auth_params") else "")
                 result.open_ports.append({
                     "port": port, "proto": "udp", "service": service,
                     "status": resp.status_code,
@@ -390,8 +466,9 @@ def probe_host(host: str, timeout: float = 2.0,
                     "server": resp.server,
                     "allow": sip.parse_allowed_methods(resp),
                     "transport": "udp",
+                    "realm": realm,
                 }
-                result.fingerprint = fingerprint_banner(resp.server)
+                result.fingerprint = fingerprint_banner(resp.server, realm=realm)
                 result.version = version_from_banner(resp.server)
                 # Version from SIP banner
                 if not result.version:
@@ -432,6 +509,11 @@ def probe_host(host: str, timeout: float = 2.0,
                 cn = ssl_cn_extract(host, port, timeout)
                 if cn:
                     result.ssl_cn = cn
+                # FIX 5: also check cert O/OU fields for vendor fingerprinting
+                if result.fingerprint == "unknown":
+                    org_fp = ssl_org_fingerprint(host, port, timeout)
+                    if org_fp:
+                        result.fingerprint = org_fp
 
         result.open_ports.append(entry)
 
@@ -448,14 +530,18 @@ def probe_host(host: str, timeout: float = 2.0,
                                       timeout=timeout, traffic_log=traffic_log,
                                       tcp=True, use_tls=use_tls)
             if resp:
+                # FIX 2: extract realm from WWW-Authenticate for fingerprinting
+                realm = (resp.auth_params.get("realm", "")
+                         if hasattr(resp, "auth_params") else "")
                 result.sip = {
                     "status": resp.status_code,
                     "reason": resp.reason,
                     "server": resp.server,
                     "allow": sip.parse_allowed_methods(resp),
                     "transport": transport,
+                    "realm": realm,
                 }
-                result.fingerprint = fingerprint_banner(resp.server)
+                result.fingerprint = fingerprint_banner(resp.server, realm=realm)
                 result.version = version_from_banner(resp.server)
                 if not result.version:
                     ver = version_extract(resp.server)
@@ -523,6 +609,10 @@ def sweep(
                 r = fut.result()
                 if r:
                     results.append(r)
-            except Exception:
-                continue
+            except OSError:
+                # FIX 3: catch only network/OS errors so programming errors
+                # (AttributeError, TypeError, etc.) propagate and are not
+                # silently swallowed.  Host unreachable / timeout is expected
+                # for the vast majority of IPs in a large range.
+                pass
     return sorted(results, key=lambda r: r.ip)

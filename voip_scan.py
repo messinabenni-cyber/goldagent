@@ -890,6 +890,21 @@ def main() -> int:
                 else:
                     _info("No credentials cracked.", col)
 
+                # Credential reuse: try cracked SIP passwords against AMI
+                if successes and hr.get("ami") and not hr["ami"].get("success"):
+                    _sip_passwords = list({c["password"] for c in successes if c.get("password")})
+                    if _sip_passwords:
+                        _info(f"Credential reuse: trying {len(_sip_passwords)} cracked SIP password(s) against AMI...", col)
+                        from scanner import ami as _ami
+                        for _pwd in _sip_passwords[:5]:
+                            for _user in ["admin", "asterisk", successes[0].get("username", "admin")]:
+                                _reuse = _ami.try_login(h.ip, _user, _pwd, port=5038, timeout=args.timeout)
+                                if _reuse and _reuse.get("success"):
+                                    _warn(f"AMI credential reuse: SIP password '{_pwd}' works on AMI as '{_user}'!", col)
+                                    hr["ami"]["reuse_hit"] = {"username": _user, "password": _pwd}
+                                    _finding("critical", f"CREDENTIAL REUSE: SIP password '{_pwd}' grants AMI access as '{_user}' — full PBX control", col)
+                                    break
+
                 # --auto: also try INVITE-based auth spray for extensions that only
                 # challenge INVITE (some PBXes skip REGISTER challenge)
                 if args.auto and not successes:
