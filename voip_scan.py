@@ -757,6 +757,21 @@ def main() -> int:
                 _found_prefix: str | None = None
                 _probe_exts = _call_candidates[:3] if _call_candidates else [(call_from, username, password)]
 
+                def _prefix_probe_cb(pfx: str, dest: str, r: "call.CallResult") -> None:
+                    """Print SIP trace + mini-result for every prefix probe."""
+                    _pfx_show = repr(pfx) if pfx else "'(direct)'"
+                    _code = r.status_code or "T/O"
+                    _hit = r.reached_dialplan
+                    _sym = "✓" if _hit else "✗"
+                    _info(
+                        f"  prefix {_pfx_show:<10} → {dest:<28}  "
+                        f"[{_code}]  {'DIALPLAN HIT' if _hit else 'rejected'}  {_sym}",
+                        col,
+                    )
+                    if r.sip_trace:
+                        for _tl in r.sip_trace:
+                            _info(f"    {_tl}", col)
+
                 for _ext, _uname, _pwd in _probe_exts:
                     _jitter_sleep(args.jitter)
 
@@ -769,6 +784,7 @@ def main() -> int:
                             source_ip=args.source_ip,
                             source_port_range=source_port_range,
                             prefixes=_platform_prefixes,
+                            probe_callback=_prefix_probe_cb,
                         )
                         for _pfx, _dest in _hits:
                             all_working_prefixes.append((_pfx, _dest, _ext))
@@ -776,7 +792,7 @@ def main() -> int:
                             _found_prefix, effective_call_to = _hits[0]
                             call_from, username, password = _ext, _uname, _pwd
                     else:
-                        # Fast: stop at first working prefix
+                        # Fast: stop at first working prefix (print trace for each)
                         _found_prefix, effective_call_to = call.discover_dialplan_prefix(
                             h.ip, args.call_to, _ext,
                             port=args.port, username=_uname, password=_pwd,
@@ -784,6 +800,7 @@ def main() -> int:
                             source_ip=args.source_ip,
                             source_port_range=source_port_range,
                             prefixes=_platform_prefixes,
+                            probe_callback=_prefix_probe_cb,
                         )
                         if _found_prefix is not None:
                             call_from, username, password = _ext, _uname, _pwd
@@ -862,23 +879,58 @@ def main() -> int:
                 _wl_cands = list(dict.fromkeys(_wl_numeric[:8] + _wl_extra))
                 _wl_cands = [e for e in _wl_cands if e != call_from][:18]
 
-                _info(f"Weak-line sweep: testing {len(_wl_cands)} extensions "
-                      f"for unauthenticated outbound routing...", col)
+                # Weak-line sweep: 60-second live calls from each candidate extension
+                # (no dry_run — we need to confirm the call truly completes and observe
+                # it on the destination phone, not just cancel at the provisional).
+                _wl_call_dur = max(60.0, args.call_duration)
+                _info(
+                    f"Weak-line sweep: testing {len(_wl_cands)} extensions — "
+                    f"LIVE {_wl_call_dur:.0f}s calls (no dry-run) to confirm "
+                    f"unauthenticated outbound routing...",
+                    col,
+                )
                 _weak_lines: list[str] = [call_from]  # already confirmed
                 for _wext in _wl_cands:
+                    _jitter_sleep(args.jitter)
+                    _info(f"  Testing ext {col.BOLD}{_wext}{col.RESET} → {effective_call_to} "
+                          f"({_wl_call_dur:.0f}s hold)...", col)
                     _wr = call.place_call(
                         h.ip, effective_call_to, _wext,
-                        port=args.port, timeout=min(args.timeout, 3.0),
-                        dry_run=True, max_wait=3.5,
+                        port=args.port,
+                        timeout=args.timeout,
+                        dry_run=False,
+                        call_duration=_wl_call_dur,
+                        max_wait=_wl_call_dur + 15.0,
                         traffic_log=traffic_log,
                         source_ip=args.source_ip,
                         source_port_range=source_port_range,
                     )
                     status = _wr.status_code or "timeout"
-                    if _wr.reached_dialplan:
+                    # ── Per-extension SIP trace ────────────────────────────
+                    if _wr.sip_trace:
+                        _info(f"    {'─'*48}", col)
+                        _info(f"    SIP TRACE  ext={_wext}", col)
+                        _info(f"    {'─'*48}", col)
+                        for _tl in _wr.sip_trace:
+                            _info(f"    {_tl}", col)
+                        _info(f"    {'─'*48}", col)
+                    # ── Per-extension diagnostic ───────────────────────────
+                    _wdiag = call.diagnose_call_result(
+                        _wr, host=h.ip, local_ip=_wr.local_ip_used,
+                    )
+                    _info(f"    DIAGNOSTIC  ext={_wext}:", col)
+                    for _wdl in _wdiag.split("\n")[:8]:  # first 8 lines (risk summary)
+                        _info(f"      {_wdl}", col)
+                    if _wr.success or _wr.reached_dialplan:
                         _weak_lines.append(_wext)
-                        _warn(f"  Weak line: ext {col.BOLD}{_wext}{col.RESET} → "
-                              f"dialplan accepted  [{status}]", col)
+                        _conf_note = " (CONFIRMED — BYE acked)" if _wr.call_confirmed else \
+                                     " (200 OK — BYE unacked/NAT)" if _wr.success else \
+                                     " (dialplan reached)"
+                        _warn(
+                            f"  {col.RED}Weak line: ext {col.BOLD}{_wext}{col.RESET}"
+                            f"{col.RED} → dialplan accepted  [{status}]{_conf_note}{col.RESET}",
+                            col,
+                        )
                     else:
                         _info(f"  {_wext}: rejected  [{status}]", col)
 

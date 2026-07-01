@@ -871,12 +871,16 @@ def discover_all_prefixes(
     source_ip: str = "",
     source_port_range: tuple[int, int] | None = None,
     prefixes: list[str] | None = None,
+    probe_callback=None,
 ) -> list[tuple[str, str]]:
     """Exhaustively probe every prefix and return ALL that reach the dialplan.
 
     Returns list of (prefix, full_destination) for every prefix that produced
     a 100/180/183 response. Empty list if none worked. Use this in --auto mode
     to fully map the PBX's outbound routing rules rather than stopping at first hit.
+
+    probe_callback(prefix, dest, result) is called after every probe if provided,
+    enabling callers to print per-probe SIP traces and diagnostics.
     """
     if prefixes is None:
         prefixes = DIALPLAN_PREFIXES
@@ -890,6 +894,8 @@ def discover_all_prefixes(
             traffic_log=traffic_log,
             source_ip=source_ip, source_port_range=source_port_range,
         )
+        if probe_callback:
+            probe_callback(prefix, dest, result)
         if result.reached_dialplan:
             hits.append((prefix, dest))
     return hits
@@ -909,11 +915,15 @@ def discover_dialplan_prefix(
     source_port_range: tuple[int, int] | None = None,
     prefixes: list[str] | None = None,
     fingerprint: str = "",
+    probe_callback=None,
 ) -> tuple[str | None, str]:
     """Try dial-plan prefixes until one produces a provisional response.
 
     Returns (winning_prefix, full_destination) or (None, call_to) if none work.
     Pass fingerprint= to use platform-tuned prefix ordering.
+
+    probe_callback(prefix, dest, result) is called after every probe if provided,
+    enabling callers to print per-probe SIP traces and diagnostics.
     """
     if prefixes is None:
         prefixes = prefixes_for_fingerprint(fingerprint) if fingerprint else DIALPLAN_PREFIXES
@@ -927,6 +937,8 @@ def discover_dialplan_prefix(
             traffic_log=traffic_log,
             source_ip=source_ip, source_port_range=source_port_range,
         )
+        if probe_callback:
+            probe_callback(prefix, dest, result)
         if result.reached_dialplan:
             return prefix, dest
 

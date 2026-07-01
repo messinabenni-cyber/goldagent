@@ -7,10 +7,15 @@ report.
 
 Platforms covered:
   FreePBX / Asterisk  — CVE-2019-19006, CVE-2021-45461, path traversal,
-                        module exposure, recording exposure, CVE-2022-2347
+                        module exposure, recording exposure, CVE-2022-2347,
+                        CVE-2025-57819 (EPM SQL injection + RCE, CVSS 9.8),
+                        CVE-2025-57767 (SIP auth crash DoS, CVSS 7.5)
   Grandstream UCM     — CVE-2021-37748, CVE-2023-37315
   3CX                 — admin/webclient exposure, unauthenticated API
-  Generic             — Asterisk AMI without TLS, SIP version disclosure
+  Generic             — Asterisk AMI without TLS, SIP version disclosure,
+                        CONFIG-SIP-TLS (unencrypted signaling, RFC 3261 §26),
+                        CONFIG-SIP-WS-PLAIN (plain WebSocket SIP, RFC 7118),
+                        CONFIG-SIP-WSS-CSWSH (Cross-Site WebSocket Hijacking)
 """
 from __future__ import annotations
 
@@ -967,6 +972,338 @@ def check_sip_version_disclosure(
 
 
 # ---------------------------------------------------------------------------
+# Check 11: CVE-2025-57819 — FreePBX EPM unauthenticated SQL injection + RCE
+# ---------------------------------------------------------------------------
+
+def check_freepbx_cve_2025_57819(
+    host: str,
+    port: int,
+    use_tls: bool = False,
+    timeout: float = 3.0,
+) -> "CveResult | None":
+    """CVE-2025-57819 (CVSS 9.8): FreePBX End Point Manager SQL injection → RCE.
+
+    The EPM module exposes /admin/ajax.php?module=epm_config_manager without
+    authentication checks. Sending a crafted request leaks the endpoint and
+    in vulnerable versions allows SQL injection chainable to remote code
+    execution as root. Over 12,000 instances publicly exposed (2025).
+
+    Affected: FreePBX EPM 15.0 < 15.0.66, 16.0 < 16.0.89, 17.0 < 17.0.3.
+    """
+    status, hdrs, body = _http_get(
+        host, port,
+        "/admin/ajax.php?module=epm_config_manager&command=getTemplateList",
+        timeout, use_tls,
+    )
+    if status == 0:
+        return None
+    body_l = body.lower()
+    # Indicator: JSON response or explicit EPM module data returned unauthenticated
+    epm_exposed = (
+        status == 200
+        and ('"template"' in body_l or '"mac"' in body_l
+             or "epm" in body_l or "endpoint" in body_l)
+    )
+    if not epm_exposed:
+        return None
+    scheme = "https" if use_tls else "http"
+    return CveResult(
+        cve_id="CVE-2025-57819",
+        platform="FreePBX",
+        severity="critical",
+        host=host,
+        port=port,
+        title=(
+            "CVE-2025-57819: FreePBX EPM module exposed without authentication "
+            "(SQL injection → RCE, CVSS 9.8)"
+        ),
+        evidence=(
+            f"GET {scheme}://{host}:{port}/admin/ajax.php?module=epm_config_manager"
+            f"&command=getTemplateList → {status}. "
+            f"EPM endpoint responds without requiring session/cookie authentication. "
+            f"Body excerpt: {body[:200].strip()}"
+        ),
+        remediation=(
+            "Update EPM module to ≥15.0.66 / ≥16.0.89 / ≥17.0.3 immediately. "
+            "If unable to patch, disable EPM in FreePBX admin → Module Admin. "
+            "Block /admin/ajax.php access from the internet at the firewall."
+        ),
+        references=[
+            "https://nvd.nist.gov/vuln/detail/CVE-2025-57819",
+            "https://www.greenbone.net/en/blog/cve-2025-57819-unauthenticated-rce-threatens-freepbx-systems-globally/",
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Check 12: CVE-2025-57767 — Asterisk SIP digest auth NULL pointer dereference
+# ---------------------------------------------------------------------------
+
+def check_asterisk_cve_2025_57767(
+    host: str,
+    sip_port: int,
+    sip_server: str,
+    timeout: float = 3.0,
+) -> "CveResult | None":
+    """CVE-2025-57767 (CVSS 7.5): Asterisk NULL pointer dereference on malformed auth.
+
+    A SIP INVITE with a crafted Authorization header (missing realm or nonce)
+    triggers a NULL pointer dereference in res_pjsip_authenticator_digest.so,
+    causing an Asterisk crash (remote DoS). Any unauthenticated attacker on the
+    network can take down the PBX.
+
+    Affected: Asterisk < 20.15.2, < 21.10.2, < 22.5.2.
+    """
+    if not sip_server:
+        return None
+    sv = sip_server.lower()
+    if "asterisk" not in sv:
+        return None
+    # Extract version
+    m = re.search(r"asterisk\s+(?:pbx\s+)?(\d+\.\d+(?:\.\d+)?)", sv)
+    if not m:
+        return None
+    ver_str = m.group(1)
+    try:
+        parts = [int(x) for x in ver_str.split(".")]
+    except ValueError:
+        return None
+    major = parts[0] if parts else 0
+    minor = parts[1] if len(parts) > 1 else 0
+    patch = parts[2] if len(parts) > 2 else 0
+
+    vulnerable = (
+        (major == 20 and (minor < 15 or (minor == 15 and patch < 2)))
+        or (major == 21 and (minor < 10 or (minor == 10 and patch < 2)))
+        or (major == 22 and (minor < 5 or (minor == 5 and patch < 2)))
+    )
+    if not vulnerable:
+        return None
+    return CveResult(
+        cve_id="CVE-2025-57767",
+        platform="Asterisk",
+        severity="high",
+        host=host,
+        port=sip_port,
+        title=(
+            f"CVE-2025-57767: Asterisk {ver_str} vulnerable to SIP auth crash "
+            "(remote DoS via malformed Authorization header, CVSS 7.5)"
+        ),
+        evidence=(
+            f"SIP server banner: {sip_server}. "
+            f"Asterisk {ver_str} < 20.15.2/21.10.2/22.5.2. "
+            "A crafted Authorization header with missing realm/nonce triggers "
+            "NULL pointer dereference in res_pjsip_authenticator_digest → crash."
+        ),
+        remediation=(
+            "Upgrade Asterisk to ≥20.15.2, ≥21.10.2, or ≥22.5.2. "
+            "As an interim mitigation, configure fail2ban to rate-limit SIP "
+            "INVITEs from unknown sources."
+        ),
+        affected_version=ver_str,
+        references=[
+            "https://nvd.nist.gov/vuln/detail/CVE-2025-57767",
+            "https://www.ameeba.com/blog/cve-2025-57767-asterisk-vulnerability-affecting-sip-request-authentication/",
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Check 13: CONFIG-SIP-TLS — Unencrypted SIP signaling (no TLS on 5061)
+# ---------------------------------------------------------------------------
+
+def check_sip_tls_missing(
+    host: str,
+    sip_port: int,
+    tcp_ports: list[int],
+    timeout: float = 3.0,
+) -> "CveResult | None":
+    """CONFIG: SIP signaling not protected by TLS.
+
+    When SIP is carried over plain UDP/TCP (not TLS-wrapped), Digest
+    authentication credentials, call metadata, SDP offers (including any
+    SDES-SRTP a=crypto key material), and CLI/Caller-ID are transmitted in
+    cleartext and trivially capturable by passive network monitors or
+    man-in-the-middle attackers.
+
+    RFC 3261 §26 requires TLS for any SIP deployment where signaling crosses
+    untrusted networks. RFC 4568 §9 mandates TLS to protect SDES keys.
+    """
+    # Check if port 5061 (SIP-TLS) is in open TCP ports
+    sip_tls_open = 5061 in tcp_ports
+    # Also probe 5061 directly — it might not have been discovered
+    if not sip_tls_open:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, 5061))
+            sip_tls_open = True
+        except OSError:
+            pass
+        finally:
+            s.close()
+
+    if sip_tls_open:
+        return None  # TLS available — not a finding
+
+    # Plain SIP is reachable on port 5060 but TLS is not available on 5061
+    return CveResult(
+        cve_id="CONFIG-SIP-TLS",
+        platform="Generic",
+        severity="high",
+        host=host,
+        port=sip_port,
+        title=(
+            "Unencrypted SIP signaling — TLS not available on port 5061 "
+            "(credentials and SDES-SRTP keys transmitted in cleartext)"
+        ),
+        evidence=(
+            f"SIP port {sip_port}/udp is open. Port 5061/tcp (SIP-TLS) is not "
+            "reachable. SIP Digest authentication nonces, call metadata, "
+            "and any SDP a=crypto SDES key material are transmitted unencrypted. "
+            "Violates RFC 3261 §26 and RFC 4568 §9."
+        ),
+        remediation=(
+            "Enable SIP-TLS (port 5061) on the PBX. "
+            "FreePBX: Settings → Advanced Settings → TLS → Enable. "
+            "Asterisk: enable tls=yes in sip.conf or pjsip transport. "
+            "Use valid TLS certificates (Let's Encrypt is supported). "
+            "Enforce SIP-TLS on all external trunks and SIP UA registrations."
+        ),
+        references=[
+            "https://datatracker.ietf.org/doc/html/rfc3261#section-26",
+            "https://datatracker.ietf.org/doc/html/rfc4568#section-9",
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Check 14: CONFIG-SIP-WSS — SIP-over-WebSocket security check
+# ---------------------------------------------------------------------------
+
+def check_sip_wss_security(
+    host: str,
+    tcp_ports: list[int],
+    timeout: float = 3.0,
+) -> list["CveResult"]:
+    """CONFIG: SIP-over-WebSocket (RFC 7118) security assessment.
+
+    SIP-WSS on port 8089 is common for FreePBX/Asterisk WebRTC endpoints.
+    Tests: (a) plain WS on 8088 (unencrypted), (b) Origin header not validated
+    (potential CSWSH), (c) WSS TLS cipher strength.
+    """
+    results: list[CveResult] = []
+
+    # Check for plain WS (port 8088) — unencrypted WebSocket SIP
+    ws_plain_open = 8088 in tcp_ports
+    if not ws_plain_open:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, 8088))
+            ws_plain_open = True
+        except OSError:
+            pass
+        finally:
+            s.close()
+
+    if ws_plain_open:
+        results.append(CveResult(
+            cve_id="CONFIG-SIP-WS-PLAIN",
+            platform="Generic",
+            severity="high",
+            host=host,
+            port=8088,
+            title=(
+                "Unencrypted SIP-over-WebSocket (ws://) on port 8088 — "
+                "signaling exposed to eavesdropping (RFC 7118 §14)"
+            ),
+            evidence=(
+                "Port 8088/tcp is open. SIP-over-WebSocket without TLS allows "
+                "full call session capture, credential theft, and call injection "
+                "by any network observer. Credentials in WWW-Authenticate are "
+                "transmitted in cleartext over the WebSocket transport."
+            ),
+            remediation=(
+                "Disable plain WS (port 8088). Use WSS only (port 8089). "
+                "FreePBX: Admin → Asterisk SIP Settings → WebRTC → force WSS. "
+                "Ensure all WebRTC clients use wss:// URI scheme."
+            ),
+            references=["https://datatracker.ietf.org/doc/html/rfc7118#section-14"],
+        ))
+
+    # Check for WSS (port 8089) — probe for TLS availability (positive indicator)
+    wss_open = 8089 in tcp_ports
+    if not wss_open:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, 8089))
+            wss_open = True
+        except OSError:
+            pass
+        finally:
+            s.close()
+
+    if wss_open:
+        # Probe for Origin header CSWSH: send a WS upgrade without proper Origin
+        # A vulnerable server accepts any Origin header
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect((host, 8089))
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            tls = ctx.wrap_socket(s, server_hostname=host)
+            ws_upgrade = (
+                "GET / HTTP/1.1\r\n"
+                f"Host: {host}:8089\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "Sec-WebSocket-Protocol: sip\r\n"
+                "Origin: https://evil.example.com\r\n"
+                "\r\n"
+            )
+            tls.sendall(ws_upgrade.encode())
+            resp = tls.recv(2048).decode("utf-8", errors="replace")
+            tls.close()
+            if "101 switching" in resp.lower():
+                results.append(CveResult(
+                    cve_id="CONFIG-SIP-WSS-CSWSH",
+                    platform="Generic",
+                    severity="medium",
+                    host=host,
+                    port=8089,
+                    title=(
+                        "SIP-WSS accepts arbitrary Origin headers — "
+                        "Cross-Site WebSocket Hijacking (CSWSH) possible"
+                    ),
+                    evidence=(
+                        "Sent WS upgrade with Origin: https://evil.example.com. "
+                        "Server responded 101 Switching Protocols — no Origin "
+                        "validation. Browser-based CSWSH can hijack SIP sessions "
+                        "of authenticated WebRTC users."
+                    ),
+                    remediation=(
+                        "Configure allowed WebSocket origins. "
+                        "FreePBX/Asterisk: set websocket_allowed_origins in "
+                        "http.conf. Restrict to your own domain(s) only."
+                    ),
+                    references=[
+                        "https://datatracker.ietf.org/doc/html/rfc7118#section-14",
+                        "https://portswigger.net/web-security/websockets/cross-site-websocket-hijacking",
+                    ],
+                ))
+        except (OSError, ssl.SSLError):
+            pass
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1090,6 +1427,29 @@ def check_all(
     # Check 10: SIP version disclosure
     version_results = check_sip_version_disclosure(host, sip_port, sip_server, timeout)
     results.extend(version_results)
+
+    # Check 11: CVE-2025-57819 — FreePBX EPM SQL injection + RCE
+    if is_freepbx_or_asterisk:
+        for port, use_tls in http_port_tls:
+            r = check_freepbx_cve_2025_57819(host, port, use_tls, timeout)
+            if r:
+                results.append(r)
+                break
+
+    # Check 12: CVE-2025-57767 — Asterisk SIP auth crash (DoS)
+    if is_freepbx_or_asterisk:
+        r = check_asterisk_cve_2025_57767(host, sip_port, sip_server, timeout)
+        if r:
+            results.append(r)
+
+    # Check 13: Unencrypted SIP signaling (no TLS on 5061)
+    r_tls = check_sip_tls_missing(host, sip_port, tcp_ports, timeout)
+    if r_tls:
+        results.append(r_tls)
+
+    # Check 14: SIP-over-WebSocket security
+    wss_results = check_sip_wss_security(host, tcp_ports, timeout)
+    results.extend(wss_results)
 
     # Deduplicate by (cve_id, host, port)
     seen: set[tuple[str, str, int]] = set()

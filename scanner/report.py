@@ -171,10 +171,12 @@ def build_findings(report: dict) -> list[dict]:
         ct = host.get("call_test")
         if ct and ct.get("success"):
             _anon_dialout = ct.get("anonymous_dialout", False)
+            _confirmed = ct.get("call_confirmed", False)
+            _conf_suffix = " (DIALOG CONFIRMED)" if _confirmed else " (SIP 200 OK)"
             _tf_title = (
-                "TOLL FRAUD WITHOUT CREDENTIALS — Outbound call placed anonymously"
+                "TOLL-FRAUD WITHOUT CREDENTIALS — Anonymous outbound call placed" + _conf_suffix
                 if _anon_dialout
-                else "TOLL FRAUD (CREDENTIALED) — Outbound call placed via PBX"
+                else "TOLL-FRAUD (CREDENTIALED) — Outbound call placed via PBX" + _conf_suffix
             )
             findings.append({
                 "severity": "critical", "host": ip,
