@@ -1311,7 +1311,7 @@ def _phase_crack_hashes_and_respray(
         [],                          # empty wordlist — only ami_cracked_passwords used
         port=sip_port,
         timeout=args.timeout,
-        max_workers=min(args.workers, 10),
+        max_workers=args.workers,
         max_failures_per_ext=args.max_failures_per_ext,
         traffic_log=traffic_log,
         source_ip=args.source_ip,
@@ -1899,20 +1899,39 @@ def main() -> int:
             )
 
         if args.spray and state.extension_list:
-            creds = auth.load_credentials(args.cred_file)
+            # Build ordered credential list:
+            #   1. top_defaults.txt  (~60 entries, fastest wins — always tried first)
+            #   2. full credentials.txt  (only in --full/--auto or --cred-file override)
+            _top_path = os.path.join(os.path.dirname(__file__), "wordlists", "top_defaults.txt")
+            _full_path = args.cred_file
+            _use_full = args.full or getattr(args, "auto", False) or (
+                args.cred_file != os.path.join(os.path.dirname(__file__), "wordlists", "credentials.txt")
+            )
+            if os.path.exists(_top_path):
+                _top_creds = list(auth.load_credentials(_top_path))
+            else:
+                _top_creds = []
+            if _use_full:
+                _full_creds = list(auth.load_credentials(_full_path))
+                # Dedup: skip full-list pairs already in top list
+                _top_set = {(u, p) for u, p in _top_creds}
+                _full_creds = [(u, p) for u, p in _full_creds if (u, p) not in _top_set]
+                creds = _top_creds + _full_creds
+            else:
+                creds = _top_creds
+                _info(
+                    f"Fast spray: using top_defaults.txt ({len(creds)} pairs). "
+                    f"Add --full for full {os.path.basename(_full_path)} wordlist.",
+                    col,
+                )
             if args.grandstream_creds or state.fingerprint == "Grandstream":
                 gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
                 if os.path.exists(gs_path):
-                    creds.extend(auth.load_credentials(gs_path))
+                    creds = creds + list(auth.load_credentials(gs_path))
 
             targets_for_spray = state.spray_targets()
             if targets_for_spray:
-                # Bump workers to max on auth-bypass — target is already confirmed
-                # accessible; lockout risk is lower.
-                _spray_workers = (
-                    args.workers if state.cve_auth_bypass_triggered
-                    else min(args.workers, 10)
-                )
+                _spray_workers = args.workers
                 total_attempts = len(creds) * len(targets_for_spray)
                 _info(
                     f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
@@ -1936,7 +1955,7 @@ def main() -> int:
                     max_failures_per_ext=args.max_failures_per_ext,
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                    ami_cracked_passwords=state.crack_pool,  # full pool, ordered
+                    ami_cracked_passwords=state.crack_pool,
                     hash_log_path=os.path.join(report_dir, "sip_hashes.txt"),
                 )
                 prog.close()
@@ -1996,7 +2015,7 @@ def main() -> int:
                         invite_hits = auth.spray(
                             h.ip, invite_auth_exts, creds,
                             port=sip_port, timeout=args.timeout,
-                            max_workers=min(args.workers, 10),
+                            max_workers=args.workers,
                             max_failures_per_ext=args.max_failures_per_ext,
                             traffic_log=traffic_log,
                             source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
@@ -2862,7 +2881,7 @@ def main() -> int:
                 hits_spray = auth.spray(
                     h.ip, targets_for_spray, creds,
                     port=sip_port, timeout=args.timeout,
-                    max_workers=min(args.workers, 10),
+                    max_workers=args.workers,
                     max_failures_per_ext=args.max_failures_per_ext,
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
@@ -2914,7 +2933,7 @@ def main() -> int:
                         invite_hits = auth.spray(
                             h.ip, invite_auth_exts, creds,
                             port=sip_port, timeout=args.timeout,
-                            max_workers=min(args.workers, 10),
+                            max_workers=args.workers,
                             max_failures_per_ext=args.max_failures_per_ext,
                             traffic_log=traffic_log,
                             source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
