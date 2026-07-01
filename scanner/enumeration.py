@@ -241,6 +241,8 @@ def probe(
     tcp: bool = False,
     use_tls: bool = False,
     retries: int = 1,
+    header_ip: str | None = None,
+    extra_headers: list[str] | None = None,
 ) -> ExtensionResult:
     """Probe a single extension. Retries once on timeout (catches UDP loss).
 
@@ -280,14 +282,16 @@ def probe(
         extras = ["Accept: application/sdp"]
         body = ""
 
+    all_extras = (extras or []) + (extra_headers or [])
     msg = sip.build_message(
         method, request_uri,
         from_user=ext, to_user=ext,
         host=host, port=port,
         local_ip=local_ip, local_port=0,
         call_id=call_id, cseq=1, from_tag=tag,
-        body=body, extra_headers=extras,
+        body=body, extra_headers=all_extras if all_extras else None,
         transport=transport,
+        header_ip=header_ip,
     )
 
     data: bytes | None = None
@@ -357,6 +361,8 @@ def sweep(
     use_tls: bool = False,
     retries: int = 1,
     max_results: int = _MAX_RESULTS,
+    header_ip: str | None = None,
+    extra_headers: list[str] | None = None,
 ) -> list[ExtensionResult]:
     """Parallel sweep over a list of extension candidates. Returns only hits.
 
@@ -371,7 +377,9 @@ def sweep(
         return probe(host, ext, port=port, method=method,
                      timeout=timeout, traffic_log=traffic_log,
                      source_ip=source_ip, tcp=tcp, use_tls=use_tls,
-                     retries=retries)
+                     retries=retries,
+                     header_ip=header_ip,
+                     extra_headers=extra_headers)
 
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:

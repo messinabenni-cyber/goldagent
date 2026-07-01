@@ -441,6 +441,10 @@ def place_call(
     # Media
     srtp: str = "off",       # "off" | "offer" | "require"
     dtmf_digits: str = "",   # e.g. "1p500#" — 'pN' = N-ms pause
+    # IP spoofing / header bypass
+    header_ip: str | None = None,      # IP shown in Via/Contact (decoupled from socket bind)
+    extra_headers: list[str] | None = None,  # Extra SIP headers (e.g. X-Forwarded-For)
+    user_agent: str | None = None,     # Override User-Agent (None = default)
 ) -> CallResult:
     """Place one INVITE; handle 401 re-auth; on 200 OK send ACK then BYE.
 
@@ -546,9 +550,13 @@ def place_call(
                 )
             trace.append(f"! SRTP offer skipped (no crypto: {exc})")
 
+    _default_ua = sip.DEFAULT_UA
     identity_kwargs = dict(
         pai=pai, diversion=diversion, privacy=privacy,
         remote_party_id=remote_party_id, from_display=from_display,
+        header_ip=header_ip,
+        extra_headers=extra_headers,
+        user_agent=user_agent if user_agent else _default_ua,
     )
 
     if not tcp:

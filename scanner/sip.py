@@ -257,19 +257,40 @@ def build_message(
     privacy: str | None = None,
     remote_party_id: str | None = None,
     from_display: str | None = None,
+    # IP spoofing: decouple socket-bind IP from what appears in Via/Contact
+    header_ip: str | None = None,
 ) -> bytes:
-    """Build a SIP request as UTF-8 bytes."""
+    """Build a SIP request as UTF-8 bytes.
+
+    header_ip: when set, overrides what appears in Via and Contact headers
+    while local_ip is still used for the actual socket bind.  This enables
+    header-level IP spoofing without raw-socket privileges — useful for
+    testing PBX trust policies that check Via/Contact rather than the IP
+    layer.  USE ONLY ON AUTHORISED TARGETS.
+    """
     if not (1 <= port <= 65535):
         raise ValueError(f"SIP port out of range: {port}")
 
     # CRLF guards on every caller-supplied header value
     for name, value in [
+        ("from_user", from_user),
+        ("to_user", to_user),
+        ("host", host),
+        ("local_ip", local_ip),
+        ("call_id", call_id),
+        ("from_tag", from_tag),
+        ("to_tag", to_tag or ""),
+        ("branch", branch or ""),
+        ("method", method),
+        ("request_uri", request_uri),
+        ("user_agent", user_agent),
         ("auth_header", auth_header or ""),
         ("pai", pai or ""),
         ("diversion", diversion or ""),
         ("privacy", privacy or ""),
         ("remote_party_id", remote_party_id or ""),
         ("from_display", from_display or ""),
+        ("header_ip", header_ip or ""),
     ]:
         _no_crlf(value, name)
 
@@ -290,6 +311,10 @@ def build_message(
         "TCP": "SIP/2.0/TCP",
     }.get(transport_upper, "SIP/2.0/UDP")
 
+    # IP shown in Via and Contact headers — may differ from socket bind IP
+    # when header_ip spoofing is active.
+    _hdr_ip = header_ip if header_ip else local_ip
+
     # From header — display name must have quotes + backslashes escaped
     if from_display:
         safe_display = from_display.replace("\\", "\\\\").replace('"', '\\"')
@@ -303,13 +328,13 @@ def build_message(
 
     lines = [
         f"{method} {request_uri} {SIP_VERSION}",
-        f"Via: {via_transport} {local_ip}:{local_port};branch={branch};rport",
+        f"Via: {via_transport} {_hdr_ip}:{local_port};branch={branch};rport",
         "Max-Forwards: 70",
         from_hdr,
         to_hdr,
         f"Call-ID: {call_id}",
         f"CSeq: {cseq} {method}",
-        f"Contact: <sip:{from_user}@{local_ip}:{local_port}>",
+        f"Contact: <sip:{from_user}@{_hdr_ip}:{local_port}>",
         f"User-Agent: {user_agent}",
     ]
     if pai:
