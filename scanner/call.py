@@ -426,6 +426,7 @@ DIALPLAN_PREFIXES: list[str] = [
     "9",     # North American outbound (FreePBX/Asterisk default)
     "0",     # Europe/PSTN single-zero
     "00",    # European IDD
+    "00+",   # IDD with embedded plus — some Asterisk/FreeSWITCH dialplans
     "+",     # E.164 plus notation
     "1",     # legacy/direct North American
     "011",   # North American IDD
@@ -436,12 +437,12 @@ DIALPLAN_PREFIXES: list[str] = [
 
 # Platform-tuned prefix order: lead with the most likely prefix for each platform.
 _FINGERPRINT_PREFIX_HINTS: dict[str, list[str]] = {
-    "FreePBX":     ["9", "", "0", "00", "+", "1", "011", "001", "8", "0011"],
-    "Asterisk":    ["9", "", "0", "00", "+", "1", "011", "001", "8", "0011"],
-    "3CX":         ["0", "9", "", "00", "+", "1", "011", "001"],
-    "Grandstream": ["9", "0", "", "00", "+", "1", "011"],
-    "Mitel":       ["9", "8", "0", "", "00", "+", "1", "011"],
-    "Sangoma":     ["9", "", "0", "00", "+", "1", "011", "001"],
+    "FreePBX":     ["9", "", "0", "00", "00+", "+", "1", "011", "001", "8", "0011"],
+    "Asterisk":    ["9", "", "0", "00", "00+", "+", "1", "011", "001", "8", "0011"],
+    "3CX":         ["0", "9", "", "00", "00+", "+", "1", "011", "001"],
+    "Grandstream": ["9", "0", "", "00", "00+", "+", "1", "011"],
+    "Mitel":       ["9", "8", "0", "", "00", "00+", "+", "1", "011"],
+    "Sangoma":     ["9", "", "0", "00", "00+", "+", "1", "011", "001"],
 }
 
 
