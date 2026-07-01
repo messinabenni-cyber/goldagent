@@ -500,3 +500,41 @@ def options_probe(
 def parse_allowed_methods(resp: SipResponse) -> list[str]:
     allow = resp.headers.get("allow", "")
     return [m.strip().upper() for m in allow.split(",") if m.strip()]
+
+
+def subscribe_probe(
+    host: str,
+    ext: str,
+    event: str = "presence",
+    *,
+    port: int = 5060,
+    local_ip: str | None = None,
+    local_port: int = 5062,
+    timeout: float = 3.0,
+    traffic_log=None,
+) -> "SipResponse | None":
+    """Send a SUBSCRIBE for *event* to *ext* and return the SIP response.
+
+    200 OK  → server accepted subscription (presence harvesting / eavesdrop possible).
+    404     → extension absent (useful for enumeration).
+    403     → extension exists but protected.
+    None    → no response (timeout / unreachable).
+    """
+    if not local_ip:
+        from .utils import local_ip_for
+        local_ip = local_ip_for(host)
+    msg = build_message(
+        "SUBSCRIBE", f"sip:{ext}@{host}",
+        from_user="scanner", to_user=ext,
+        host=host, port=port,
+        local_ip=local_ip, local_port=local_port,
+        call_id=rand_call_id(), cseq=1, from_tag=rand_tag(),
+        extra_headers=[
+            f"Event: {event}",
+            "Expires: 60",
+            "Accept: application/pidf+xml",
+        ],
+    )
+    data = send_and_recv(msg, host, port, local_port, timeout,
+                         traffic_log=traffic_log)
+    return parse_response(data) if data else None

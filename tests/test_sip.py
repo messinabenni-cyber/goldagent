@@ -178,3 +178,58 @@ class TestDigestAuth:
         assert "qop=auth" in h
         assert "nc=00000001" in h
         assert "cnonce=" in h
+
+
+# ---------------------------------------------------------------------------
+# subscribe_probe
+# ---------------------------------------------------------------------------
+
+class TestSubscribeProbe:
+    def _200_ok_bytes(self) -> bytes:
+        return (
+            b"SIP/2.0 200 OK\r\n"
+            b"Via: SIP/2.0/UDP 127.0.0.1:5062;branch=z9hG4bK-test\r\n"
+            b"From: <sip:scanner@pbx.test>;tag=abc\r\n"
+            b"To: <sip:1000@pbx.test>;tag=xyz\r\n"
+            b"Call-ID: test@scanner\r\n"
+            b"CSeq: 1 SUBSCRIBE\r\n"
+            b"Expires: 60\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+
+    def test_subscribe_probe_200_ok(self, monkeypatch):
+        monkeypatch.setattr(sip, "send_and_recv", lambda *a, **kw: self._200_ok_bytes())
+        resp = sip.subscribe_probe("pbx.test", "1000", local_ip="127.0.0.1")
+        assert resp is not None
+        assert resp.status_code == 200
+        assert resp.reason == "OK"
+
+    def test_subscribe_probe_timeout_returns_none(self, monkeypatch):
+        monkeypatch.setattr(sip, "send_and_recv", lambda *a, **kw: None)
+        resp = sip.subscribe_probe("pbx.test", "1000", local_ip="127.0.0.1")
+        assert resp is None
+
+    def test_subscribe_probe_404(self, monkeypatch):
+        payload = (
+            b"SIP/2.0 404 Not Found\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        monkeypatch.setattr(sip, "send_and_recv", lambda *a, **kw: payload)
+        resp = sip.subscribe_probe("pbx.test", "9999", local_ip="127.0.0.1")
+        assert resp is not None
+        assert resp.status_code == 404
+
+    def test_subscribe_probe_event_header_present(self, monkeypatch):
+        captured: list[bytes] = []
+
+        def _fake_send(datagram, host, port, local_port, timeout, **kw):
+            captured.append(datagram)
+            return None
+
+        monkeypatch.setattr(sip, "send_and_recv", _fake_send)
+        sip.subscribe_probe("pbx.test", "1001", event="dialog", local_ip="127.0.0.1")
+        assert captured
+        msg_text = captured[0].decode("utf-8", errors="replace")
+        assert "Event: dialog" in msg_text
+        assert "Expires: 60" in msg_text
+        assert "SUBSCRIBE sip:1001@pbx.test" in msg_text

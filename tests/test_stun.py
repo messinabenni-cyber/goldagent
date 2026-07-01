@@ -89,3 +89,151 @@ class TestResolvePublicIp:
             timeout=0.01, retries=1,
         )
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# TURN open-relay probe tests
+# ---------------------------------------------------------------------------
+
+def _build_turn_error_401(tid: bytes) -> bytes:
+    """Build a TURN Allocate Error Response (0x0013) with a 401 error code attr."""
+    # Error-Code attr: 4 bytes header + class(1) + number(1) = val[2]=4, val[3]=1 → 401
+    error_val = struct.pack("!HBB", 0, 4, 1)   # reserved(2), class=4, number=1
+    attr = struct.pack("!HH", 0x0009, len(error_val)) + error_val
+    pad = (4 - len(error_val) % 4) % 4
+    attr += b"\x00" * pad
+    header = struct.pack("!HHI", 0x0013, len(attr), STUN_MAGIC) + tid
+    return header + attr
+
+
+def _build_turn_alloc_success(tid: bytes) -> bytes:
+    """Build a minimal TURN Allocate Success Response (0x0103)."""
+    header = struct.pack("!HHI", 0x0103, 0, STUN_MAGIC) + tid
+    return header
+
+
+def _build_stun_binding_success(tid: bytes) -> bytes:
+    """Build a STUN Binding Success (0x0101) response."""
+    header = struct.pack("!HHI", 0x0101, 0, STUN_MAGIC) + tid
+    return header
+
+
+class TestProbeTurnOpenRelay:
+    def test_open_relay_critical(self, monkeypatch):
+        """Allocate Success (0x0103) without credentials → critical open-relay finding."""
+        import socket
+        from scanner import stun
+
+        sent_packets = []
+
+        class FakeSocket:
+            def settimeout(self, t):
+                pass
+
+            def sendto(self, data, addr):
+                tid = data[8:20]
+                sent_packets.append((data, addr))
+                self._resp = _build_turn_alloc_success(tid)
+
+            def recvfrom(self, size):
+                return self._resp, ("1.2.3.4", 3478)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: FakeSocket())
+        result = stun.probe_turn_open_relay("1.2.3.4", port=3478, timeout=1.0)
+
+        assert result["found"] is True
+        assert result["open_relay"] is True
+        assert result["severity"] == "critical"
+        assert "open relay" in result["evidence"].lower()
+
+    def test_turn_auth_required_no_finding(self, monkeypatch):
+        """Allocate Error (0x0013) with 401 → TURN exists but auth required, no open-relay."""
+        import socket
+        from scanner import stun
+
+        class FakeSocket:
+            def settimeout(self, t):
+                pass
+
+            def sendto(self, data, addr):
+                tid = data[8:20]
+                self._resp = _build_turn_error_401(tid)
+
+            def recvfrom(self, size):
+                return self._resp, ("1.2.3.4", 3478)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: FakeSocket())
+        result = stun.probe_turn_open_relay("1.2.3.4", port=3478, timeout=1.0)
+
+        assert result["found"] is True
+        assert result["open_relay"] is False
+        assert result["severity"] == "info"
+        assert "401" in result["evidence"] or "authentication required" in result["evidence"].lower()
+
+    def test_stun_amplification_medium(self, monkeypatch):
+        """Binding Success (0x0101) in response to Allocate → STUN amplification finding."""
+        import socket
+        from scanner import stun
+
+        class FakeSocket:
+            def settimeout(self, t):
+                pass
+
+            def sendto(self, data, addr):
+                tid = data[8:20]
+                self._resp = _build_stun_binding_success(tid)
+
+            def recvfrom(self, size):
+                return self._resp, ("1.2.3.4", 3478)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: FakeSocket())
+        result = stun.probe_turn_open_relay("1.2.3.4", port=3478, timeout=1.0)
+
+        assert result["found"] is True
+        assert result["stun_amp"] is True
+        assert result["open_relay"] is False
+        assert result["severity"] == "medium"
+        assert "amplification" in result["evidence"].lower() or "ddos" in result["evidence"].lower()
+
+    def test_no_response_returns_not_found(self, monkeypatch):
+        """Timeout → found=False, no severity."""
+        import socket
+        from scanner import stun
+
+        class FakeSocket:
+            def settimeout(self, t):
+                pass
+
+            def sendto(self, data, addr):
+                raise socket.timeout("simulated")
+
+            def recvfrom(self, size):
+                raise socket.timeout("simulated")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(socket, "socket", lambda *a, **kw: FakeSocket())
+        result = stun.probe_turn_open_relay("1.2.3.4", port=3478, timeout=0.01)
+
+        assert result["found"] is False
+        assert result["open_relay"] is False
+        assert result["severity"] == ""
+
+
+class TestProbeTurnIpv4MappedSsrf:
+    def test_no_credentials_returns_not_attempted(self):
+        """Without credentials, probe returns attempted=False immediately."""
+        from scanner import stun
+        result = stun.probe_turn_ipv4mapped_ssrf("1.2.3.4", credentials=None)
+        assert result["attempted"] is False
+        assert result["ssrf_confirmed"] is False

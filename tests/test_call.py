@@ -82,3 +82,61 @@ class TestDtmf:
         from scanner.dtmf import build_info_dtmf_body
         with pytest.raises(ValueError):
             build_info_dtmf_body("Z")
+
+
+class TestReferBlindTransfer:
+    def _make_response_bytes(self, status: str) -> bytes:
+        return (
+            f"SIP/2.0 {status}\r\n"
+            f"Content-Length: 0\r\n\r\n"
+        ).encode()
+
+    def test_202_accepted_is_vulnerable(self, monkeypatch):
+        from scanner.call import test_refer_blind_transfer
+        from tests.mock_pbx import MockPbx
+
+        pbx = MockPbx(responses={
+            "INVITE": ("100 Trying", ""),
+            "REFER": ("202 Accepted", ""),
+        })
+        pbx.start()
+        try:
+            result = test_refer_blind_transfer(
+                pbx.host, "1000", "+442071234567",
+                port=pbx.port, timeout=1.5,
+            )
+            assert result["is_vulnerable"] is True
+            assert result["status_code"] == 202
+            assert "202" in result["evidence"]
+            assert "IRSF" in result["evidence"] or "toll-fraud" in result["evidence"]
+        finally:
+            pbx.stop()
+
+    def test_403_forbidden_not_vulnerable(self, monkeypatch):
+        from scanner.call import test_refer_blind_transfer
+        from tests.mock_pbx import MockPbx
+
+        pbx = MockPbx(responses={
+            "INVITE": ("100 Trying", ""),
+            "REFER": ("403 Forbidden", ""),
+        })
+        pbx.start()
+        try:
+            result = test_refer_blind_transfer(
+                pbx.host, "1000", "+442071234567",
+                port=pbx.port, timeout=1.5,
+            )
+            assert result["is_vulnerable"] is False
+            assert result["status_code"] == 403
+            assert "403" in result["evidence"]
+        finally:
+            pbx.stop()
+
+    def test_timeout_returns_not_vulnerable(self):
+        from scanner.call import test_refer_blind_transfer
+        result = test_refer_blind_transfer(
+            "127.0.0.1", "1000", "+442071234567",
+            port=19999, timeout=0.2,
+        )
+        assert result["is_vulnerable"] is False
+        assert result["status_code"] is None

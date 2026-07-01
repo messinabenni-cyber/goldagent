@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from . import sip
+from . import stun as _stun_mod
 from .utils import RateLimiter, local_ip_for
 
 
@@ -41,6 +42,7 @@ DEFAULT_PORTS: list[tuple[str, int, str]] = [
     ("tcp", 8089,  "Asterisk-HTTPS-WSS"), # FIX 4: Asterisk HTTPS/WSS
     ("tcp", 8443,  "PBX-HTTPS-alt"),
     ("tcp", 10000, "Asterisk-RTP-check"),
+    ("udp", 3478,  "STUN-TURN"),
 ]
 
 
@@ -53,6 +55,7 @@ class HostResult:
     version: str = ""
     rdns: str = ""
     ssl_cn: str = ""
+    turn_findings: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +445,17 @@ def probe_host(host: str, timeout: float = 2.0,
                 ports_to_probe.append(("udp", p, f"SIP-alt-{p}"))
 
     for proto, port, service in ports_to_probe:
+        if proto == "udp" and port == 3478:
+            turn_result = _stun_mod.probe_turn_open_relay(host, port=port, timeout=timeout)
+            if turn_result.get("found"):
+                result.open_ports.append({
+                    "port": port, "proto": "udp", "service": service,
+                    "banner": turn_result.get("evidence", "")[:200],
+                })
+                if turn_result.get("severity") and turn_result["severity"] != "info":
+                    result.turn_findings.append(turn_result)
+            continue
+
         if proto == "udp":
             # Use SIP OPTIONS as the "is it alive on UDP/5060" probe.
             # FIX 1: if resp is truthy the SIP module already parsed a valid

