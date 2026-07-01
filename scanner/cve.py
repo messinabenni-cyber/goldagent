@@ -1837,13 +1837,16 @@ def check_all(
             results.append(r)
 
     # Check 13: Unencrypted SIP signaling (no TLS on 5061)
-    r_tls = check_sip_tls_missing(host, sip_port, tcp_ports, timeout)
-    if r_tls:
-        results.append(r_tls)
+    # Only meaningful when SIP is actually responding — skip if no banner detected.
+    if sip_server or sip_port in tcp_ports:
+        r_tls = check_sip_tls_missing(host, sip_port, tcp_ports, timeout)
+        if r_tls:
+            results.append(r_tls)
 
-    # Check 14: SIP-over-WebSocket security
-    wss_results = check_sip_wss_security(host, tcp_ports, timeout)
-    results.extend(wss_results)
+    # Check 14: SIP-over-WebSocket security (only if WS ports are open or SIP detected)
+    if sip_server or any(p in tcp_ports for p in (8088, 8089, 5066)):
+        wss_results = check_sip_wss_security(host, tcp_ports, timeout)
+        results.extend(wss_results)
 
     # Deduplicate by (cve_id, host, port)
     seen: set[tuple[str, str, int]] = set()
