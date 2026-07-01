@@ -40,6 +40,7 @@ class CveResult:
     references: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # structured evidence (capture data, etc.)
     confirmed: bool = True        # True = live exploit/response verified; False = config/version-based
+    confidence: str = "confirmed" # "confirmed" = live probe verified; "version_based" = version check only (possible FP if patched)
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +192,16 @@ _FPBX_VER_RE = re.compile(
     re.I,
 )
 _AST_VER_RE = re.compile(r"Asterisk[\s/]+(?:PBX\s+)?([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)", re.I)
+# Matches the Asterisk version embedded in an FPBX banner: "FPBX-15.0.17.34(17.9.3)"
+_FPBX_AST_PAREN_RE = re.compile(
+    r"FPBX[- ][\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?\(([\d]+\.[\d]+\.[\d]+(?:\.[\d]+)?)\)",
+    re.I,
+)
+# Matches Grandstream firmware: "Grandstream UCM6XXX 1.0.20.x" or "UCM62xx 1.0.20.5"
+_GS_VER_RE = re.compile(
+    r"(?:Grandstream\s+)?UCM\w*\s+([\d]+\.[\d]+\.[\d]+(?:\.[\w]+)?)",
+    re.I,
+)
 
 
 def _extract_fpbx_version(text: str) -> str:
@@ -201,17 +212,58 @@ def _extract_fpbx_version(text: str) -> str:
 
 
 def _extract_asterisk_version(text: str) -> str:
+    # First try normal "Asterisk PBX x.y.z" form
     m = _AST_VER_RE.search(text)
+    if m:
+        return m.group(1)
+    # Fall back: extract from "FPBX-15.0.17.34(17.9.3)" parenthetical
+    m2 = _FPBX_AST_PAREN_RE.search(text)
+    if m2:
+        return m2.group(1)
+    return ""
+
+
+def _extract_grandstream_version(text: str) -> str:
+    """Extract firmware version from Grandstream UCM banner strings.
+
+    Examples:
+      "Grandstream UCM6XXX 1.0.20.x" → "1.0.20.x"
+      "UCM62xx 1.0.20.5"             → "1.0.20.5"
+    """
+    m = _GS_VER_RE.search(text)
     if m:
         return m.group(1)
     return ""
 
 
+def _parse_version(s: str) -> tuple[int, ...]:
+    """Parse a version string into a numeric tuple, stripping any non-numeric suffix.
+
+    Examples:
+      "15.0.17.34"    → (15, 0, 17, 34)
+      "16.0.19.9-rc1" → (16, 0, 19, 9)
+      "Asterisk/20.3" → (20, 3)
+      ""              → (0,)
+      None            → (0,)
+    """
+    nums = re.findall(r"\d+", str(s or ""))
+    return tuple(int(n) for n in nums[:6]) if nums else (0,)
+
+
 def _version_lt(ver: str, threshold: str) -> bool:
-    """Return True if ver < threshold using numeric tuple comparison."""
+    """Return True if ver < threshold using numeric tuple comparison.
+
+    Handles 4+ component versions (e.g. "15.0.17.34") and letter suffixes
+    (e.g. "16.0.19.9-rc1") by delegating to _parse_version.
+    Returns False for empty/None/malformed strings (safe default).
+    """
+    if not ver or not threshold:
+        return False
     try:
-        v = tuple(int(x) for x in ver.split("."))
-        t = tuple(int(x) for x in threshold.split("."))
+        v = _parse_version(ver)
+        t = _parse_version(threshold)
+        if v == (0,) and not re.search(r"\d", str(ver)):
+            return False
         # Pad to equal length
         length = max(len(v), len(t))
         v = v + (0,) * (length - len(v))
@@ -518,7 +570,9 @@ def check_freepbx_module_exposure(
                         "(Options -Indexes in Apache). "
                         "Restrict /admin to localhost or VPN."
                     ),
-                    references=[],
+                    references=[
+                        "https://www.freepbx.org/freepbx-security-vulnerability-advisory-fpbx-sa-2019-001/",
+                    ],
                 )
             )
 
@@ -889,7 +943,10 @@ def check_freepbx_recordings_exposure(
                     "Move recording storage outside the web root. "
                     "Audit for sensitive voicemail recordings that may have been accessed."
                 ),
-                references=[],
+                references=[
+                    "https://www.freepbx.org/freepbx-security-vulnerability-advisory-fpbx-sa-2019-001/",
+                    "https://owasp.org/www-project-web-security-testing-guide/latest/4-Web_Application_Security_Testing/02-Configuration_and_Deployment_Management_Testing/04-Review_Old_Backup_and_Unreferenced_Files_for_Sensitive_Information",
+                ],
             )
         )
 

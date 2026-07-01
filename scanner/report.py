@@ -7,6 +7,7 @@ prints to a PDF that an auditor can attach to their workpaper.
 """
 from __future__ import annotations
 
+import csv
 import html as _html
 import json
 import time
@@ -35,9 +36,138 @@ SEVERITY_COLOUR = {
     "info":     "#2874a6",
 }
 
+# Severity order used for sorting (lower = higher priority).
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+_CONF_ORDER = {"confirmed": 0, "high": 1, "medium": 2, "low": 3}
+
+
+# ---------------------------------------------------------------------------
+# Confidence scoring (item 2)
+# ---------------------------------------------------------------------------
+
+def _confidence_for_finding(finding: dict) -> str:
+    """Return a confidence label based on the evidence text of a finding."""
+    evidence = (
+        finding.get("detail", "") + " " + finding.get("evidence", "")
+    ).lower()
+
+    if any(kw in evidence for kw in ("succeeded", "200 ok", "authenticated", "cracked")):
+        return "confirmed"
+    if any(kw in evidence for kw in ("reachable", "banner", "verified")):
+        return "high"
+    if any(kw in evidence for kw in ("below", "version")):
+        return "medium"
+    return "low"
+
+
+# ---------------------------------------------------------------------------
+# Business impact (item 3)
+# ---------------------------------------------------------------------------
+
+def _business_impact(finding: dict) -> str:
+    """Return a concise business risk string specific to VoIP/PBX findings."""
+    cve_id = finding.get("cve_id", "").upper()
+    title  = finding.get("title", "").lower()
+    detail = finding.get("detail", "").lower()
+
+    # AMI default credentials
+    if "ami" in title and any(
+        kw in title for kw in ("default cred", "authenticated with default")
+    ):
+        return (
+            "Attacker gains full PBX admin access; can originate toll-fraud "
+            "calls, dump all extensions and voicemail, and persist a backdoor"
+        )
+
+    # Anonymous dial-out / toll-fraud
+    if "anonymous" in title and any(
+        kw in title for kw in ("outbound", "dial", "invite", "toll-fraud")
+    ):
+        return (
+            "Attacker can place unlimited international calls at the "
+            "organisation's expense with no authentication required"
+        )
+    if "toll-fraud" in title or "outbound call placed" in title:
+        return (
+            "Attacker can place unlimited international calls at the "
+            "organisation's expense with no authentication required"
+        )
+
+    # SIP enumeration
+    if any(kw in title for kw in ("sip service reachable", "extension", "enumerat")):
+        return (
+            "Extension list exposed — enables targeted brute-force and "
+            "social engineering attacks"
+        )
+
+    # Cleartext SIP / media downgrade
+    if any(kw in title for kw in ("cleartext", "srtp", "unencrypted", "downgrad")):
+        return (
+            "All SIP credentials, call metadata, and SRTP keys are visible "
+            "to any passive network observer"
+        )
+
+    # CVE version-based — derive from CVE description where possible
+    if cve_id and ("below" in detail or "version" in detail or "affected" in detail):
+        return (
+            f"{cve_id} affects a specific software version installed on this "
+            "host; a remote attacker may exploit this vulnerability without "
+            "authentication to achieve code execution or denial of service"
+        )
+
+    return (
+        "Security misconfiguration increases attack surface and risk of "
+        "service disruption"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deduplication (item 5)
+# ---------------------------------------------------------------------------
+
+def _deduplicate(findings: list[dict]) -> list[dict]:
+    """Deduplicate by (cve_id, host, port), keeping richest evidence."""
+    seen: dict[tuple, dict] = {}
+    for f in findings:
+        key = (
+            f.get("cve_id", ""),
+            f.get("host", ""),
+            str(f.get("port", "")),
+        )
+        if key == ("", f.get("host", ""), ""):
+            # No cve_id / port — use title as discriminator to avoid over-merging
+            key = (f.get("title", ""), f.get("host", ""), "")
+        if key not in seen:
+            seen[key] = f
+        else:
+            # Keep the one with longer evidence (richer detail)
+            existing = seen[key]
+            if len(str(f.get("detail", ""))) > len(str(existing.get("detail", ""))):
+                seen[key] = f
+    return list(seen.values())
+
+
+# ---------------------------------------------------------------------------
+# Sorting (item 6)
+# ---------------------------------------------------------------------------
+
+def _sort_findings(findings: list[dict]) -> list[dict]:
+    """Sort critical → high → medium → low → info; confirmed confidence first."""
+    return sorted(
+        findings,
+        key=lambda f: (
+            _SEV_ORDER.get(f.get("severity", "info"), 99),
+            _CONF_ORDER.get(f.get("confidence", "low"), 99),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Build findings (combines all enrichment)
+# ---------------------------------------------------------------------------
 
 def build_findings(report: dict) -> list[dict]:
-    """Walk the report dict and produce a flat list of findings."""
+    """Walk the report dict and produce a flat, enriched, deduplicated list of findings."""
     findings: list[dict] = []
 
     for host in report.get("hosts", []):
@@ -77,6 +207,7 @@ def build_findings(report: dict) -> list[dict]:
             if port.get("service") == "Asterisk-AMI":
                 findings.append({
                     "severity": "high", "host": ip,
+                    "port": port["port"],
                     "title": "Asterisk Manager Interface (AMI) exposed",
                     "detail": (
                         f"TCP/{port['port']} responded. AMI grants full "
@@ -247,12 +378,19 @@ def build_findings(report: dict) -> list[dict]:
                 detail = f"[{ver}] {detail}"
             findings.append({
                 "severity": f["severity"], "host": ip,
+                "cve_id": cve_id,
                 "title": title,
                 "detail": detail,
                 "remediation": f["remediation"],
             })
 
-    findings.sort(key=lambda x: severity_rank(x.get("severity", "info")))
+    # Enrich each finding with confidence and business_impact before dedup/sort
+    for f in findings:
+        f.setdefault("confidence", _confidence_for_finding(f))
+        f.setdefault("business_impact", _business_impact(f))
+
+    findings = _deduplicate(findings)
+    findings = _sort_findings(findings)
     return findings
 
 
@@ -357,6 +495,102 @@ def _auto_executive_summary(report: dict, findings: list[dict]) -> str:
     return " ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Executive summary block (item 4)
+# ---------------------------------------------------------------------------
+
+def _render_exec_summary_block(findings: list[dict], counts: dict) -> str:
+    """Render a professional executive summary HTML block for the top of the report."""
+    # Determine overall risk level from highest severity present
+    if counts.get("critical", 0) > 0:
+        risk_label = "CRITICAL"
+        risk_colour = SEVERITY_COLOUR["critical"]
+        risk_sentence = (
+            "This assessment has identified <strong>critical severity vulnerabilities</strong> "
+            "that represent an immediate risk to the organisation — exploitation is possible "
+            "without authentication and could result in direct financial loss through toll fraud, "
+            "full PBX compromise, or service disruption."
+        )
+    elif counts.get("high", 0) > 0:
+        risk_label = "HIGH"
+        risk_colour = SEVERITY_COLOUR["high"]
+        risk_sentence = (
+            "This assessment has identified <strong>high severity vulnerabilities</strong> "
+            "that significantly increase the probability of a successful attack on the "
+            "VoIP infrastructure and require prompt remediation."
+        )
+    elif counts.get("medium", 0) > 0:
+        risk_label = "MEDIUM"
+        risk_colour = SEVERITY_COLOUR["medium"]
+        risk_sentence = (
+            "The overall risk posture is <strong>medium</strong>. No immediately exploitable "
+            "vulnerabilities were confirmed, but configuration weaknesses were identified "
+            "that could be leveraged in a chained attack."
+        )
+    else:
+        risk_label = "LOW / INFORMATIONAL"
+        risk_colour = SEVERITY_COLOUR["info"]
+        risk_sentence = (
+            "No critical or high severity findings were confirmed during this assessment. "
+            "The overall risk posture is <strong>low</strong>; only informational observations "
+            "are recorded."
+        )
+
+    # Top 3 critical/high findings
+    top_findings = [
+        f for f in findings
+        if f.get("severity") in ("critical", "high")
+    ][:3]
+
+    top_bullets = ""
+    for f in top_findings:
+        sev = f.get("severity", "info")
+        col = SEVERITY_COLOUR.get(sev, "#666")
+        top_bullets += (
+            f'<li>'
+            f'<span style="background:{col};color:#fff;padding:2px 7px;'
+            f'border-radius:3px;font-size:11px;font-weight:700;margin-right:6px">'
+            f'{sev.upper()}</span>'
+            f'<b>{_esc(f.get("title", ""))}</b> '
+            f'<span style="color:#666;font-size:13px">({_esc(f.get("host",""))})</span>'
+            f'</li>'
+        )
+    if not top_bullets:
+        top_bullets = "<li>No critical or high severity findings identified.</li>"
+
+    # Top 3 remediations
+    rem_bullets = ""
+    seen_rems: set[str] = set()
+    for f in findings:
+        rem = f.get("remediation", "").strip()
+        if rem and rem not in seen_rems and f.get("severity") in ("critical", "high"):
+            seen_rems.add(rem)
+            rem_bullets += f"<li>{_esc(rem)}</li>"
+        if len(seen_rems) >= 3:
+            break
+    if not rem_bullets:
+        rem_bullets = "<li>Review and harden VoIP configuration per vendor guidelines.</li>"
+
+    return f"""
+<div style="border-left:6px solid {risk_colour};background:#fafafa;padding:20px 24px;
+            border-radius:0 8px 8px 0;margin:20px 0">
+  <h2 style="margin-top:0;color:{risk_colour}">&#9632; Executive Summary
+    <span style="font-size:14px;font-weight:400;color:#555;margin-left:10px">
+      Overall risk: <strong style="color:{risk_colour}">{_esc(risk_label)}</strong>
+    </span>
+  </h2>
+  <p style="margin:8px 0 16px">{risk_sentence}</p>
+  <p style="font-weight:600;margin:0 0 6px">Top findings:</p>
+  <ul style="margin:0 0 16px;padding-left:20px;line-height:2">{top_bullets}</ul>
+  <p style="font-weight:600;margin:0 0 6px">Recommended immediate actions:</p>
+  <ol style="margin:0;padding-left:20px;line-height:1.8">{rem_bullets}</ol>
+</div>"""
+
+
+# ---------------------------------------------------------------------------
+# HTML render
+# ---------------------------------------------------------------------------
+
 def render_html(report: dict) -> str:
     """Render the full HTML report. Self-contained — no external assets."""
     findings = build_findings(report)
@@ -370,6 +604,35 @@ def render_html(report: dict) -> str:
     scope_file = _esc(report.get("scope_file", ""))
     scope_sha = _esc(report.get("scope_sha256", ""))
 
+    # --- Professional report header (item 7) ---
+    finding_badges = ""
+    for sev in ("critical", "high", "medium", "low", "info"):
+        c = counts.get(sev, 0)
+        col = SEVERITY_COLOUR[sev]
+        finding_badges += (
+            f'<span style="background:{col};color:#fff;padding:4px 10px;'
+            f'border-radius:12px;font-size:12px;font-weight:700;margin-right:6px">'
+            f'{c} {sev.upper()}</span>'
+        )
+
+    report_header_html = f"""
+<div class="report-header" style="background:#1a1a2e;color:white;padding:20px;border-radius:8px;margin-bottom:20px">
+  <div style="display:flex;align-items:flex-start;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <div>
+      <div style="font-size:22px;font-weight:700;letter-spacing:1px">VoIPScan Enterprise</div>
+      <div style="font-size:13px;opacity:0.65;margin-top:2px">VoIP Penetration Test Report</div>
+    </div>
+    <div style="text-align:right;font-size:13px;opacity:0.8">
+      <div><b>Target:</b> <code style="background:rgba(255,255,255,0.1);padding:2px 6px;border-radius:4px">{target}</code></div>
+      <div style="margin-top:4px"><b>Operator:</b> {operator}</div>
+      <div style="margin-top:4px"><b>Scan date:</b> {timestamp}</div>
+    </div>
+  </div>
+  <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,0.15);padding-top:14px">
+    {finding_badges}
+  </div>
+</div>"""
+
     # KPI cards
     kpi_html = ""
     for sev in ("critical", "high", "medium", "low", "info"):
@@ -381,18 +644,30 @@ def render_html(report: dict) -> str:
             f'<div class="l">{sev.upper()}</div></div>'
         )
 
-    # Findings table
+    # Findings table — severity badge spans (item 8)
     rows_html = ""
     for f in findings:
         sev = f.get("severity", "info")
+        conf = f.get("confidence", "low")
         col = SEVERITY_COLOUR.get(sev, "#666")
+        conf_col = {
+            "confirmed": "#155724", "high": "#004085",
+            "medium": "#856404", "low": "#6c757d",
+        }.get(conf, "#6c757d")
         rows_html += (
             f'<tr>'
-            f'<td style="background:{col};color:#fff;font-weight:700">'
-            f'{sev.upper()}</td>'
+            f'<td style="vertical-align:middle">'
+            f'<span style="background:{col};color:#fff;padding:4px 8px;'
+            f'border-radius:4px;font-weight:700;font-size:12px;display:inline-block;'
+            f'min-width:64px;text-align:center">{sev.upper()}</span>'
+            f'<br><span style="font-size:11px;color:{conf_col};margin-top:4px;'
+            f'display:inline-block">{conf}</span>'
+            f'</td>'
             f'<td>{_esc(f.get("host", ""))}</td>'
             f'<td><b>{_esc(f.get("title", ""))}</b>'
             f'<br><span class="detail">{_esc(f.get("detail", ""))}</span>'
+            f'<br><span class="rem"><b>Business impact:</b> '
+            f'{_esc(f.get("business_impact", ""))}</span>'
             f'<br><span class="rem"><b>Remediation:</b> '
             f'{_esc(f.get("remediation", ""))}</span></td>'
             f'</tr>'
@@ -429,6 +704,9 @@ def render_html(report: dict) -> str:
 """
 
     exec_summary = _auto_executive_summary(report, findings)
+
+    # Executive summary block (item 4)
+    exec_summary_block = _render_exec_summary_block(findings, counts)
 
     # Attack chain section
     attack_chain: list[str] = []
@@ -478,19 +756,15 @@ th{{background:#0b1a33;color:#fff;font-weight:600;font-size:13px}}
 </style>
 </head><body>
 
-<h1>VoIP Penetration Test Report</h1>
-<div class="meta">
-  <b>Target:</b> <code>{target}</code> &nbsp;·&nbsp;
-  <b>Operator:</b> {operator} &nbsp;·&nbsp;
-  <b>Generated:</b> {timestamp}
-</div>
+{report_header_html}
 
 {f'<div class="banner"><b>Scope of work:</b> {scope_file}<br><b>SHA-256:</b> <code>{scope_sha}</code></div>' if scope_file else ''}
 
-<h2>Executive Summary</h2>
-<div class="kpi-grid">{kpi_html}</div>
+{exec_summary_block}
 
 <p>{exec_summary}</p>
+
+<div class="kpi-grid">{kpi_html}</div>
 
 <h2>Findings</h2>
 <table>
@@ -510,6 +784,50 @@ Generated by VoIPScan v3.0 · {timestamp}
 
 </body></html>"""
 
+
+# ---------------------------------------------------------------------------
+# CSV export (item 1)
+# ---------------------------------------------------------------------------
+
+def write_csv(report_dir: str, report_data: dict) -> str:
+    """Write findings.csv with key columns for spreadsheet analysis.
+
+    Columns: severity, confidence, cve_id, host, port, title,
+             business_impact, evidence_snippet, remediation
+    """
+    findings = report_data.get("findings") or build_findings(report_data)
+    out = Path(report_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    csv_path = out / "findings.csv"
+    fieldnames = [
+        "severity", "confidence", "cve_id", "host", "port",
+        "title", "business_impact", "evidence_snippet", "remediation",
+    ]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for f in findings:
+            detail = str(f.get("detail", ""))
+            writer.writerow({
+                "severity":        f.get("severity", ""),
+                "confidence":      f.get("confidence", ""),
+                "cve_id":          f.get("cve_id", ""),
+                "host":            f.get("host", ""),
+                "port":            f.get("port", ""),
+                "title":           f.get("title", ""),
+                "business_impact": f.get("business_impact", ""),
+                "evidence_snippet": detail[:200],
+                "remediation":     f.get("remediation", ""),
+            })
+
+    return str(csv_path)
+
+
+# ---------------------------------------------------------------------------
+# Risk score + toll-fraud estimate
+# ---------------------------------------------------------------------------
 
 def risk_score(findings: list[dict]) -> int:
     """Compute a 0-100 risk score from findings.
@@ -733,14 +1051,16 @@ def write_findings(report_dir: str, findings: list[dict]) -> str:
 
 
 def write_all(report_dir: str, report: dict) -> dict[str, str]:
-    """Write report.html, report.json, findings.json, and sales_brief.html.
+    """Write report.html, report.json, findings.json, findings.csv, and sales_brief.html.
 
     findings.json contains only actionable (critical/high/medium) findings —
     the default machine-readable export. report.json is the full raw snapshot.
+    findings.csv is a spreadsheet-friendly export of all findings.
     sales_brief.html is a one-page client-facing summary.
 
     Returns a dict of:
-        {"html": path, "json": path, "findings": path, "sales_brief": path}
+        {"html": path, "json": path, "findings": path,
+         "csv": path, "sales_brief": path}
 
     Also attaches risk_score and toll_fraud_estimate to the report dict.
     """
@@ -763,6 +1083,9 @@ def write_all(report_dir: str, report: dict) -> dict[str, str]:
 
     findings_path = write_findings(report_dir, findings)
 
+    # CSV export (item 1)
+    csv_path = write_csv(report_dir, report)
+
     # Sales brief — rendered after risk_score and toll_fraud_estimate are attached
     sales_brief_path = out / "sales_brief.html"
     sales_brief_text = render_sales_brief(report)
@@ -772,5 +1095,6 @@ def write_all(report_dir: str, report: dict) -> dict[str, str]:
         "html": str(html_path),
         "json": str(json_path),
         "findings": findings_path,
+        "csv": csv_path,
         "sales_brief": str(sales_brief_path),
     }

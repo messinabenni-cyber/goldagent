@@ -7,6 +7,7 @@ until convergence.
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,8 +16,10 @@ from dataclasses import dataclass
 from . import sip
 from .utils import RateLimiter, local_ip_for, rand_call_id, rand_tag
 
+log = logging.getLogger(__name__)
 
 _MAX_RANGE = 10_000   # cap any single range expansion to prevent runaway sweeps
+_MAX_RESULTS = 5_000  # cap accumulated hits to prevent unbounded memory use
 
 # Adaptive rate limiter — starts fast, backs off when 429/503 detected.
 # Shared across threads; .wait() is GIL-safe for a single float mutation.
@@ -353,9 +356,16 @@ def sweep(
     tcp: bool = False,
     use_tls: bool = False,
     retries: int = 1,
+    max_results: int = _MAX_RESULTS,
 ) -> list[ExtensionResult]:
-    """Parallel sweep over a list of extension candidates. Returns only hits."""
+    """Parallel sweep over a list of extension candidates. Returns only hits.
+
+    Caps accumulated results at *max_results* (default 5 000) to bound memory
+    use when scanning very large extension spaces.  A warning is emitted if the
+    cap is reached.  Partial results are returned on KeyboardInterrupt.
+    """
     hits: list[ExtensionResult] = []
+    _capped = False
 
     def _probe(ext: str) -> ExtensionResult:
         return probe(host, ext, port=port, method=method,
@@ -363,23 +373,38 @@ def sweep(
                      source_ip=source_ip, tcp=tcp, use_tls=use_tls,
                      retries=retries)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_probe, e): e for e in extensions}
-        for fut in as_completed(futures):
-            try:
-                r = fut.result()
-                hit = r.exists
-                if hit:
-                    hits.append(r)
-                if progress_cb:
-                    progress_cb(hit)
-            except Exception as _exc:
-                if progress_cb:
-                    progress_cb(False)
-                # Log unexpected errors so they're visible in traffic log
-                if traffic_log:
-                    traffic_log.log("ERR", f"{host}:probe", str(_exc).encode())
-                continue
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_probe, e): e for e in extensions}
+            for fut in as_completed(futures):
+                try:
+                    r = fut.result()
+                    hit = r.exists
+                    if hit:
+                        if len(hits) >= max_results:
+                            if not _capped:
+                                _capped = True
+                                log.warning(
+                                    "sweep: max_results cap of %d reached — "
+                                    "truncating remaining hits", max_results
+                                )
+                        else:
+                            hits.append(r)
+                    if progress_cb:
+                        progress_cb(hit)
+                except Exception as _exc:
+                    if progress_cb:
+                        progress_cb(False)
+                    # Log unexpected errors so they're visible in traffic log
+                    if traffic_log:
+                        traffic_log.log("ERR", f"{host}:probe", str(_exc).encode())
+                    continue
+    except KeyboardInterrupt:
+        log.warning(
+            "sweep: interrupted — returning %d partial result(s) found so far",
+            len(hits),
+        )
+
     return sorted(hits, key=lambda r: (len(r.extension), r.extension))
 
 
@@ -398,6 +423,8 @@ def adaptive_sweep(
     source_ip: str = "",
     tcp: bool = False,
     use_tls: bool = False,
+    force_full_enum: bool = False,
+    max_results: int = _MAX_RESULTS,
 ) -> list[ExtensionResult]:
     """Multi-pass adaptive sweep: coarse scan + iterative frontier expansion.
 
@@ -411,46 +438,79 @@ def adaptive_sweep(
 
     Zero-padded extensions (e.g. 001, 0100) are not covered here — include them
     in SPECIAL_EXTENSIONS sweeps before calling this function.
+
+    If high-low > _MAX_RANGE a warning is logged and the range is capped at
+    low+_MAX_RANGE unless *force_full_enum* is True.
+
+    Partial results are returned on KeyboardInterrupt.
     """
-    coarse_cands = [str(n) for n in range(low, high + 1, coarse_step)]
-    coarse_hits = sweep(host, coarse_cands, port=port,
-                        timeout=timeout, max_workers=max_workers,
-                        traffic_log=traffic_log, progress_cb=progress_cb,
-                        source_ip=source_ip, tcp=tcp, use_tls=use_tls)
-    by_ext: dict[str, ExtensionResult] = {r.extension: r for r in coarse_hits}
+    span = high - low
+    if span > _MAX_RANGE:
+        if force_full_enum:
+            log.warning(
+                "adaptive_sweep: range %d-%d spans %d extensions (> %d cap); "
+                "proceeding because force_full_enum=True",
+                low, high, span, _MAX_RANGE,
+            )
+        else:
+            capped_high = low + _MAX_RANGE
+            log.warning(
+                "adaptive_sweep: range %d-%d spans %d extensions (> %d cap); "
+                "capping at %d. Pass force_full_enum=True to override.",
+                low, high, span, _MAX_RANGE, capped_high,
+            )
+            high = capped_high
 
-    # Iterative fill: frontier = newly found extensions this round
-    frontier: set[str] = {r.extension for r in coarse_hits}
+    by_ext: dict[str, ExtensionResult] = {}
 
-    for _pass in range(max_fill_passes):
-        if not frontier:
-            break
+    try:
+        coarse_cands = [str(n) for n in range(low, high + 1, coarse_step)]
+        coarse_hits = sweep(host, coarse_cands, port=port,
+                            timeout=timeout, max_workers=max_workers,
+                            traffic_log=traffic_log, progress_cb=progress_cb,
+                            source_ip=source_ip, tcp=tcp, use_tls=use_tls,
+                            max_results=max_results)
+        by_ext = {r.extension: r for r in coarse_hits}
 
-        fill: set[int] = set()
-        for ext_str in frontier:
-            try:
-                n = int(ext_str)
-            except ValueError:
-                continue
-            for delta in range(-fill_radius, fill_radius + 1):
-                nb = n + delta
-                if low <= nb <= high and str(nb) not in by_ext:
-                    fill.add(nb)
+        # Iterative fill: frontier = newly found extensions this round
+        frontier: set[str] = {r.extension for r in coarse_hits}
 
-        if not fill:
-            break
+        for _pass in range(max_fill_passes):
+            if not frontier:
+                break
 
-        fill_cands = [str(n) for n in sorted(fill)]
-        new_frontier: set[str] = set()
-        for r in sweep(host, fill_cands, port=port, timeout=timeout,
-                       max_workers=max_workers, traffic_log=traffic_log,
-                       progress_cb=progress_cb,
-                       source_ip=source_ip, tcp=tcp, use_tls=use_tls):
-            if r.extension not in by_ext:
-                by_ext[r.extension] = r
-                new_frontier.add(r.extension)
+            fill: set[int] = set()
+            for ext_str in frontier:
+                try:
+                    n = int(ext_str)
+                except ValueError:
+                    continue
+                for delta in range(-fill_radius, fill_radius + 1):
+                    nb = n + delta
+                    if low <= nb <= high and str(nb) not in by_ext:
+                        fill.add(nb)
 
-        frontier = new_frontier   # only expand around brand-new hits next pass
+            if not fill:
+                break
+
+            fill_cands = [str(n) for n in sorted(fill)]
+            new_frontier: set[str] = set()
+            for r in sweep(host, fill_cands, port=port, timeout=timeout,
+                           max_workers=max_workers, traffic_log=traffic_log,
+                           progress_cb=progress_cb,
+                           source_ip=source_ip, tcp=tcp, use_tls=use_tls,
+                           max_results=max(0, max_results - len(by_ext))):
+                if r.extension not in by_ext:
+                    by_ext[r.extension] = r
+                    new_frontier.add(r.extension)
+
+            frontier = new_frontier   # only expand around brand-new hits next pass
+
+    except KeyboardInterrupt:
+        log.warning(
+            "adaptive_sweep: interrupted — returning %d partial result(s) found so far",
+            len(by_ext),
+        )
 
     return sorted(by_ext.values(),
                   key=lambda r: (len(r.extension), r.extension))
