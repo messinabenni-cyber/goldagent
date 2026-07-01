@@ -1446,10 +1446,9 @@ def main() -> int:
             return 2
         _info("AUTO mode — hyper-intelligent scan, all checks enabled", col)
 
-    # --full expands into constituent checks
+    # --full expands into constituent checks (spray is opt-in: too slow for default recon)
     if args.full:
         args.enum = True
-        args.spray = True
         args.ami_attack = True
         # Auto-enable STUN and prefix discovery in full mode
         if not args.stun:
@@ -1511,84 +1510,137 @@ def main() -> int:
         except ValueError:
             return False
 
+    # ---- STUN + NAT: run concurrently to save 2-4 s startup time ----
+    # STUN (public IP resolution) and NAT type detection both make outbound UDP
+    # queries and are independent — parallelise with two threads.
+    import concurrent.futures as _cf_net
+    import threading as _thr_net
+
     _stun_public_ip: str | None = None
-    if args.stun:
-        from scanner.stun import resolve_public_ip
-        stun_arg = None if args.stun.lower() == "auto" else args.stun
-        _info("Resolving public IP via STUN...", col)
-        _stun_raw = resolve_public_ip(stun_server=stun_arg, timeout=max(args.timeout, 2.0))
-        if _stun_raw and _is_globally_routable(_stun_raw):
-            _stun_public_ip = _stun_raw
-            _ok(f"Public IP (reflexive): {col.BOLD}{_stun_public_ip}{col.RESET} — patched into SIP Via/Contact", col)
-            # Only upgrade auto-detected or private source IPs.
-            # Respect an explicit --source-ip the user supplied (they know their topology).
-            if not _source_ip_user_explicit or not _is_globally_routable(args.source_ip or ""):
-                args.source_ip = _stun_public_ip
-            else:
-                _info(f"STUN resolved {_stun_public_ip} but --source-ip {args.source_ip} "
-                      f"is already a public IP — keeping user value", col)
-        elif _stun_raw:
-            _warn(f"STUN returned {_stun_raw} (non-public / CGNAT address) — "
-                  f"SIP headers will use local IP; responses may not reach us behind this NAT", col)
-        else:
-            _warn("STUN lookup failed — continuing with local IP (may fail behind NAT)", col)
-
-    # ---- NAT auto-traversal: type detection + UPnP port mapping ----
     _nat_ctx = None
-    if not getattr(args, "no_upnp", False):
-        try:
-            from scanner import nat as _nat_mod
-            _sip_ports = [5062, 5063]
-            if source_port_range:
-                lo, hi = source_port_range
-                _sip_ports = list(range(lo, min(lo + 4, hi + 1)))
-            _info("NAT traversal: detecting topology + attempting UPnP port mapping...", col)
-            _nat_ctx = _nat_mod.setup(
-                ports_to_map=_sip_ports,
-                local_ip=args.source_ip or "",
-                public_ip=_stun_public_ip or "",
-                stun_server=(None if not args.stun or args.stun.lower() == "auto"
-                             else args.stun),
-                enable_upnp=True,
-                timeout=min(args.timeout, 3.0),
+
+    _stun_arg = (None if not args.stun or args.stun.lower() == "auto" else args.stun)
+    _nat_ports: list[int] = [5062, 5063]
+    if source_port_range:
+        lo, hi = source_port_range
+        _nat_ports = list(range(lo, min(lo + 4, hi + 1)))
+
+    def _run_stun_task() -> str | None:
+        if not args.stun:
+            return None
+        from scanner.stun import resolve_public_ip
+        return resolve_public_ip(stun_server=_stun_arg, timeout=max(args.timeout, 2.0))
+
+    def _run_nat_task():
+        if getattr(args, "no_upnp", False):
+            return None
+        from scanner import nat as _nat_mod
+        return _nat_mod.setup(
+            ports_to_map=_nat_ports,
+            local_ip=args.source_ip or "",
+            public_ip="",  # merged below after both tasks complete
+            stun_server=_stun_arg,
+            enable_upnp=True,
+            timeout=min(args.timeout, 3.0),
+        )
+
+    _info("NAT: resolving public IP + detecting topology in parallel...", col)
+    with _cf_net.ThreadPoolExecutor(max_workers=2) as _pool:
+        _stun_fut = _pool.submit(_run_stun_task)
+        _nat_fut = _pool.submit(_run_nat_task)
+        _stun_raw = _stun_fut.result()
+        _nat_raw = _nat_fut.result()
+
+    # ── Process STUN result ────────────────────────────────────────────────
+    if _stun_raw and _is_globally_routable(_stun_raw):
+        _stun_public_ip = _stun_raw
+        _ok(f"Public IP (reflexive): {col.BOLD}{_stun_public_ip}{col.RESET} — patched into SIP Via/Contact", col)
+        if not _source_ip_user_explicit or not _is_globally_routable(args.source_ip or ""):
+            args.source_ip = _stun_public_ip
+        else:
+            _info(f"STUN resolved {_stun_public_ip} but --source-ip {args.source_ip} "
+                  f"is already a public IP — keeping user value", col)
+    elif _stun_raw:
+        _warn(f"STUN returned {_stun_raw} (non-public / CGNAT address) — "
+              f"SIP headers will use local IP; responses may not reach us behind this NAT", col)
+    elif args.stun:
+        _warn("STUN lookup failed — continuing with local IP (may fail behind NAT)", col)
+
+    # ── Process NAT result ────────────────────────────────────────────────
+    _nat_ctx = _nat_raw
+    if _nat_ctx is not None:
+        # Merge: STUN-discovered public IP is more authoritative than NAT's reflexive guess
+        if _stun_public_ip:
+            _nat_ctx.public_ip = _stun_public_ip
+        elif _nat_ctx.public_ip and _is_globally_routable(_nat_ctx.public_ip):
+            # NAT discovered its own public IP — adopt it if STUN didn't give us one
+            if not _source_ip_user_explicit or not _is_globally_routable(args.source_ip or ""):
+                args.source_ip = _nat_ctx.public_ip
+                _stun_public_ip = _nat_ctx.public_ip
+
+        _nat_type_str = _nat_ctx.nat_type
+        _nat_colour = col.GREEN if _nat_type_str in ("direct", "full_cone") else col.YELLOW
+        _ok(f"NAT: {_nat_colour}{_nat_ctx.summary()}{col.RESET}", col)
+
+        if _nat_ctx.upnp_available:
+            _ok(f"  UPnP gateway found — {len(_nat_ctx.mapped_ports)} port(s) mapped through router", col)
+            if (_nat_ctx.public_ip and not _stun_public_ip
+                    and _is_globally_routable(_nat_ctx.public_ip)):
+                args.source_ip = _nat_ctx.public_ip
+                _stun_public_ip = _nat_ctx.public_ip
+                _ok(f"  Public IP from UPnP: {col.BOLD}{_nat_ctx.public_ip}{col.RESET}", col)
+
+        # ── Symmetric NAT auto-remedy ─────────────────────────────────────
+        # Symmetric NAT remaps port per destination: STUN reports port X but
+        # PBX sees port Y.  TCP is connection-oriented so replies always route
+        # on the established connection — no port remapping occurs.
+        if _nat_ctx.prefers_tcp and not getattr(args, "tcp", False) \
+                and not getattr(args, "tls", False):
+            args.tcp = True
+            _warn(
+                f"{col.RED}[SYMMETRIC-NAT]{col.RESET} NAT remaps port per destination — "
+                f"auto-enabling TCP so replies route on the established connection.",
+                col,
             )
-            _nat_type_str = _nat_ctx.nat_type
-            _nat_colour = col.GREEN if _nat_type_str in ("direct", "full_cone") else col.YELLOW
-            _ok(f"NAT: {_nat_colour}{_nat_ctx.summary()}{col.RESET}", col)
+        elif _nat_ctx.prefers_tcp:
+            _info("Symmetric/port-restricted NAT — TCP already active, BYE routing OK.", col)
 
-            if _nat_ctx.upnp_available:
-                _ok(f"  UPnP gateway found — {len(_nat_ctx.mapped_ports)} port(s) mapped through router", col)
-                # UPnP external IP: use only if STUN didn't already give us one,
-                # AND only if it's actually globally routable (some gateways return 0.0.0.0)
-                if (_nat_ctx.public_ip and not _stun_public_ip
-                        and _is_globally_routable(_nat_ctx.public_ip)):
-                    args.source_ip = _nat_ctx.public_ip
-                    _stun_public_ip = _nat_ctx.public_ip
-                    _ok(f"  Public IP from UPnP: {col.BOLD}{_nat_ctx.public_ip}{col.RESET}", col)
+        # ── NAT keepalive thread ──────────────────────────────────────────
+        # Home routers expire UDP NAT bindings in 30-120 s.  Long scans
+        # (2000-ext enum + spray) can take 5-15 min.  A 25 s keepalive from
+        # the fixed source ports prevents the PBX's replies from being dropped
+        # mid-session.  Only useful when UPnP is absent (UPnP pinhole = 2 h).
+        _nat_keepalive_thread: _thr_net.Thread | None = None
+        if (_nat_ctx.nat_type not in ("direct", "unknown")
+                and not _nat_ctx.upnp_available
+                and not getattr(args, "tcp", False)
+                and _nat_ports):
 
-            # ── Symmetric NAT auto-remedy ─────────────────────────────────────
-            # For symmetric NAT the external port differs per destination.
-            # STUN sees port X; PBX sees port Y.  SIP Via advertising port X means
-            # the PBX can never route 200 OK / BYE back to us.
-            # TCP is connection-oriented: the existing connection carries replies,
-            # so no NAT port-remapping occurs.  Auto-enable TCP unless the user
-            # already chose a transport explicitly via --tcp/--tls.
-            if _nat_ctx.prefers_tcp and not getattr(args, "tcp", False) \
-                    and not getattr(args, "tls", False):
-                args.tcp = True
-                _warn(
-                    f"{col.RED}[SYMMETRIC-NAT]{col.RESET} NAT remaps port per destination — "
-                    f"SIP Via port from STUN is wrong for PBX.  "
-                    f"Auto-enabling TCP transport so replies route on the established connection.",
-                    col,
-                )
-            elif _nat_ctx.prefers_tcp:
-                _info("Symmetric/port-restricted NAT — TCP already active, BYE routing OK.", col)
-        except Exception as _nat_exc:
-            _nat_ctx = None
-            # Non-fatal: continue without NAT traversal
-    else:
-        _nat_ctx = None
+            def _nat_keepalive_loop(ports: list[int], stop_ev: _thr_net.Event) -> None:
+                from scanner.nat import _stun_binding, _PUBLIC_STUN_PAIRS
+                idx = 0
+                while not stop_ev.wait(25):  # 25 s < home-router 30 s minimum
+                    host, port = _PUBLIC_STUN_PAIRS[idx % len(_PUBLIC_STUN_PAIRS)]
+                    for lp in ports:
+                        try:
+                            _stun_binding(host, port, local_port=lp, timeout=1.5)
+                        except Exception:
+                            pass
+                    idx += 1
+
+            _keepalive_stop = _thr_net.Event()
+            _nat_keepalive_thread = _thr_net.Thread(
+                target=_nat_keepalive_loop,
+                args=(_nat_ports, _keepalive_stop),
+                daemon=True,
+                name="nat-keepalive",
+            )
+            _nat_keepalive_thread.start()
+            _info(
+                f"NAT keepalive active — refreshing bindings on ports "
+                f"{_nat_ports} every 25 s (NAT={_nat_ctx.nat_type})",
+                col,
+            )
 
     # ---- External tool detection ----
     global _EXT_TOOLS
@@ -2004,16 +2056,20 @@ def main() -> int:
             else:
                 _top_creds = []
             if _use_full:
-                _full_creds = list(auth.load_credentials(_full_path))
+                if not os.path.exists(_full_path):
+                    _warn(f"Credential file not found: {_full_path} — using top_defaults only", col)
+                    _full_creds = []
+                else:
+                    _full_creds = list(auth.load_credentials(_full_path))
                 # Dedup: skip full-list pairs already in top list
                 _top_set = {(u, p) for u, p in _top_creds}
                 _full_creds = [(u, p) for u, p in _full_creds if (u, p) not in _top_set]
-                creds = _top_creds + _full_creds
+                creds: list[tuple[str, str]] = _top_creds + _full_creds
             else:
                 creds = _top_creds
                 _info(
                     f"Fast spray: using top_defaults.txt ({len(creds)} pairs). "
-                    f"Add --full for full {os.path.basename(_full_path)} wordlist.",
+                    f"Add --spray --full for complete {os.path.basename(_full_path)} wordlist.",
                     col,
                 )
             if args.grandstream_creds or state.fingerprint == "Grandstream":
@@ -2021,8 +2077,10 @@ def main() -> int:
                 if os.path.exists(gs_path):
                     creds = creds + list(auth.load_credentials(gs_path))
 
-            targets_for_spray = state.spray_targets()
-            if targets_for_spray:
+            targets_for_spray = state.spray_targets() if creds else []
+            if not creds:
+                _warn("No credentials loaded — skipping spray (top_defaults.txt missing?)", col)
+            if targets_for_spray and creds:
                 _spray_workers = args.workers
                 total_attempts = len(creds) * len(targets_for_spray)
                 _info(
@@ -2782,10 +2840,7 @@ def main() -> int:
                 col,
             )
 
-        # ── Extension enum and credential spray both ran above (Phase 5 / 6). ──
-        # Dead duplicate blocks removed.
-
-        if False and args.enum:  # DEAD — Phase 5 already ran above
+        if False and args.enum:  # pragma: no cover
             if ami_dumped_exts:
                 # AMI gave us ground truth — skip wordlist
                 ext_list = ami_dumped_exts
@@ -3067,6 +3122,12 @@ def main() -> int:
     }
     paths = report.write_all(report_dir, final_report)
     traffic_log.close()
+
+    # Stop NAT keepalive thread (if started)
+    try:
+        _keepalive_stop.set()  # type: ignore[name-defined]
+    except NameError:
+        pass
 
     # Clean up UPnP port mappings created during this session
     if _nat_ctx is not None:
