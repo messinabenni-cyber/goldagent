@@ -39,6 +39,7 @@ class CveResult:
     affected_version: str = ""   # extracted version string if found
     references: list[str] = field(default_factory=list)
     extra: dict = field(default_factory=dict)  # structured evidence (capture data, etc.)
+    confirmed: bool = True        # True = live exploit/response verified; False = config/version-based
 
 
 # ---------------------------------------------------------------------------
@@ -914,7 +915,7 @@ def check_sip_version_disclosure(
                     severity="critical",
                     host=host,
                     port=sip_port,
-                    title=f"Asterisk {ast_ver} is below 18.12.0 — multiple known CVEs",
+                    title=f"Asterisk {ast_ver} is below 18.12.0 — multiple known CVEs [VERSION-BASED]",
                     evidence=(
                         f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
                         "Asterisk versions below 18.12.0 are affected by multiple "
@@ -933,6 +934,7 @@ def check_sip_version_disclosure(
                         "https://www.asterisk.org/asterisk-security-advisories/",
                         "https://nvd.nist.gov/vuln/search/results?query=asterisk",
                     ],
+                    confirmed=False,  # version-based: not live-exploited
                 )
             )
 
@@ -966,6 +968,7 @@ def check_sip_version_disclosure(
                         "https://nvd.nist.gov/vuln/detail/CVE-2022-2347",
                         "https://www.freepbx.org/",
                     ],
+                    confirmed=False,  # version-based: not live-exploited
                 )
             )
 
@@ -1159,8 +1162,8 @@ def check_sip_tls_missing(
             "(credentials and SDES-SRTP keys transmitted in cleartext)"
         ),
         evidence=(
-            f"SIP port {sip_port}/udp is open. Port 5061/tcp (SIP-TLS) is not "
-            "reachable. SIP Digest authentication nonces, call metadata, "
+            f"SIP port {sip_port}/udp is open and responding. Port 5061/tcp (SIP-TLS) "
+            "is not reachable. SIP Digest authentication nonces, call metadata, "
             "and any SDP a=crypto SDES key material are transmitted unencrypted. "
             "Violates RFC 3261 §26 and RFC 4568 §9."
         ),
@@ -1175,6 +1178,7 @@ def check_sip_tls_missing(
             "https://datatracker.ietf.org/doc/html/rfc3261#section-26",
             "https://datatracker.ietf.org/doc/html/rfc4568#section-9",
         ],
+        confirmed=False,  # config-based: SIP responds but TLS not configured
     )
 
 
@@ -1220,10 +1224,10 @@ def check_sip_wss_security(
                 "signaling exposed to eavesdropping (RFC 7118 §14)"
             ),
             evidence=(
-                "Port 8088/tcp is open. SIP-over-WebSocket without TLS allows "
-                "full call session capture, credential theft, and call injection "
-                "by any network observer. Credentials in WWW-Authenticate are "
-                "transmitted in cleartext over the WebSocket transport."
+                "Port 8088/tcp is open and accepting connections. SIP-over-WebSocket "
+                "without TLS allows full call session capture, credential theft, and "
+                "call injection by any network observer. Credentials in WWW-Authenticate "
+                "are transmitted in cleartext over the WebSocket transport."
             ),
             remediation=(
                 "Disable plain WS (port 8088). Use WSS only (port 8089). "
@@ -1231,6 +1235,7 @@ def check_sip_wss_security(
                 "Ensure all WebRTC clients use wss:// URI scheme."
             ),
             references=["https://datatracker.ietf.org/doc/html/rfc7118#section-14"],
+            confirmed=False,  # config-based: port is open but we didn't capture live creds yet
         ))
 
     # Check for WSS (port 8089) — probe for TLS availability (positive indicator)

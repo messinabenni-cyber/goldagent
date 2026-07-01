@@ -35,6 +35,13 @@ except ImportError:
     cve_module = None  # type: ignore[assignment]
     _CVE_AVAILABLE = False
 
+try:
+    from scanner import crack as crack_module
+    _CRACK_AVAILABLE = True
+except ImportError:
+    crack_module = None  # type: ignore[assignment]
+    _CRACK_AVAILABLE = False
+
 # Mode preset definitions
 _MODE_PRESETS: dict[str, dict] = {
     "fast": {
@@ -97,6 +104,86 @@ def _jitter_sleep(jitter: float) -> None:
     """Sleep for a random duration between 0 and jitter seconds."""
     if jitter > 0.0:
         time.sleep(random.uniform(0.0, jitter))
+
+
+# ---------------------------------------------------------------------------
+# External tool detection & NAT/firewall bypass helpers
+# ---------------------------------------------------------------------------
+
+_EXT_TOOLS: dict[str, str | None] = {}  # populated at scan start
+
+
+def _detect_external_tools() -> dict[str, str | None]:
+    """Probe for external security tools and return {name: path_or_None}."""
+    probes = [
+        "socat", "ncat", "nc", "nmap", "sipsak",
+        "sngrep", "tcpdump", "tshark", "sipdump", "sipvicious",
+        "hashcat", "john", "hydra",
+    ]
+    tools: dict[str, str | None] = {}
+    for t in probes:
+        try:
+            r = subprocess.run(["which", t], capture_output=True, text=True, timeout=3)
+            tools[t] = r.stdout.strip() if r.returncode == 0 else None
+        except Exception:
+            tools[t] = None
+    return tools
+
+
+def _nat_auto_recover(
+    host: str,
+    current_source_ip: str,
+    timeout: float,
+    col: "Colours",
+) -> str | None:
+    """If source_ip is RFC-1918 and host is public, resolve public IP via STUN.
+
+    Returns the public IP string on success, None if STUN fails or not needed.
+    """
+    import ipaddress
+
+    def _is_private(ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip).is_private
+        except ValueError:
+            return False
+
+    def _is_public(ip: str) -> bool:
+        try:
+            a = ipaddress.ip_address(ip)
+            return not (a.is_private or a.is_loopback or a.is_link_local)
+        except ValueError:
+            return False
+
+    if not _is_private(current_source_ip) or not _is_public(host):
+        return None  # no NAT mismatch
+
+    try:
+        from scanner.stun import resolve_public_ip
+        pub = resolve_public_ip(timeout=timeout)
+        if pub and pub != current_source_ip:
+            _ok(
+                f"AUTO-NAT-FIX: STUN resolved public IP {col.BOLD}{pub}{col.RESET} "
+                f"(was {current_source_ip}) — patching SIP Contact/Via headers…",
+                col,
+            )
+            return pub
+    except Exception:
+        pass
+    return None
+
+
+def _show_ext_tool_hint(
+    hint: str,
+    tools: dict[str, str | None],
+    col: "Colours",
+) -> None:
+    """Print one-liner if the relevant external tool is available."""
+    # hint keys: "socat", "nmap", "sngrep", etc.
+    for tool, path in tools.items():
+        if tool in hint.lower() and path:
+            print(f"  {col.CYAN}  ↳ [{tool}] {hint}{col.RESET}")
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -857,6 +944,15 @@ def main() -> int:
     else:
         _stun_public_ip = None
 
+    # ---- External tool detection ----
+    global _EXT_TOOLS
+    _EXT_TOOLS = _detect_external_tools()
+    _avail = [t for t, p in _EXT_TOOLS.items() if p]
+    if _avail:
+        _info(f"External tools detected: {col.CYAN}{' · '.join(_avail)}{col.RESET}", col)
+    else:
+        _info("No external tools found (socat/nmap/sngrep not installed — continuing with built-ins)", col)
+
     operator, scope_sha = authorize(args, col)
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -961,7 +1057,11 @@ def main() -> int:
             ]
             if cve_results:
                 for r in cve_results:
-                    _finding(r.severity, f"{r.cve_id} — {r.title}", col)
+                    _verify_badge = (
+                        f" {col.GREEN}[CONFIRMED]{col.RESET}" if getattr(r, "confirmed", True)
+                        else f" {col.YELLOW}[CONFIG/VERSION — not live-exploited]{col.RESET}"
+                    )
+                    _finding(r.severity, f"{r.cve_id} — {r.title}{_verify_badge}", col)
                     # Unencrypted SIP: silently probe for live credentials/keys
                     # Only surface output if real captured data is found
                     if r.cve_id in ("CONFIG-SIP-TLS", "CONFIG-SIP-WS-PLAIN") and _CVE_AVAILABLE:
@@ -983,10 +1083,69 @@ def main() -> int:
                         if _has_creds or _has_keys or _has_intel:
                             # Show capture — only because real findings exist
                             _show_cleartext_capture(_cleartext_ev, col)
+                            # Auto-crack captured challenge — silent until confirmed
+                            if _has_creds and _CRACK_AVAILABLE:
+                                _challenge = _cleartext_ev.get("challenge", {})
+                                _crack_ext = _cleartext_ev.get(
+                                    "extension",
+                                    _agg.get("all_extensions", ["1000"])[0]
+                                    if _agg.get("all_extensions") else "1000",
+                                )
+                                _info(
+                                    f"  Auto-cracking captured challenge"
+                                    f" (realm={_challenge.get('realm','?')}"
+                                    f"  algo={_challenge.get('algorithm','MD5')}) …",
+                                    col,
+                                )
+                                import threading as _th
+                                _crack_result: list = [None]
+                                def _do_crack(
+                                    ch=_challenge, ext=_crack_ext, hst=h.ip,
+                                    port=_cap_port, src=args.source_ip,
+                                    to=args.timeout, tcp=sip_tcp, tls=sip_tls,
+                                ) -> None:
+                                    _crack_result[0] = crack_module.crack_sip_digest_challenge(
+                                        challenge=ch, extension=ext,
+                                        host=hst, sip_port=port,
+                                        source_ip=src, timeout=to,
+                                        tcp=tcp, use_tls=tls,
+                                        time_limit=50.0,
+                                    )
+                                _ct = _th.Thread(target=_do_crack, daemon=True)
+                                _ct.start()
+                                _ct.join(timeout=55.0)
+                                if _crack_result[0]:
+                                    _cracked_pw, _crack_src = _crack_result[0]
+                                    _finding(
+                                        "critical",
+                                        f"SIP-CREDENTIAL-CRACKED — ext {col.BOLD}{_crack_ext}{col.RESET} "
+                                        f"password: {col.RED}{col.BOLD}{_cracked_pw}{col.RESET}  "
+                                        f"realm={_challenge.get('realm','?')}  "
+                                        f"source={_crack_src}",
+                                        col,
+                                    )
+                                    # Store for use in spray/call phases
+                                    hr.setdefault("cracked_credentials", []).append({
+                                        "extension": _crack_ext,
+                                        "password": _cracked_pw,
+                                        "realm": _challenge.get("realm", ""),
+                                        "source": _crack_src,
+                                    })
                         else:
                             _info(
                                 "  Cleartext probe ran — no credentials intercepted on this exchange"
                                 " (PBX may not have challenged within timeout).",
+                                col,
+                            )
+                        # Hint: suggest live capture tools if available
+                        if _EXT_TOOLS.get("sngrep"):
+                            _info(
+                                f"  [sngrep] sngrep -d any host {h.ip} and port {_cap_port}",
+                                col,
+                            )
+                        elif _EXT_TOOLS.get("tcpdump"):
+                            _info(
+                                f"  [tcpdump] tcpdump -i any -A 'host {h.ip} and port {_cap_port}'",
                                 col,
                             )
             else:
@@ -1324,12 +1483,21 @@ def main() -> int:
                 code = result.status_code
 
                 # A) Timeout + NAT suspected → retry with STUN public IP
-                if code is None and result.nat_suspected and _stun_public_ip and \
-                        _stun_public_ip != args.source_ip:
+                # On-the-fly STUN if not already resolved
+                _stun_for_fix = _stun_public_ip
+                if code is None and result.nat_suspected and not _stun_for_fix:
+                    _info(f"  {col.YELLOW}AUTO-FIX A0:{col.RESET} NAT detected + no --stun — "
+                          f"auto-running STUN to resolve public IP…", col)
+                    _stun_for_fix = _nat_auto_recover(
+                        h.ip, result.local_ip_used or args.source_ip,
+                        args.timeout, col,
+                    ) or _stun_public_ip
+                if code is None and result.nat_suspected and _stun_for_fix and \
+                        _stun_for_fix != args.source_ip:
                     _info(f"  {col.YELLOW}AUTO-FIX A:{col.RESET} NAT detected — retrying with "
-                          f"STUN public IP {_stun_public_ip}", col)
+                          f"STUN public IP {_stun_for_fix}", col)
                     result = _try_call("NAT fix: STUN public IP as Contact/Via",
-                                       source_ip=_stun_public_ip)
+                                       source_ip=_stun_for_fix)
                     _attempts.append(("nat-fix-stun", result))
 
                 # B) Still timing out → try TCP transport
@@ -1550,15 +1718,31 @@ def main() -> int:
             _info(f"{'═'*60}", col)
             _info("", col)
 
-            # ── NAT warning ────────────────────────────────────────────────
+            # ── NAT auto-recover ───────────────────────────────────────────
             if result.nat_suspected:
                 _warn(
-                    f"NAT DETECTED: scanner Contact IP ({result.local_ip_used}) is "
-                    f"private but PBX ({h.ip}) is public. The PBX cannot route BYE/RTP "
-                    f"back to your scanner. Test from same subnet as PBX for definitive "
-                    f"proof, or use a VPN/SSH tunnel into the target network.",
+                    f"NAT DETECTED: Contact IP ({result.local_ip_used}) is private "
+                    f"but PBX ({h.ip}) is public — auto-attempting STUN recovery…",
                     col,
                 )
+                _nat_pub = _nat_auto_recover(h.ip, result.local_ip_used, args.timeout, col)
+                if _nat_pub:
+                    args.source_ip = _nat_pub
+                    _ok(
+                        f"NAT FIX APPLIED: future SIP exchanges will use "
+                        f"{col.BOLD}{_nat_pub}{col.RESET} in Contact/Via headers.",
+                        col,
+                    )
+                else:
+                    _warn(
+                        "STUN auto-fix unavailable. Bypass options:",
+                        col,
+                    )
+                    if _EXT_TOOLS.get("socat"):
+                        print(f"  {col.CYAN}  [socat] socat UDP-LISTEN:5060,fork UDP4:{h.ip}:5060{col.RESET}")
+                    if _EXT_TOOLS.get("ncat"):
+                        print(f"  {col.CYAN}  [ncat]  ncat -l -p 5060 --sh-exec 'ncat {h.ip} 5060'{col.RESET}")
+                    print(f"  {col.YELLOW}  [manual] SSH/VPN tunnel into target network, or add --stun auto{col.RESET}")
 
             # ── Confirmed call announcement ────────────────────────────────
             if result.success and result.call_confirmed:
