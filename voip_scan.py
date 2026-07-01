@@ -1412,10 +1412,15 @@ def main() -> int:
         print("ERROR: --target is required", file=sys.stderr)
         return 2
 
+    # Track whether the caller supplied an explicit --source-ip so STUN knows not to
+    # override it.  --network-derived IPs are considered auto-detected (upgradeable).
+    _source_ip_user_explicit: bool = bool(args.source_ip)
+
     # --network resolves to --source-ip; explicit --source-ip takes precedence
     if args.network and not args.source_ip:
         args.source_ip = _resolve_network_arg(args.network)
-        _info(f"Network {args.network!r} → source IP {args.source_ip}", col)
+        _info(f"Network {args.network!r} → SIP header IP {args.source_ip} "
+              f"(traffic routing follows OS table; STUN will upgrade if public IP differs)", col)
     elif args.network and args.source_ip:
         _warn("Both --network and --source-ip given; --source-ip takes precedence", col)
 
@@ -1492,23 +1497,41 @@ def main() -> int:
 
     source_port_range = _parse_port_range(args.source_port_range)
 
-    # ---- STUN: resolve public IP to fix Via/Contact headers behind NAT ----
+    # ---- STUN: resolve public/reflexive IP to fix Via/Contact headers behind NAT ----
+    import ipaddress as _ipaddress
+
+    def _is_globally_routable(ip: str) -> bool:
+        """True only for addresses the PBX can actually route back to us."""
+        try:
+            a = _ipaddress.ip_address(ip)
+            return not (a.is_private or a.is_loopback or a.is_link_local
+                        or a.is_reserved or a.is_multicast
+                        or _ipaddress.ip_network(ip).overlaps(
+                            _ipaddress.ip_network("100.64.0.0/10")))  # CGNAT RFC 6598
+        except ValueError:
+            return False
+
+    _stun_public_ip: str | None = None
     if args.stun:
         from scanner.stun import resolve_public_ip
         stun_arg = None if args.stun.lower() == "auto" else args.stun
         _info("Resolving public IP via STUN...", col)
-        public_ip = resolve_public_ip(stun_server=stun_arg, timeout=args.timeout)
-        if public_ip:
-            _ok(f"Public IP (reflexive): {col.BOLD}{public_ip}{col.RESET} — patched into SIP Via/Contact", col)
-            # Always override: STUN public IP is the correct Contact/Via address
-            # even if --network pre-set a private interface IP.
-            args.source_ip = public_ip
-            _stun_public_ip = public_ip
+        _stun_raw = resolve_public_ip(stun_server=stun_arg, timeout=max(args.timeout, 2.0))
+        if _stun_raw and _is_globally_routable(_stun_raw):
+            _stun_public_ip = _stun_raw
+            _ok(f"Public IP (reflexive): {col.BOLD}{_stun_public_ip}{col.RESET} — patched into SIP Via/Contact", col)
+            # Only upgrade auto-detected or private source IPs.
+            # Respect an explicit --source-ip the user supplied (they know their topology).
+            if not _source_ip_user_explicit or not _is_globally_routable(args.source_ip or ""):
+                args.source_ip = _stun_public_ip
+            else:
+                _info(f"STUN resolved {_stun_public_ip} but --source-ip {args.source_ip} "
+                      f"is already a public IP — keeping user value", col)
+        elif _stun_raw:
+            _warn(f"STUN returned {_stun_raw} (non-public / CGNAT address) — "
+                  f"SIP headers will use local IP; responses may not reach us behind this NAT", col)
         else:
             _warn("STUN lookup failed — continuing with local IP (may fail behind NAT)", col)
-            _stun_public_ip: str | None = None
-    else:
-        _stun_public_ip = None
 
     # ---- NAT auto-traversal: type detection + UPnP port mapping ----
     _nat_ctx = None
@@ -1529,22 +1552,38 @@ def main() -> int:
                 enable_upnp=True,
                 timeout=min(args.timeout, 3.0),
             )
-            # If NAT type is symmetric and no STUN/UPnP resolved, prefer TCP
             _nat_type_str = _nat_ctx.nat_type
             _nat_colour = col.GREEN if _nat_type_str in ("direct", "full_cone") else col.YELLOW
             _ok(f"NAT: {_nat_colour}{_nat_ctx.summary()}{col.RESET}", col)
+
             if _nat_ctx.upnp_available:
                 _ok(f"  UPnP gateway found — {len(_nat_ctx.mapped_ports)} port(s) mapped through router", col)
-                if _nat_ctx.public_ip and not _stun_public_ip:
-                    # UPnP gave us the external IP; use it
+                # UPnP external IP: use only if STUN didn't already give us one,
+                # AND only if it's actually globally routable (some gateways return 0.0.0.0)
+                if (_nat_ctx.public_ip and not _stun_public_ip
+                        and _is_globally_routable(_nat_ctx.public_ip)):
                     args.source_ip = _nat_ctx.public_ip
                     _stun_public_ip = _nat_ctx.public_ip
                     _ok(f"  Public IP from UPnP: {col.BOLD}{_nat_ctx.public_ip}{col.RESET}", col)
-            elif _nat_type_str == "symmetric":
-                _warn("Symmetric NAT detected — BYE routing may fail; TCP transport preferred. "
-                      "UPnP not available on this network.", col)
-            for _log_line in _nat_ctx.setup_log:
-                pass  # already summarised above; available for --debug if needed
+
+            # ── Symmetric NAT auto-remedy ─────────────────────────────────────
+            # For symmetric NAT the external port differs per destination.
+            # STUN sees port X; PBX sees port Y.  SIP Via advertising port X means
+            # the PBX can never route 200 OK / BYE back to us.
+            # TCP is connection-oriented: the existing connection carries replies,
+            # so no NAT port-remapping occurs.  Auto-enable TCP unless the user
+            # already chose a transport explicitly via --tcp/--tls.
+            if _nat_ctx.prefers_tcp and not getattr(args, "tcp", False) \
+                    and not getattr(args, "tls", False):
+                args.tcp = True
+                _warn(
+                    f"{col.RED}[SYMMETRIC-NAT]{col.RESET} NAT remaps port per destination — "
+                    f"SIP Via port from STUN is wrong for PBX.  "
+                    f"Auto-enabling TCP transport so replies route on the established connection.",
+                    col,
+                )
+            elif _nat_ctx.prefers_tcp:
+                _info("Symmetric/port-restricted NAT — TCP already active, BYE routing OK.", col)
         except Exception as _nat_exc:
             _nat_ctx = None
             # Non-fatal: continue without NAT traversal

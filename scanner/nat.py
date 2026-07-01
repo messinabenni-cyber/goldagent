@@ -211,9 +211,15 @@ def detect_nat_type(timeout: float = 3.0) -> NatType:
             return "unknown"
         ext_ip1, ext_port1 = r1
 
-        # Detect if behind NAT at all
+        # Detect if behind NAT: compare reflexive IP to the actual outbound IP.
+        # gethostbyname(gethostname()) is unreliable on Linux (often 127.0.0.1).
+        # Use routing socket trick: connect UDP toward the STUN server and read
+        # the kernel-selected source address — that is the true local egress IP.
         try:
-            local_ip = socket.gethostbyname(socket.gethostname())
+            _probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            _probe.connect((h1, p1))
+            local_ip = _probe.getsockname()[0]
+            _probe.close()
         except OSError:
             local_ip = ""
         if ext_ip1 == local_ip:
@@ -482,14 +488,19 @@ def setup(
         log.append(f"NAT type detection failed: {exc}")
 
     # ── 2. Reflexive port tracking ─────────────────────────────────────────
+    # public_ip may have been supplied by caller (from a prior standalone STUN
+    # query).  Still probe per-port reflexive ports for accurate Via advertising,
+    # but skip the public IP update if we already have a reliable value.
+    _have_public_ip = bool(ctx.public_ip)
     for lp in ports_to_map:
         try:
             ref = get_reflexive_address(local_port=lp, stun_server=stun_server,
                                          timeout=timeout)
             if ref:
                 ctx.reflexive_ports[lp] = ref[1]
-                if not ctx.public_ip:
+                if not _have_public_ip:
                     ctx.public_ip = ref[0]
+                    _have_public_ip = True
                 log.append(f"Reflexive port for {lp}: {ref[0]}:{ref[1]}")
         except Exception as exc:
             log.append(f"Reflexive port probe for {lp} failed: {exc}")
