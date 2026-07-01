@@ -332,8 +332,13 @@ def _safe_fetch_url(url, timeout=5.0):
         ip = socket.gethostbyname(host)
         import ipaddress as _ipa
         addr = _ipa.ip_address(ip)
-        if addr.is_loopback:
+        if addr.is_loopback or addr.is_private or addr.is_link_local or addr.is_reserved:
             return ""
+        # Prevent DNS rebinding by using the resolved IP directly
+        netloc = parsed.netloc
+        port_part = f":{netloc.split(':', 1)[1]}" if ':' in netloc else ""
+        resolved_url = url.replace(netloc, ip + port_part, 1)
+        return _fetch_url(resolved_url, timeout)
     except Exception:
         pass
     return _fetch_url(url, timeout)
@@ -423,14 +428,15 @@ def add_port_mapping(
     duration: int = 3600,
 ) -> bool:
     """AddPortMapping via UPnP SOAP. Returns True on success."""
+    from xml.sax.saxutils import escape as _xesc
     args = (
         "<NewRemoteHost></NewRemoteHost>"
-        f"<NewExternalPort>{external_port}</NewExternalPort>"
-        f"<NewProtocol>{protocol.upper()}</NewProtocol>"
-        f"<NewInternalPort>{internal_port}</NewInternalPort>"
-        f"<NewInternalClient>{internal_ip}</NewInternalClient>"
+        f"<NewExternalPort>{_xesc(str(external_port))}</NewExternalPort>"
+        f"<NewProtocol>{_xesc(str(protocol).upper())}</NewProtocol>"
+        f"<NewInternalPort>{_xesc(str(internal_port))}</NewInternalPort>"
+        f"<NewInternalClient>{_xesc(str(internal_ip))}</NewInternalClient>"
         "<NewEnabled>1</NewEnabled>"
-        f"<NewPortMappingDescription>{description}</NewPortMappingDescription>"
+        f"<NewPortMappingDescription>{_xesc(str(description))}</NewPortMappingDescription>"
         f"<NewLeaseDuration>{duration}</NewLeaseDuration>"
     )
     resp = _soap_action(control_url, service_type, "AddPortMapping", args)

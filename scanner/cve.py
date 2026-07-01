@@ -47,6 +47,11 @@ class CveResult:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _sanitise_header(s: str) -> str:
+    """Strip CR/LF from a header value to prevent HTTP header injection."""
+    return s.replace('\r', '').replace('\n', '')
+
+
 def _http_get(
     host: str,
     port: int,
@@ -72,10 +77,10 @@ def _http_get(
         extra = ""
         if extra_headers:
             for k, v in extra_headers.items():
-                extra += f"{k}: {v}\r\n"
+                extra += f"{_sanitise_header(k)}: {_sanitise_header(v)}\r\n"
         request = (
             f"GET {path} HTTP/1.0\r\n"
-            f"Host: {host}\r\n"
+            f"Host: {_sanitise_header(host)}\r\n"
             "User-Agent: Mozilla/5.0 VoIPScan/4.0\r\n"
             "Accept: */*\r\n"
             f"{extra}"
@@ -395,7 +400,7 @@ def check_freepbx_cve_2021_45461(
     ver = _extract_fpbx_version(body)
     confirmed = True
     if ver:
-        vulnerable = _version_lt(ver, "15.0.21.4") or _version_lt(ver, "16.0.10.41")
+        vulnerable = (ver.startswith("15.") and _version_lt(ver, "15.0.21.4")) or (ver.startswith("16.") and _version_lt(ver, "16.0.10.41"))
         if not vulnerable:
             confirmed = False
 
@@ -1114,7 +1119,7 @@ def check_sip_version_disclosure(
     # Check FreePBX version
     fpbx_ver = _extract_fpbx_version(sip_server)
     if fpbx_ver:
-        if _version_lt(fpbx_ver, "16.0.19.9"):
+        if fpbx_ver.startswith("16.") and _version_lt(fpbx_ver, "16.0.19.9"):
             results.append(
                 CveResult(
                     cve_id="CVE-2022-2347",
@@ -1129,7 +1134,7 @@ def check_sip_version_disclosure(
                         "CVE-2022-2347: authenticated path traversal and arbitrary "
                         "file read via the file manager module, which can expose "
                         "system files including /etc/passwd and Asterisk SIP credentials. "
-                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H] "
+                        "[CVSS:6.5/MEDIUM CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N] "
                         "[CONFIG/VERSION — not live-exploited]"
                     ),
                     remediation=(

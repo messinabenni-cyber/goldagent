@@ -81,7 +81,7 @@ def parse_response(data: bytes) -> SipResponse | None:
         lines = head.decode("utf-8", errors="replace").split("\r\n")
         if not lines:
             return None
-        m = re.match(r"SIP/2\.0\s+(\d{3})\s*(.*)", lines[0])
+        m = re.match(r"SIP/2\.0 (\d{3}) ([^\r\n]{0,256})", lines[0])
         if not m:
             return None
         code = int(m.group(1))
@@ -145,7 +145,7 @@ def parse_request(data: bytes) -> SipRequest | None:
         lines = head.decode("utf-8", errors="replace").split("\r\n")
         if not lines:
             return None
-        m = re.match(r"([A-Z]+)\s+(\S+)\s+SIP/2\.0", lines[0])
+        m = re.match(r"([A-Z]{1,16}) (\S{1,512}) SIP/2\.0", lines[0])
         if not m:
             return None
         method      = m.group(1)
@@ -178,18 +178,18 @@ def build_response_to_request(
 ) -> bytes:
     """Build a minimal SIP response reflecting Via/From/To/Call-ID/CSeq from request."""
     lines = [f"SIP/2.0 {status_code} {reason}"]
-    # Reflect each Via header verbatim
-    for via in (request.via or "").split(","):
+    # Reflect each Via header -- sanitise to prevent header injection from untrusted PBX
+    for via in (_sanitise_hdr(request.via or "")).split(","):
         v = via.strip()
         if v:
             lines.append(f"Via: {v}")
-    lines.append(f"From: {request.from_header}")
-    to = request.to_header
+    lines.append(f"From: {_sanitise_hdr(request.from_header)}")
+    to = _sanitise_hdr(request.to_header)
     if to_tag and ";tag=" not in to:
         to += f";tag={to_tag}"
     lines.append(f"To: {to}")
-    lines.append(f"Call-ID: {request.call_id}")
-    lines.append(f"CSeq: {request.cseq}")
+    lines.append(f"Call-ID: {_sanitise_hdr(request.call_id)}")
+    lines.append(f"CSeq: {_sanitise_hdr(request.cseq)}")
     if extra_headers:
         lines.extend(extra_headers)
     if body:
@@ -222,6 +222,11 @@ def parse_contact_uri(headers: dict[str, str]) -> tuple[str, int] | None:
 def _no_crlf(value: str, label: str) -> None:
     if value and ("\r" in value or "\n" in value):
         raise ValueError(f"{label} contains invalid CR/LF characters")
+
+
+def _sanitise_hdr(v: str) -> str:
+    """Strip CR/LF from a header value reflected from an untrusted source."""
+    return v.replace('\r', '').replace('\n', '') if v else ''
 
 
 def _wrap_uri(value: str) -> str:
@@ -354,7 +359,7 @@ def build_message(
         lines.extend(extra_headers)
     if body:
         lines.append("Content-Type: application/sdp")
-    lines.append(f"Content-Length: {len(body)}")
+    lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
     lines.append("")
 
     return ("\r\n".join(lines) + "\r\n" + body).encode("utf-8")
@@ -571,6 +576,8 @@ def send_and_recv_tcp(
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > 262144:
+                break
             header_end = buf.find(b"\r\n\r\n")
             if header_end == -1:
                 continue
@@ -578,7 +585,7 @@ def send_and_recv_tcp(
             cl_match = re.search(
                 r"(?i)^content-length\s*:\s*(\d+)", headers_text, re.MULTILINE
             )
-            content_length = int(cl_match.group(1)) if cl_match else 0
+            content_length = min(int(cl_match.group(1)), 131072) if cl_match else 0
             body_received = len(buf) - (header_end + 4)
             if body_received >= content_length:
                 break

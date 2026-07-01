@@ -168,14 +168,24 @@ class TestCheckAll:
 class TestCheckCVE20222347:
 
     def test_check_cve_2022_2347_vulnerable_version(self):
-        """FreePBX 15.0.17.0 is below 16.0.19.9 — should produce CVE-2022-2347 finding."""
+        """FreePBX 16.0.18.0 is below 16.0.19.9 — should produce CVE-2022-2347 finding."""
+        results = check_sip_version_disclosure(
+            host="192.0.2.10",
+            sip_port=5060,
+            sip_server="FreePBX/16.0.18.0",
+        )
+        cve_ids = [r.cve_id for r in results]
+        assert "CVE-2022-2347" in cve_ids
+
+    def test_check_cve_2022_2347_not_16x(self):
+        """FreePBX 15.0.17.0 is not 16.x — CVE-2022-2347 is 16.x-specific, should NOT trigger."""
         results = check_sip_version_disclosure(
             host="192.0.2.10",
             sip_port=5060,
             sip_server="FreePBX/15.0.17.0",
         )
         cve_ids = [r.cve_id for r in results]
-        assert "CVE-2022-2347" in cve_ids
+        assert "CVE-2022-2347" not in cve_ids
 
     def test_check_cve_2022_2347_patched_version(self):
         """FreePBX 16.0.20.0 is above 16.0.19.9 — should NOT produce CVE-2022-2347 finding."""

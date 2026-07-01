@@ -31,6 +31,9 @@ def _http_post(host: str, port: int, path: str, body: str, timeout: float,
                use_tls: bool = False,
                content_type: str = "application/json") -> tuple[int, str, bytes]:
     """POST request. Returns (status, server_header, body_first_4k). (0,"",b"") on error."""
+    if '\r' in host or '\n' in host or '\r' in path or '\n' in path:
+        raise ValueError('CR/LF in host or path')
+    content_type = content_type.replace('\r', '').replace('\n', '')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -84,6 +87,8 @@ def _http_post(host: str, port: int, path: str, body: str, timeout: float,
 def _http_get(host: str, port: int, path: str, timeout: float,
               use_tls: bool = False) -> tuple[int, str, bytes]:
     """Return (status, server_header, body_first_4k). (0,"",b"") on error."""
+    if '\r' in host or '\n' in host or '\r' in path or '\n' in path:
+        raise ValueError('CR/LF in host or path')
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:

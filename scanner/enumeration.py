@@ -104,6 +104,7 @@ class ExtensionResult:
     open_register: bool = False        # 200 OK to unauth REGISTER
     anonymous_invite: bool = False     # 100/180/200 to unauth INVITE
     evidence: str = ""
+    raw_response: bytes | None = None  # raw SIP response bytes for intel extraction
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +341,9 @@ def probe(
         # Another thread detected rate-limiting; honour a brief cooldown
         time.sleep(0.5)
 
-    return _classify(resp, method, ext)
+    result = _classify(resp, method, ext)
+    result.raw_response = data
+    return result
 
 
 # ---------------------------------------------------------------------------

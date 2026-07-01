@@ -155,8 +155,12 @@ def find_rockyou() -> str | None:
     return None
 
 
-def ensure_rockyou(log_fn=None) -> str | None:
-    """Find rockyou, or try to install wordlists package via apt. Returns path or None."""
+def ensure_rockyou(log_fn=None, auto_install: bool = False) -> str | None:
+    """Find rockyou, or try to install wordlists package via apt. Returns path or None.
+
+    Set auto_install=True to allow automatic package installation via apt-get.
+    Without explicit consent (auto_install=False), apt-get is not run.
+    """
     path = find_rockyou()
     if path:
         return path
@@ -164,6 +168,10 @@ def ensure_rockyou(log_fn=None) -> str | None:
     def _log(msg: str) -> None:
         if log_fn:
             log_fn(msg)
+
+    if not auto_install:
+        _log("rockyou.txt not found — skipping auto-install (pass auto_install=True to enable)")
+        return None
 
     _log("rockyou.txt not found — attempting apt-get install wordlists…")
     try:
@@ -325,7 +333,7 @@ def crack_sip_digest_challenge(
     All failures are silent; caller only sees a result on confirmed crack.
     """
     # Challenge must have at least a nonce to be usable
-    if not challenge.get("nonce") and not challenge.get("realm"):
+    if not challenge.get("nonce") or not challenge.get("realm"):
         return None
 
     def _log(msg: str) -> None:

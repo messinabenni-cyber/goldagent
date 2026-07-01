@@ -453,11 +453,11 @@ class TestSipVersionDisclosureGrandstream:
             sip_server="FPBX-15.0.17.34(17.9.3)",
         )
         # Asterisk 17.x is EOL → CONFIG-ASTERISK-EOL
-        # FreePBX 15.0.17.34 < 16.0.19.9 → CVE-2022-2347
+        # CVE-2022-2347 is 16.x-specific — 15.x should NOT trigger it
         cve_ids = [r.cve_id for r in results]
         assert "CONFIG-ASTERISK-EOL" in cve_ids, (
             f"Expected CONFIG-ASTERISK-EOL for Asterisk 17.x (EOL); got {cve_ids}"
         )
-        assert "CVE-2022-2347" in cve_ids, (
-            f"Expected CVE-2022-2347 for FreePBX 15.0.17.34; got {cve_ids}"
+        assert "CVE-2022-2347" not in cve_ids, (
+            f"CVE-2022-2347 is 16.x-specific; should not trigger for FreePBX 15.0.17.34; got {cve_ids}"
         )

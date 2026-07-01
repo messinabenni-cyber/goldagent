@@ -762,7 +762,7 @@ th{{background:#0b1a33;color:#fff;font-weight:600;font-size:13px}}
 
 {exec_summary_block}
 
-<p>{exec_summary}</p>
+<p>{_esc(exec_summary)}</p>
 
 <div class="kpi-grid">{kpi_html}</div>
 
@@ -1033,6 +1033,9 @@ def write_findings(report_dir: str, findings: list[dict]) -> str:
     This file is the primary machine-readable artefact — ready for import into
     a SIEM, ticketing system, or further automation.
     """
+    import pathlib as _pl
+    if ".." in _pl.Path(report_dir).parts:
+        raise ValueError(f"report_dir contains path traversal: {report_dir}")
     out = Path(report_dir)
     out.mkdir(parents=True, exist_ok=True)
 

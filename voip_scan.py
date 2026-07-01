@@ -26,6 +26,7 @@ import time
 from dataclasses import asdict
 
 from scanner import ami, auth, call, discovery, enumeration, http_probes, report
+from scanner.intel import extract_from_raw, format_intel_findings
 from scanner.utils import Colours, Progress, TrafficLog, hash_file
 
 try:
@@ -156,6 +157,7 @@ class ScanState:
     ami_http: dict | None = None
     credentials_found: list[dict] = _field(default_factory=list)
     cracked_credentials: list[dict] = _field(default_factory=list)  # from hash cracking
+    intel_findings: list[str] = _field(default_factory=list)  # SIP intel extraction findings
     call_test: dict | None = None
     subscribe_probes: list[dict] = _field(default_factory=list)
     refer_probe: dict | None = None
@@ -1511,11 +1513,11 @@ def main() -> int:
         _err("--call-to-auto requires --call-to (destination number)", col)
         return 2
 
-    # CRLF injection guard: reject usernames/passwords containing CR or LF
-    for _crlf_attr in ("username", "password"):
-        _crlf_val = getattr(args, _crlf_attr, None)
-        if _crlf_val and ("\r" in _crlf_val or "\n" in _crlf_val):
-            _err(f"--{_crlf_attr} contains CR/LF characters", col)
+    # CRLF injection guard: reject SIP header args containing CR or LF
+    for _attr in ('pai', 'diversion', 'from_display', 'privacy', 'remote_party_id'):
+        _val = getattr(args, _attr, None)
+        if _val and ('\r' in _val or '\n' in _val):
+            _err(f"--{_attr.replace('_','-')} contains CR/LF characters", col)
             return 2
 
     source_port_range = _parse_port_range(args.source_port_range)
@@ -1720,7 +1722,14 @@ def main() -> int:
     if chr(0) in report_dir:
         _err("--report-dir contains null bytes", col)
         return 2
+    import pathlib as _pl
+    _rd_resolved = _pl.Path(report_dir).resolve()
+    _rd_base = _pl.Path('reports').resolve()
+    if '..' in _pl.Path(report_dir).parts:
+        _err("--report-dir must not contain '..'  path components", col)
+        return 2
     os.makedirs(report_dir, exist_ok=True)
+    os.chmod(report_dir, 0o700)
     traffic_log = TrafficLog(os.path.join(report_dir, "traffic.log"))
 
     # ══════════════════════════════════════════════════════════════════════
@@ -2061,13 +2070,15 @@ def main() -> int:
             # Merge sweep results into state.extension_list (deduped)
             for r in found:
                 existing_exts = {e["extension"] for e in state.extension_list}
+                # Exclude raw_response bytes from the serialised state dict
+                _r_dict = {k: v for k, v in asdict(r).items() if k != "raw_response"}
                 if r.extension not in existing_exts:
-                    state.extension_list.append(asdict(r))
+                    state.extension_list.append(_r_dict)
                 else:
                     # Update existing entry with richer data from sweep
                     for entry in state.extension_list:
                         if entry["extension"] == r.extension:
-                            entry.update(asdict(r))
+                            entry.update(_r_dict)
                             break
 
             anon = sum(1 for x in found if x.anonymous_invite)
@@ -2077,6 +2088,30 @@ def main() -> int:
                 f"anonymous_invite:{col.RED if anon else ''}{anon}{col.RESET if anon else ''}  "
                 f"open_register:{col.RED if open_reg else ''}{open_reg}{col.RESET if open_reg else ''}",
                 col)
+
+            # ── SIP intelligence extraction from probe responses ────────────
+            _intel_lines: list[str] = []
+            for _r in found:
+                if _r.raw_response:
+                    _intel = extract_from_raw(
+                        _r.raw_response,
+                        transport="TLS" if sip_tls else ("TCP" if sip_tcp else "UDP"),
+                    )
+                    for _line in format_intel_findings(_intel, extension=_r.extension):
+                        _intel_lines.append(_line)
+                        state.intel_findings.append(_line)
+                # No-auth extensions are high-priority findings
+                if _r.anonymous_invite:
+                    _anon_msg = f"[ext {_r.extension}] CRITICAL: anonymous INVITE accepted (no auth required)"
+                    _intel_lines.append(_anon_msg)
+                    state.intel_findings.append(_anon_msg)
+
+            if _intel_lines:
+                _info(f"  SIP intel ({len(_intel_lines)} finding(s)):", col)
+                for _il in _intel_lines[:20]:  # cap display to 20 lines
+                    sev = "CRITICAL" if "CRITICAL" in _il else ("HIGH" if "HIGH" in _il else "")
+                    _c = col.RED if sev == "CRITICAL" else (col.YELLOW if sev == "HIGH" else "")
+                    _info(f"    {_c}{_il}{col.RESET if _c else ''}", col)
 
         # ── Phase 5 → spray adaptive injection (fallback) ─────────────────
         # If enum found nothing but AMI dumped extensions, they were already
@@ -2610,7 +2645,7 @@ def main() -> int:
                 # F) 401/407 Auth required — try AMI-cracked creds if available
                 if result.status_code in (401, 407):
                     _ami_creds = [(c["username"], c["password"])
-                                  for c in hr.get("credentials_found", [])]
+                                  for c in state.credentials_found]
                     if not _ami_creds:
                         # Try common defaults
                         _ami_creds = [("1000", "1000"), ("admin", "admin"),
@@ -3254,7 +3289,12 @@ def main() -> int:
         "scope_file": args.scope_file or "",
         "scope_sha256": scope_sha or "",
         "args": {k: v for k, v in vars(args).items()
-                 if not callable(v) and not k.startswith("_")},
+                 if k in {
+                     'target', 'mode', 'rate', 'timeout', 'workers', 'port', 'ami_port',
+                     'enum', 'spray', 'call_test', 'full', 'auto', 'discover_prefix',
+                     'check_refer', 'call_dry_run', 'srtp', 'no_color', 'json_output',
+                     'report_dir', 'scope_file', 'stun', 'tcp', 'tls',
+                 }},
         "hosts": host_reports,
     }
     paths = report.write_all(report_dir, final_report)
@@ -3273,6 +3313,8 @@ def main() -> int:
             _nat_mod.teardown(_nat_ctx)
         except Exception:
             pass
+
+    counts = final_report.get("severity_counts", {})
 
     # --json-output: write machine-readable findings to a user-specified path
     if args.json_output:
@@ -3317,7 +3359,6 @@ def main() -> int:
         except OSError as _je:
             _warn(f"Could not write JSON output to {args.json_output}: {_je}", col)
 
-    counts = final_report.get("severity_counts", {})
 
     # risk_score is stored as an int by write_all(); normalise to dict for display
     _rs_raw = final_report.get("risk_score", 0)
