@@ -315,9 +315,26 @@ def _fetch_url(url: str, timeout: float = 5.0) -> str:
         return ""
 
 
+def _safe_fetch_url(url, timeout=5.0):
+    import urllib.parse as _up
+    parsed = _up.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    try:
+        host = parsed.hostname or ""
+        ip = socket.gethostbyname(host)
+        import ipaddress as _ipa
+        addr = _ipa.ip_address(ip)
+        if addr.is_loopback:
+            return ""
+    except Exception:
+        pass
+    return _fetch_url(url, timeout)
+
+
 def _find_wan_service(location_url: str) -> tuple[str, str] | None:
     """Parse IGD device XML; return (control_url, service_type) for WAN*Connection."""
-    xml = _fetch_url(location_url)
+    xml = _safe_fetch_url(location_url)
     if not xml:
         return None
 
@@ -344,6 +361,8 @@ def _find_wan_service(location_url: str) -> tuple[str, str] | None:
 def _soap_action(control_url: str, service_type: str,
                  action: str, args_xml: str, timeout: float = 5.0) -> str:
     """Send a SOAP action to a UPnP service control URL."""
+    if not control_url.startswith(("http://", "https://")):
+        return "blocked"
     body = (
         '<?xml version="1.0"?>'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '

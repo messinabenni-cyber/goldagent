@@ -738,6 +738,14 @@ def authorize(args, col: Colours) -> tuple[str, str | None]:
 # Argument parsing
 # ---------------------------------------------------------------------------
 
+def _validate_phone_number(val):
+    import re as _re
+    if not _re.match(r"^[+0-9*#pPwWx,;. -]{1,40}$", val.strip()):
+        import argparse
+        raise argparse.ArgumentTypeError("Invalid phone number format: " + repr(val))
+    return val.strip()
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
@@ -799,6 +807,7 @@ def parse_args() -> argparse.Namespace:
     c.add_argument("--call-test", action="store_true",
                    help="Place a proof-of-concept outbound call")
     c.add_argument("--call-to",
+                   type=_validate_phone_number,
                    help="Destination number (YOU must own it)")
     c.add_argument("--call-from",
                    help="From extension (defaults to first valid extension found)")
@@ -1421,6 +1430,13 @@ def main() -> int:
         _err("--call-to-auto requires --call-to (destination number)", col)
         return 2
 
+    # CRLF injection guard: reject usernames/passwords containing CR or LF
+    for _crlf_attr in ("username", "password"):
+        _crlf_val = getattr(args, _crlf_attr, None)
+        if _crlf_val and ("\r" in _crlf_val or "\n" in _crlf_val):
+            _err(f"--{_crlf_attr} contains CR/LF characters", col)
+            return 2
+
     source_port_range = _parse_port_range(args.source_port_range)
 
     # ---- STUN: resolve public IP to fix Via/Contact headers behind NAT ----
@@ -1495,6 +1511,9 @@ def main() -> int:
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     report_dir = args.report_dir or os.path.join("reports", stamp)
+    if chr(0) in report_dir:
+        _err("--report-dir contains null bytes", col)
+        return 2
     os.makedirs(report_dir, exist_ok=True)
     traffic_log = TrafficLog(os.path.join(report_dir, "traffic.log"))
 

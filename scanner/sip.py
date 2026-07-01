@@ -74,6 +74,8 @@ class SipResponse:
 
 
 def parse_response(data: bytes) -> SipResponse | None:
+    if len(data) > 131072:
+        data = data[:131072]
     try:
         head, _, body = data.partition(b"\r\n\r\n")
         lines = head.decode("utf-8", errors="replace").split("\r\n")
@@ -136,6 +138,8 @@ class SipRequest:
 
 def parse_request(data: bytes) -> SipRequest | None:
     """Parse a SIP request message (OPTIONS, BYE, re-INVITE, etc.)."""
+    if len(data) > 131072:
+        data = data[:131072]
     try:
         head, _, body = data.partition(b"\r\n\r\n")
         lines = head.decode("utf-8", errors="replace").split("\r\n")
@@ -319,6 +323,9 @@ def build_message(
     if auth_header:
         lines.append(auth_header)
     if extra_headers:
+        for i, h in enumerate(extra_headers):
+            if chr(13) in h or chr(10) in h:
+                raise ValueError("extra_headers[" + str(i) + "] contains CRLF injection attempt")
         lines.extend(extra_headers)
     if body:
         lines.append("Content-Type: application/sdp")
@@ -341,6 +348,8 @@ def build_auth_header(
     header_name: str = "Authorization",
 ) -> str:
     """Build Digest auth response. Supports MD5, MD5-SESS, SHA-256, SHA-256-SESS."""
+    _no_crlf(username, "username")
+    _no_crlf(password, "password")
     realm = params.get("realm", "")
     nonce = params.get("nonce", "")
     algorithm = params.get("algorithm", "MD5").upper()
