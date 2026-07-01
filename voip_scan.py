@@ -544,6 +544,59 @@ def _sip_no_response_diagnosis(
     print(f"  {col.BOLD}{col.YELLOW}╚{'═'*50}╝{col.RESET}")
     print()
 
+    # Only run relay/nmap probes when nothing was found via the standard sweep
+    if not open_alts:
+        sip_port = args_port  # alias for the inserted block below
+
+        # ── socat UDP→TCP relay: last-resort bypass when UDP 5060 blocked ────
+        if _EXT_TOOLS.get("socat"):
+            try:
+                from scanner.nat import socat_tcp_relay
+                _relay_port = 5073  # ephemeral local port for relay
+                _relay_proc = socat_tcp_relay(host, target_port=sip_port,
+                                              local_port=_relay_port, timeout=3.0)
+                if _relay_proc:
+                    # Probe localhost:_relay_port (socat relays to host:sip_port via TCP)
+                    _relay_msg = sip_mod.build_message(
+                        "OPTIONS", f"sip:{host}",
+                        from_user="goldagent", to_user="goldagent",
+                        host="127.0.0.1", port=_relay_port,
+                        local_ip="127.0.0.1", local_port=0,
+                    )
+                    _relay_data = sip_mod.send_and_recv(_relay_msg, "127.0.0.1",
+                                                    _relay_port, 0, timeout)
+                    _relay_resp = sip_mod.parse_response(_relay_data) if _relay_data else None
+                    _relay_proc.terminate()
+                    if _relay_resp and _relay_resp.status_code in range(100, 700):
+                        _ok(f"socat relay: UDP→TCP through relay — SIP {_relay_resp.status_code} "
+                            f"{_relay_resp.reason} confirmed on {host}:{sip_port}", col)
+                        # Return the ORIGINAL host/port — caller uses sip_mod.send_and_recv directly;
+                        # the relay was just a probe. Set tcp=True so all subsequent sends use TCP.
+                        return _relay_resp.to_dict() if hasattr(_relay_resp, "to_dict") else {
+                            "status": _relay_resp.status_code,
+                            "reason": _relay_resp.reason,
+                            "server": _relay_resp.server or "",
+                            "allow": list(_relay_resp.allow),
+                            "transport": "tcp",
+                        }, sip_port, True, False
+            except Exception:
+                pass
+
+        # ── nmap firewall probe: detect filtered/open state via evasion flags ──
+        if _EXT_TOOLS.get("nmap"):
+            try:
+                from scanner.nat import nmap_sip_probe
+                _nm = nmap_sip_probe(host, port=sip_port, timeout=6.0)
+                if _nm.get("open"):
+                    _ok(f"nmap evasion probe: SIP port {sip_port}/udp is OPEN (firewall bypassed via --source-port 53)", col)
+                    if _nm.get("scripts"):
+                        _info(f"nmap SIP scripts: {_nm['scripts']}", col)
+                elif _nm.get("filtered"):
+                    _warn(f"nmap: port {sip_port}/udp is FILTERED — deep firewall detected. "
+                          f"Try --tcp or VPN tunnel.", col)
+            except Exception:
+                pass
+
     return discovered_sip, found_port, found_is_tcp, found_use_tls
 
 

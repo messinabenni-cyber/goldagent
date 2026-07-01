@@ -19,6 +19,7 @@ from __future__ import annotations
 import re
 import socket
 import struct
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -563,3 +564,99 @@ def _default_local_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def socat_tcp_relay(
+    target_host: str,
+    target_port: int = 5060,
+    local_port: int = 5063,
+    timeout: float = 5.0,
+) -> "subprocess.Popen | None":
+    """Start a socat UDP→TCP relay process for SIP firewall bypass.
+
+    Spawns: socat UDP4-RECVFROM:<local_port>,fork TCP4:<target_host>:<target_port>
+
+    Returns the Popen object on success (caller must .terminate() it), or None
+    if socat is unavailable or the relay fails to start.
+
+    Use-case: when UDP 5060 is blocked by a firewall but TCP 5060 is open.
+    The scanner sends SIP to localhost:<local_port> (UDP) and socat tunnels
+    each datagram as a TCP stream to the PBX.
+    """
+    import shutil
+    socat = shutil.which("socat")
+    if not socat:
+        return None
+    cmd = [
+        socat,
+        f"UDP4-RECVFROM:{local_port},fork",
+        f"TCP4:{target_host}:{target_port}",
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        import time as _t
+        _t.sleep(0.3)  # give socat a moment to bind
+        if proc.poll() is not None:
+            return None  # exited immediately — port already in use or socat error
+        return proc
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def nmap_sip_probe(
+    host: str,
+    port: int = 5060,
+    timeout: float = 8.0,
+    extra_flags: list[str] | None = None,
+) -> dict:
+    """Run nmap SIP/UDP probe with firewall-evasion flags.
+
+    Uses: nmap -sU -p <port> --source-port 53 -f --data-length 48
+          --script sip-methods <host>
+
+    The --source-port 53 trick bypasses stateless ACLs that allow DNS.
+    Fragmentation (-f) evades shallow packet inspectors.
+
+    Returns dict with keys: open (bool), filtered (bool), scripts (str),
+    raw_output (str). All False/empty if nmap is unavailable.
+    """
+    import shutil
+    nmap = shutil.which("nmap")
+    if not nmap:
+        return {"open": False, "filtered": False, "scripts": "", "raw_output": ""}
+    cmd = [
+        nmap,
+        "-sU", "-p", str(port),
+        "--source-port", "53",
+        "-f",
+        "--data-length", "48",
+        "-T4",
+        "--script", "sip-methods",
+        "--host-timeout", f"{int(timeout)}s",
+        host,
+    ]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout + 5
+        )
+        raw = r.stdout + r.stderr
+        is_open = "/udp open" in raw or "open|filtered" in raw
+        is_filtered = "filtered" in raw and not is_open
+        scripts = ""
+        for line in raw.splitlines():
+            if "|_sip" in line or "| sip" in line:
+                scripts += line.strip() + "\n"
+        return {
+            "open": is_open,
+            "filtered": is_filtered,
+            "scripts": scripts.strip(),
+            "raw_output": raw[:4096],
+        }
+    except (OSError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return {"open": False, "filtered": False, "scripts": "", "raw_output": ""}
