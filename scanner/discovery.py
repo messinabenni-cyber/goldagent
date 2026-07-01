@@ -22,6 +22,9 @@ from . import sip
 from . import stun as _stun_mod
 from .utils import RateLimiter, local_ip_for
 
+# Module-level DNS cache: hostname -> resolved IP string.
+_DNS_CACHE: dict[str, str] = {}
+
 
 # Ports commonly running PBX management / SIP on internet-facing hosts.
 # (proto, port, service_label)
@@ -111,9 +114,14 @@ def expand_target(spec: str) -> list[str]:
         except (ipaddress.AddressValueError, ValueError):
             pass  # fall through to hostname resolution
 
-    # Try resolving as hostname first; fall back to treating as IP literal
+    # Try resolving as hostname first; fall back to treating as IP literal.
+    # Cache results to avoid redundant DNS round-trips across repeated calls.
+    if spec in _DNS_CACHE:
+        return [_DNS_CACHE[spec]]
     try:
-        return [socket.gethostbyname(spec)]
+        resolved = socket.gethostbyname(spec)
+        _DNS_CACHE[spec] = resolved
+        return [resolved]
     except socket.gaierror:
         # Last resort: validate as IP, return as-is
         try:
@@ -147,7 +155,12 @@ def _tcp_probe(host: str, port: int, timeout: float) -> str | None:
 
 
 def _http_banner(host: str, port: int, timeout: float, use_tls: bool = False) -> str:
-    """Send a minimal HTTP/1.0 GET and capture Server header for fingerprinting."""
+    """Send a minimal HTTP/1.0 GET and capture Server header for fingerprinting.
+
+    Each recv() call is bounded by *timeout*, and the total read loop is
+    bounded by 2x *timeout* so there is no unbounded wait.
+    """
+    import time
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(timeout)
     try:
@@ -161,8 +174,13 @@ def _http_banner(host: str, port: int, timeout: float, use_tls: bool = False) ->
             f"GET / HTTP/1.0\r\nHost: {host}\r\nUser-Agent: VoIPScan/3.0\r\n\r\n"
             .encode()
         )
+        # Cap each recv() at *timeout* and the total loop at 2x *timeout*.
+        s.settimeout(timeout)
+        deadline = time.monotonic() + 2 * timeout
         chunks = b""
         while len(chunks) < 4096:
+            if time.monotonic() >= deadline:
+                break
             try:
                 d = s.recv(2048)
             except socket.timeout:

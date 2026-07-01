@@ -399,7 +399,13 @@ def spray(
             try:
                 e, u, p = next(work_iter)
                 if stop_for_ext[e].is_set():
-                    continue   # skip already-locked extensions without submitting
+                    # Extension already locked out — skip with a clear log message
+                    if traffic_log:
+                        traffic_log.write(
+                            f"[SKIP] ext={e} skipped: max_failures_per_ext "
+                            f"({max_failures_per_ext}) reached or lockout detected\n"
+                        )
+                    continue   # skip and try to pull next item from generator
                 f = ex.submit(_attempt, e, u, p)
                 active[f] = (e, u, p)
             except StopIteration:
@@ -407,30 +413,44 @@ def spray(
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         _fill(ex)
-        while active:
-            done, _ = concurrent.futures.wait(
-                active, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in done:
-                ext, u, p = active.pop(fut)
-                try:
-                    hit = fut.result()
-                except Exception:
-                    hit = None
-                if hit and hit.success:
-                    hits.append(hit)
-                    if stop_on_first:
-                        stop_for_ext[ext].set()
-                elif hit is not None and hit.evidence.startswith("LOCKOUT-SUSPECTED"):
-                    # already stopped in _attempt; do not increment fail_counts
-                    pass
-                elif hit is None and max_failures_per_ext:
-                    # _attempt returned None = failure; track lockout
-                    with lock:
-                        fail_counts[ext] += 1
-                        if fail_counts[ext] >= max_failures_per_ext:
+        try:
+            while active:
+                done, _ = concurrent.futures.wait(
+                    active, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for fut in done:
+                    ext, u, p = active.pop(fut)
+                    try:
+                        hit = fut.result()
+                    except Exception:
+                        hit = None
+                    if hit and hit.success:
+                        hits.append(hit)
+                        if stop_on_first:
                             stop_for_ext[ext].set()
-            _fill(ex)   # refill window after processing completions
+                    elif hit is not None and hit.evidence.startswith("LOCKOUT-SUSPECTED"):
+                        # already stopped in _attempt; do not increment fail_counts
+                        pass
+                    elif hit is None and max_failures_per_ext:
+                        # _attempt returned None = failure; track lockout
+                        with lock:
+                            fail_counts[ext] += 1
+                            if fail_counts[ext] >= max_failures_per_ext:
+                                stop_for_ext[ext].set()
+                                if traffic_log:
+                                    traffic_log.write(
+                                        f"[LOCKOUT-GUARD] ext={ext} stopped: "
+                                        f"{fail_counts[ext]} failures >= "
+                                        f"max_failures_per_ext={max_failures_per_ext}\n"
+                                    )
+                    _fill(ex)   # refill window after processing completions
+        except KeyboardInterrupt:
+            # Signal all extensions to stop and return partial results collected so far
+            for ev in stop_for_ext.values():
+                ev.set()
+            # Cancel pending futures where possible; executor shutdown will drain the rest
+            for fut in list(active):
+                fut.cancel()
 
     hits.sort(key=lambda r: r.extension)
     return hits

@@ -978,10 +978,8 @@ def check_sip_version_disclosure(
     # Check Asterisk version
     ast_ver = _extract_asterisk_version(sip_server)
     if ast_ver:
-        try:
-            parts = [int(x) for x in ast_ver.split(".")]
-        except ValueError:
-            parts = []
+        # Use _parse_version for robustness (handles rc/letter suffixes, 4+ components)
+        parts = list(_parse_version(ast_ver))
         # Require at least major.minor to avoid false-positives on bare "Asterisk 20" banners
         if len(parts) >= 2:
             major = parts[0]
@@ -990,14 +988,15 @@ def check_sip_version_disclosure(
                     CveResult(
                         cve_id="CONFIG-ASTERISK-EOL",
                         platform="Asterisk",
-                        severity="critical",
+                        severity="high",  # version-only, no live exploit → cap at HIGH
                         host=host,
                         port=sip_port,
                         title=f"Asterisk {ast_ver} is end-of-life and no longer receives security updates",
                         evidence=(
                             f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
                             f"Asterisk {major}.x has reached end-of-life and no longer receives "
-                            "security patches. All known and future CVEs remain unaddressed."
+                            "security patches. All known and future CVEs remain unaddressed. "
+                            "[CONFIG/VERSION — not live-exploited]"
                         ),
                         remediation=(
                             "Upgrade to Asterisk 20 LTS (>=20.15.2) or Asterisk 22 (>=22.5.2). "
@@ -1010,6 +1009,7 @@ def check_sip_version_disclosure(
                             "https://wiki.asterisk.org/wiki/display/AST/Asterisk+Versions",
                         ],
                         confirmed=False,
+                        confidence="version_based",
                     )
                 )
             elif major == 20 and _version_lt(ast_ver, "20.15.2"):
@@ -1017,16 +1017,17 @@ def check_sip_version_disclosure(
                     CveResult(
                         cve_id="CVE-2025-57767",
                         platform="Asterisk",
-                        severity="critical",
+                        severity="high",  # CVE-2025-57767 is DoS only (CVSS 7.5), version-only → HIGH
                         host=host,
                         port=sip_port,
-                        title=f"Asterisk {ast_ver} is below 20.15.2 — CVE-2025-57767, AST-2022-002 (CVE-2022-26498) [VERSION-BASED]",
+                        title=f"Asterisk {ast_ver} (version below 20.15.2) — CVE-2025-57767, AST-2022-002 (CVE-2022-26498) [VERSION-BASED]",
                         evidence=(
                             f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
                             "Asterisk 20.x below 20.15.2 is affected by CVE-2025-57767 "
                             "(NULL pointer dereference in SIP digest auth, CVSS 7.5) and "
                             "AST-2022-002/CVE-2022-26498 (heap overflow in STIR/SHAKEN). "
-                            "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
+                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H] "
+                            "[CONFIG/VERSION — not live-exploited]"
                         ),
                         remediation=(
                             "Upgrade Asterisk to 20.15.2 or later (LTS branch), "
@@ -1040,6 +1041,7 @@ def check_sip_version_disclosure(
                             "https://www.asterisk.org/asterisk-security-advisories/",
                         ],
                         confirmed=False,
+                        confidence="version_based",
                     )
                 )
             elif major == 21 and _version_lt(ast_ver, "21.10.2"):
@@ -1050,12 +1052,13 @@ def check_sip_version_disclosure(
                         severity="high",
                         host=host,
                         port=sip_port,
-                        title=f"Asterisk {ast_ver} is below 21.10.2 — CVE-2025-57767 [VERSION-BASED]",
+                        title=f"Asterisk {ast_ver} (version below 21.10.2) — CVE-2025-57767 [VERSION-BASED]",
                         evidence=(
                             f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
                             "Asterisk 21.x below 21.10.2 is affected by CVE-2025-57767 "
                             "(NULL pointer dereference in SIP digest auth, remote DoS, CVSS 7.5). "
-                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H]"
+                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H] "
+                            "[CONFIG/VERSION — not live-exploited]"
                         ),
                         remediation=(
                             "Upgrade Asterisk to 21.10.2 or later, "
@@ -1068,6 +1071,7 @@ def check_sip_version_disclosure(
                             "https://www.asterisk.org/asterisk-security-advisories/",
                         ],
                         confirmed=False,
+                        confidence="version_based",
                     )
                 )
             elif major == 22 and _version_lt(ast_ver, "22.5.2"):
@@ -1078,12 +1082,13 @@ def check_sip_version_disclosure(
                         severity="high",
                         host=host,
                         port=sip_port,
-                        title=f"Asterisk {ast_ver} is below 22.5.2 — CVE-2025-57767 [VERSION-BASED]",
+                        title=f"Asterisk {ast_ver} (version below 22.5.2) — CVE-2025-57767 [VERSION-BASED]",
                         evidence=(
                             f"SIP banner reveals Asterisk version {ast_ver!r} (from: {sip_server!r}). "
                             "Asterisk 22.x below 22.5.2 is affected by CVE-2025-57767 "
                             "(NULL pointer dereference in SIP digest auth, remote DoS, CVSS 7.5). "
-                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H]"
+                            "[CVSS:7.5/HIGH CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H] "
+                            "[CONFIG/VERSION — not live-exploited]"
                         ),
                         remediation=(
                             "Upgrade Asterisk to 22.5.2 or later, "
@@ -1096,6 +1101,7 @@ def check_sip_version_disclosure(
                             "https://www.asterisk.org/asterisk-security-advisories/",
                         ],
                         confirmed=False,
+                        confidence="version_based",
                     )
                 )
 
@@ -1110,14 +1116,15 @@ def check_sip_version_disclosure(
                     severity="high",
                     host=host,
                     port=sip_port,
-                    title=f"FreePBX {fpbx_ver} is below 16.0.19.9 — CVE-2022-2347",
+                    title=f"FreePBX {fpbx_ver} (version below 16.0.19.9) — CVE-2022-2347",
                     evidence=(
                         f"SIP banner reveals FreePBX version {fpbx_ver!r} (from: {sip_server!r}). "
                         "FreePBX versions below 16.0.19.9 are vulnerable to "
                         "CVE-2022-2347: authenticated path traversal and arbitrary "
                         "file read via the file manager module, which can expose "
                         "system files including /etc/passwd and Asterisk SIP credentials. "
-                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H]"
+                        "[CVSS:9.8/CRITICAL CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H] "
+                        "[CONFIG/VERSION — not live-exploited]"
                     ),
                     remediation=(
                         "Upgrade FreePBX to 16.0.19.9 or later. "
@@ -1130,6 +1137,7 @@ def check_sip_version_disclosure(
                         "https://www.freepbx.org/",
                     ],
                     confirmed=False,  # version-based: not live-exploited
+                    confidence="version_based",
                 )
             )
 
@@ -1224,15 +1232,12 @@ def check_asterisk_cve_2025_57767(
     sv = sip_server.lower()
     if "asterisk" not in sv:
         return None
-    # Extract version
-    m = re.search(r"asterisk\s+(?:pbx\s+)?(\d+\.\d+(?:\.\d+)?)", sv)
+    # Extract version — use _parse_version for robustness (handles rc/letter suffixes)
+    m = re.search(r"asterisk\s+(?:pbx\s+)?(\d+\.\d+(?:\.\d+)?(?:[.\-]\w+)*)", sv)
     if not m:
         return None
     ver_str = m.group(1)
-    try:
-        parts = [int(x) for x in ver_str.split(".")]
-    except ValueError:
-        return None
+    parts = list(_parse_version(ver_str))
     if len(parts) < 2:
         return None
     major = parts[0]
@@ -1253,14 +1258,16 @@ def check_asterisk_cve_2025_57767(
         host=host,
         port=sip_port,
         title=(
-            f"CVE-2025-57767: Asterisk {ver_str} vulnerable to SIP auth crash "
+            f"CVE-2025-57767: Asterisk {ver_str} (version below 20.15.2/21.10.2/22.5.2) "
+            "vulnerable to SIP auth crash "
             "(remote DoS via malformed Authorization header, CVSS 7.5)"
         ),
         evidence=(
             f"SIP server banner: {sip_server}. "
             f"Asterisk {ver_str} < 20.15.2/21.10.2/22.5.2. "
             "A crafted Authorization header with missing realm/nonce triggers "
-            "NULL pointer dereference in res_pjsip_authenticator_digest → crash."
+            "NULL pointer dereference in res_pjsip_authenticator_digest → crash. "
+            "[CONFIG/VERSION — not live-exploited]"
         ),
         remediation=(
             "Upgrade Asterisk to ≥20.15.2, ≥21.10.2, or ≥22.5.2. "
@@ -1272,6 +1279,8 @@ def check_asterisk_cve_2025_57767(
             "https://nvd.nist.gov/vuln/detail/CVE-2025-57767",
             "https://www.ameeba.com/blog/cve-2025-57767-asterisk-vulnerability-affecting-sip-request-authentication/",
         ],
+        confirmed=False,
+        confidence="version_based",
     )
 
 
@@ -1328,7 +1337,8 @@ def check_sip_tls_missing(
             f"SIP port {sip_port}/udp is open and responding. Port 5061/tcp (SIP-TLS) "
             "is not reachable. SIP Digest authentication nonces, call metadata, "
             "and any SDP a=crypto SDES key material are transmitted unencrypted. "
-            "Violates RFC 3261 §26 and RFC 4568 §9."
+            "Violates RFC 3261 §26 and RFC 4568 §9. "
+            "[CONFIG/VERSION — not live-exploited]"
         ),
         remediation=(
             "Enable SIP-TLS (port 5061) on the PBX. "
@@ -1342,6 +1352,7 @@ def check_sip_tls_missing(
             "https://datatracker.ietf.org/doc/html/rfc4568#section-9",
         ],
         confirmed=False,  # config-based: SIP responds but TLS not configured
+        confidence="version_based",
     )
 
 
