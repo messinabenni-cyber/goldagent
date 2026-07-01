@@ -102,6 +102,116 @@ def parse_response(data: bytes) -> SipResponse | None:
 
 
 # ---------------------------------------------------------------------------
+# SIP request parsing (for handling PBX-initiated requests during dialogs)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SipRequest:
+    method: str
+    request_uri: str
+    headers: dict[str, str]
+    body: str
+    raw: bytes
+
+    @property
+    def call_id(self) -> str:
+        return self.headers.get("call-id", "")
+
+    @property
+    def from_header(self) -> str:
+        return self.headers.get("from", "")
+
+    @property
+    def to_header(self) -> str:
+        return self.headers.get("to", "")
+
+    @property
+    def cseq(self) -> str:
+        return self.headers.get("cseq", "")
+
+    @property
+    def via(self) -> str:
+        return self.headers.get("via", "")
+
+
+def parse_request(data: bytes) -> SipRequest | None:
+    """Parse a SIP request message (OPTIONS, BYE, re-INVITE, etc.)."""
+    try:
+        head, _, body = data.partition(b"\r\n\r\n")
+        lines = head.decode("utf-8", errors="replace").split("\r\n")
+        if not lines:
+            return None
+        m = re.match(r"([A-Z]+)\s+(\S+)\s+SIP/2\.0", lines[0])
+        if not m:
+            return None
+        method      = m.group(1)
+        request_uri = m.group(2)
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, _, v = line.partition(":")
+                key = k.strip().lower()
+                val = v.strip()
+                # Accumulate Via headers (comma-separated)
+                if key == "via" and key in headers:
+                    headers[key] = headers[key] + "," + val
+                else:
+                    headers[key] = val
+        return SipRequest(method, request_uri, headers,
+                          body.decode("utf-8", errors="replace"), data)
+    except Exception:
+        return None
+
+
+def build_response_to_request(
+    status_code: int,
+    reason: str,
+    request: SipRequest,
+    *,
+    body: str = "",
+    extra_headers: list[str] | None = None,
+    to_tag: str | None = None,
+) -> bytes:
+    """Build a minimal SIP response reflecting Via/From/To/Call-ID/CSeq from request."""
+    lines = [f"SIP/2.0 {status_code} {reason}"]
+    # Reflect each Via header verbatim
+    for via in (request.via or "").split(","):
+        v = via.strip()
+        if v:
+            lines.append(f"Via: {v}")
+    lines.append(f"From: {request.from_header}")
+    to = request.to_header
+    if to_tag and ";tag=" not in to:
+        to += f";tag={to_tag}"
+    lines.append(f"To: {to}")
+    lines.append(f"Call-ID: {request.call_id}")
+    lines.append(f"CSeq: {request.cseq}")
+    if extra_headers:
+        lines.extend(extra_headers)
+    if body:
+        lines.append("Content-Type: application/sdp")
+    lines.append(f"Content-Length: {len(body.encode('utf-8'))}")
+    lines.append("")
+    return ("\r\n".join(lines) + "\r\n" + body).encode("utf-8")
+
+
+def parse_contact_uri(headers: dict[str, str]) -> tuple[str, int] | None:
+    """Extract (host, port) from a Contact header, or None."""
+    contact = headers.get("contact", "")
+    # Match sip:user@host:port or sip:host:port
+    m = re.search(r"sip:[^@>]*@([0-9A-Za-z._-]+):(\d+)", contact)
+    if m:
+        return m.group(1), int(m.group(2))
+    m = re.search(r"sip:([0-9A-Za-z._-]+):(\d+)", contact)
+    if m:
+        return m.group(1), int(m.group(2))
+    m = re.search(r"sip:[^@>]*@([0-9A-Za-z._-]+)", contact)
+    if m:
+        return m.group(1), 5060
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Message construction
 # ---------------------------------------------------------------------------
 

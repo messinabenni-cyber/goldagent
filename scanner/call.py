@@ -461,6 +461,7 @@ def place_call(
 
     bye_confirmed = False
     hold_seconds_actual = 0.0
+    _dialog_contact: tuple[str, int] | None = None  # Contact from 200 OK (RFC 3261 §12.2)
 
     if tcp:
         # TCP transport: single persistent connection for the entire dialog
@@ -662,6 +663,12 @@ def place_call(
             if 200 <= resp.status_code < 300:
                 final = resp
 
+                # RFC 3261 §12.2: BYE and in-dialog requests should target
+                # the Contact URI from the 200 OK, not the original Request-URI.
+                _c = sip.parse_contact_uri(resp.headers)
+                if _c:
+                    _dialog_contact = _c
+
                 # ---- SRTP answer check ----
                 if srtp_offer_line:
                     try:
@@ -697,24 +704,83 @@ def place_call(
                 send(ack)
                 trace.append("> ACK")
 
-                # ---- Hold phase (listen for PBX-initiated BYE while holding) ----
+                # ---- Hold phase: keep dialog alive + respond to PBX requests ----
                 _hold_s = max(0.0, min(call_duration, 3600.0))
+                _pbx_hung_up = False
                 if _hold_s > 0:
                     trace.append(f"* Call established — holding {_hold_s:.0f}s then BYE")
-                    _hold_start = time.monotonic()
+                    _hold_start   = time.monotonic()
                     _hold_deadline = _hold_start + _hold_s
+                    _last_keepalive = _hold_start
+                    _keepalive_iv  = 25.0  # OPTIONS keepalive every 25s
+                    import os as _os
+                    _ka_tag = _os.urandom(6).hex()
                     s.settimeout(1.0)
                     while time.monotonic() < _hold_deadline:
                         try:
                             _pkt = recv_one()
-                            if _pkt:
-                                _pr = sip.parse_response(_pkt)
-                                if _pr:
-                                    trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
-                                    if _pr.status_code and _pr.status_code >= 400:
-                                        break
                         except OSError:
                             break
+
+                        # Send in-dialog OPTIONS keepalive to keep Asterisk state alive
+                        if time.monotonic() - _last_keepalive > _keepalive_iv:
+                            _last_keepalive = time.monotonic()
+                            try:
+                                _ka_uri = f"sip:{call_to}@{host}"
+                                _ka_cseq_n = ack_cseq + 100  # well above BYE cseq
+                                _ka = sip.build_message(
+                                    "OPTIONS", _ka_uri,
+                                    from_user=call_from, to_user=call_to,
+                                    host=host, port=port,
+                                    local_ip=local_ip, local_port=local_port,
+                                    call_id=call_id,
+                                    cseq=_ka_cseq_n,
+                                    from_tag=tag_from, to_tag=last_to_tag,
+                                    transport=transport,
+                                    extra_headers=["Min-SE: 30", "Session-Expires: 300"],
+                                )
+                                send(_ka)
+                                trace.append("> OPTIONS (keepalive)")
+                            except Exception:
+                                pass
+
+                        if not _pkt:
+                            continue
+
+                        # Try as a SIP request first (BYE/OPTIONS/re-INVITE from PBX)
+                        _req = sip.parse_request(_pkt)
+                        if _req:
+                            if _req.method == "BYE":
+                                # PBX hungup — ack and stop hold
+                                _ok200 = sip.build_response_to_request(
+                                    200, "OK", _req, to_tag=_ka_tag)
+                                send(_ok200)
+                                trace.append("< (hold) PBX BYE — responded 200 OK")
+                                _pbx_hung_up = True
+                                bye_confirmed = True
+                                break
+                            elif _req.method in ("OPTIONS", "UPDATE"):
+                                # Session keepalive from PBX — reflect 200 OK
+                                _ok200 = sip.build_response_to_request(
+                                    200, "OK", _req, to_tag=_ka_tag)
+                                send(_ok200)
+                                trace.append(f"< (hold) PBX {_req.method} — 200 OK sent")
+                            elif _req.method == "INVITE":
+                                # re-INVITE (session refresh/renegotiation)
+                                _sdp = _build_sdp(local_ip)
+                                _ok200 = sip.build_response_to_request(
+                                    200, "OK", _req,
+                                    body=_sdp, to_tag=_ka_tag)
+                                send(_ok200)
+                                trace.append("< (hold) PBX re-INVITE — 200 OK sent")
+                            continue
+
+                        # Try as a SIP response
+                        _pr = sip.parse_response(_pkt)
+                        if _pr:
+                            trace.append(f"< (hold) {_pr.status_code} {_pr.reason}")
+                            if _pr.status_code and _pr.status_code >= 600:
+                                break  # hard error — PBX killed dialog
                     hold_seconds_actual = min(time.monotonic() - _hold_start, _hold_s)
                     s.settimeout(timeout)
                 else:
@@ -755,35 +821,47 @@ def place_call(
                         trace.append(f"! SIP-INFO DTMF failed: {exc}")
 
                 # ---- BYE + await acknowledgment (RFC 3261 §15.1) ----
-                bye = sip.build_message(
-                    "BYE", uri,
-                    from_user=call_from, to_user=call_to,
-                    host=host, port=port,
-                    local_ip=local_ip, local_port=local_port,
-                    call_id=call_id, cseq=bye_cseq, from_tag=tag_from,
-                    to_tag=last_to_tag, transport=transport,
-                )
-                send(bye)
-                trace.append("> BYE")
+                if not _pbx_hung_up:
+                    # Route BYE to Contact URI from 200 OK when available (RFC 3261 §12.2)
+                    _bye_host = host
+                    _bye_port = port
+                    if _dialog_contact:
+                        _bye_host, _bye_port = _dialog_contact
+                        if _bye_host != host:
+                            trace.append(f"* BYE → Contact {_bye_host}:{_bye_port} (from 200 OK)")
 
-                # Wait up to 5 s for the PBX to acknowledge our BYE (200 OK).
-                # A missing ack usually means NAT — the PBX cannot route back to
-                # our private Contact IP.  We still count the call as a finding
-                # but flag call_confirmed=False so the diagnostic report explains why.
-                _bye_deadline = time.monotonic() + min(timeout, 5.0)
-                s.settimeout(min(timeout, 2.0))
-                while time.monotonic() < _bye_deadline:
-                    _bd = recv_one()
-                    if _bd:
-                        _br = sip.parse_response(_bd)
-                        if _br:
-                            trace.append(f"< {_br.status_code} {_br.reason} (BYE ack)")
-                            if 200 <= _br.status_code < 300:
-                                bye_confirmed = True
-                                break
-                if not bye_confirmed:
-                    trace.append("! BYE not acknowledged (NAT or firewall suspected)")
-                s.settimeout(timeout)
+                    _bye_uri = f"sip:{call_to}@{_bye_host}"
+                    bye = sip.build_message(
+                        "BYE", _bye_uri,
+                        from_user=call_from, to_user=call_to,
+                        host=_bye_host, port=_bye_port,
+                        local_ip=local_ip, local_port=local_port,
+                        call_id=call_id, cseq=bye_cseq, from_tag=tag_from,
+                        to_tag=last_to_tag, transport=transport,
+                    )
+                    send(bye)
+                    trace.append("> BYE")
+
+                    # Wait up to 6s for the PBX to acknowledge our BYE (200 OK).
+                    # A missing ack usually means NAT — the PBX cannot route back to
+                    # our private Contact IP.  We still count the call as a finding
+                    # but flag call_confirmed=False so the diagnostic report explains why.
+                    _bye_deadline = time.monotonic() + min(timeout, 6.0)
+                    s.settimeout(min(timeout, 2.0))
+                    while time.monotonic() < _bye_deadline:
+                        _bd = recv_one()
+                        if _bd:
+                            _br = sip.parse_response(_bd)
+                            if _br:
+                                trace.append(f"< {_br.status_code} {_br.reason} (BYE ack)")
+                                if 200 <= _br.status_code < 300:
+                                    bye_confirmed = True
+                                    break
+                    if not bye_confirmed:
+                        trace.append("! BYE not acknowledged (NAT or firewall suspected)")
+                    s.settimeout(timeout)
+                else:
+                    trace.append("* PBX ended session — BYE not needed (already confirmed)")
 
                 # Smuggle DTMF list onto response for the result builder
                 final._dtmf_sent = dtmf_sent  # type: ignore[attr-defined]

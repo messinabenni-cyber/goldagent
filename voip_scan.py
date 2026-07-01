@@ -867,6 +867,10 @@ def parse_args() -> argparse.Namespace:
                         "Use '--stun auto' to try well-known public STUN servers, "
                         "or '--stun host[:port]' for a specific server. "
                         "Enabled automatically with --full.")
+    t.add_argument("--no-upnp", action="store_true",
+                   help="Disable UPnP/IGD port mapping (NAT traversal). "
+                        "By default the scanner attempts UPnP to punch a pinhole "
+                        "on the local router so the PBX can route BYE responses back.")
     t.add_argument("--source-port-range",
                    help="Bind within port range, inclusive (e.g. '5060-5099')")
     t.add_argument("--max-failures-per-ext", type=int, default=5,
@@ -1436,6 +1440,47 @@ def main() -> int:
             _stun_public_ip: str | None = None
     else:
         _stun_public_ip = None
+
+    # ---- NAT auto-traversal: type detection + UPnP port mapping ----
+    _nat_ctx = None
+    if not getattr(args, "no_upnp", False):
+        try:
+            from scanner import nat as _nat_mod
+            _sip_ports = [5062, 5063]
+            if source_port_range:
+                lo, hi = source_port_range
+                _sip_ports = list(range(lo, min(lo + 4, hi + 1)))
+            _info("NAT traversal: detecting topology + attempting UPnP port mapping...", col)
+            _nat_ctx = _nat_mod.setup(
+                ports_to_map=_sip_ports,
+                local_ip=args.source_ip or "",
+                public_ip=_stun_public_ip or "",
+                stun_server=(None if not args.stun or args.stun.lower() == "auto"
+                             else args.stun),
+                enable_upnp=True,
+                timeout=min(args.timeout, 3.0),
+            )
+            # If NAT type is symmetric and no STUN/UPnP resolved, prefer TCP
+            _nat_type_str = _nat_ctx.nat_type
+            _nat_colour = col.GREEN if _nat_type_str in ("direct", "full_cone") else col.YELLOW
+            _ok(f"NAT: {_nat_colour}{_nat_ctx.summary()}{col.RESET}", col)
+            if _nat_ctx.upnp_available:
+                _ok(f"  UPnP gateway found — {len(_nat_ctx.mapped_ports)} port(s) mapped through router", col)
+                if _nat_ctx.public_ip and not _stun_public_ip:
+                    # UPnP gave us the external IP; use it
+                    args.source_ip = _nat_ctx.public_ip
+                    _stun_public_ip = _nat_ctx.public_ip
+                    _ok(f"  Public IP from UPnP: {col.BOLD}{_nat_ctx.public_ip}{col.RESET}", col)
+            elif _nat_type_str == "symmetric":
+                _warn("Symmetric NAT detected — BYE routing may fail; TCP transport preferred. "
+                      "UPnP not available on this network.", col)
+            for _log_line in _nat_ctx.setup_log:
+                pass  # already summarised above; available for --debug if needed
+        except Exception as _nat_exc:
+            _nat_ctx = None
+            # Non-fatal: continue without NAT traversal
+    else:
+        _nat_ctx = None
 
     # ---- External tool detection ----
     global _EXT_TOOLS
@@ -2901,6 +2946,14 @@ def main() -> int:
     }
     paths = report.write_all(report_dir, final_report)
     traffic_log.close()
+
+    # Clean up UPnP port mappings created during this session
+    if _nat_ctx is not None:
+        try:
+            from scanner import nat as _nat_mod
+            _nat_mod.teardown(_nat_ctx)
+        except Exception:
+            pass
 
     # --json-output: write machine-readable findings to a user-specified path
     if args.json_output:
