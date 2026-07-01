@@ -145,42 +145,44 @@ def _sip_no_response_diagnosis(
     timeout: float,
     source_ip: str,
     col: "Colours",
-) -> None:
-    """Print a rich diagnostic block when no SIP response was obtained.
+) -> tuple[dict | None, int, bool, bool]:
+    """Probe all alt SIP transports/ports and print a rich diagnostic.
 
-    Actively probes alternative SIP ports/transports, explains each outcome,
-    and emits numbered actionable recommendations.
+    Returns (sip_dict, found_port, found_is_tcp, found_use_tls).
+    sip_dict is None if nothing responded — otherwise it's a dict compatible
+    with h.sip that the caller should assign so subsequent phases can run.
     """
     from scanner import sip as sip_mod
 
     tcp_open = {p["port"] for p in open_ports if p["proto"] == "tcp"}
-    udp_open = {p["port"] for p in open_ports if p["proto"] == "udp"}
 
     print()
-    print(f"  {col.BOLD}{col.YELLOW}╔══ SIP REACHABILITY DEEP-PROBE  [{host}] ══╗{col.RESET}")
+    print(f"  {col.BOLD}{col.YELLOW}╔══ SIP REACHABILITY AUTO-PROBE  [{host}] ══╗{col.RESET}")
     print(f"  {col.YELLOW}║{col.RESET}  Probing {len(_SIP_ALT_PROBE_PORTS)} transport/port combinations…")
     print()
 
-    probe_results: list[tuple[str, int, str, str, str | None]] = []  # transport, port, label, status, code
+    # (transport_str, port, label, status, code_str, resp_obj)
+    probe_results: list[tuple[str, int, str, str, str | None, object]] = []
 
     for transport, port, label, use_tls in _SIP_ALT_PROBE_PORTS:
         is_tcp = (transport in ("TCP", "TLS"))
+        resp_obj = None
         # Skip TCP ports that aren't open (saves time / avoids noise)
         if is_tcp and port not in tcp_open:
             status = "CLOSED"
             code_str: str | None = None
         else:
             try:
-                resp = sip_mod.options_probe(
+                resp_obj = sip_mod.options_probe(
                     host, port=port,
                     local_ip=source_ip or None,
                     timeout=min(timeout, 2.0),
                     tcp=is_tcp,
                     use_tls=use_tls,
                 )
-                if resp:
+                if resp_obj:
                     status = "OPEN"
-                    code_str = f"{resp.status_code} {resp.reason[:40]}"
+                    code_str = f"{resp_obj.status_code} {resp_obj.reason[:40]}"
                 else:
                     status = "NO-RESP"
                     code_str = None
@@ -188,7 +190,7 @@ def _sip_no_response_diagnosis(
                 status = "ERR"
                 code_str = str(exc)[:60]
 
-        probe_results.append((transport, port, label, status, code_str))
+        probe_results.append((transport, port, label, status, code_str, resp_obj))
 
         icon = (f"{col.GREEN}✓{col.RESET}" if status == "OPEN" else
                 f"{col.RED}✗{col.RESET}" if status == "CLOSED" else
@@ -208,38 +210,51 @@ def _sip_no_response_diagnosis(
         print()
 
     # Find any alt ports that responded
-    open_alts = [(t, p, l, c) for t, p, l, s, c in probe_results if s == "OPEN"]
+    open_alts = [(t, p, l, c, r) for t, p, l, s, c, r in probe_results if s == "OPEN"]
 
-    # Build actionable recommendations
+    # Build the discovered SIP dict from the first responding alt port
+    discovered_sip: dict | None = None
+    found_port = args_port
+    found_is_tcp = False
+    found_use_tls = False
+
+    if open_alts:
+        first_t, first_p, first_l, first_c, first_resp = open_alts[0]
+        found_is_tcp = (first_t in ("TCP", "TLS"))
+        found_use_tls = (first_t == "TLS")
+        found_port = first_p
+        transport_key = "tls" if found_use_tls else ("tcp" if found_is_tcp else "udp")
+        realm = ""
+        if first_resp and hasattr(first_resp, "auth_params"):
+            realm = first_resp.auth_params.get("realm", "")
+        discovered_sip = {
+            "status": first_resp.status_code if first_resp else 0,
+            "reason": first_resp.reason if first_resp else "",
+            "server": first_resp.server if first_resp else "",
+            "allow": [],
+            "transport": transport_key,
+            "realm": realm,
+            "_auto_recovered_port": first_p,
+            "_auto_recovered_transport": transport_key,
+        }
+
+    # Build actionable recommendations list
     recs: list[str] = []
 
-    # 1. Any alt port got a SIP response?
-    for transport, port, label, code_str in open_alts:
-        flag = "--tcp" if transport in ("TCP", "TLS") else ""
-        recs.append(
-            f"SIP found on {transport}/{port}  ({label}  {code_str})\n"
-            f"       Re-run with: {col.BOLD}--port {port}{' ' + flag if flag else ''}{col.RESET}"
-        )
-
-    # 2. Port 80/443/8080 open → web admin surface
-    web_ports = tcp_open & {80, 443, 4443, 8080, 8443}
-    if web_ports:
-        recs.append(
-            f"Web admin surface detected on TCP {sorted(web_ports)}.\n"
-            f"       Browse to http(s)://{host}/ — may expose FreePBX/3CX/Grandstream admin.\n"
-            f"       FreePBX default login: admin/admin  |  3CX: admin/<serial>  |  Grandstream: admin/admin"
-        )
-
-    # 3. Port 8088/8089 open → WebSocket SIP
-    if 8088 in tcp_open or 8089 in tcp_open:
-        recs.append(
-            f"Asterisk HTTP detected on TCP 8088/8089 — SIP/WebSocket (RFC 7118) may be active.\n"
-            f"       Try: {col.BOLD}ws://{host}:8088/ws{col.RESET}  or  {col.BOLD}wss://{host}:8089/wss{col.RESET}\n"
-            f"       Run with: {col.BOLD}--port 8088{col.RESET} or inspect /httpstatus for module list."
-        )
-
-    # 4. Firewall/SIP-ALG likely blocking
-    if not open_alts:
+    if open_alts:
+        for t, p, l, c, _ in open_alts:
+            flag = "--tcp" if t in ("TCP", "TLS") else ""
+            if p == open_alts[0][1] and t == open_alts[0][0]:
+                recs.append(
+                    f"[AUTO-APPLIED] SIP found on {t}/{p}  ({l}  {c})\n"
+                    f"       Tool auto-switched — all phases now resuming on {t}/{p}"
+                )
+            else:
+                recs.append(
+                    f"SIP also found on {t}/{p}  ({l}  {c})\n"
+                    f"       Re-run with: {col.BOLD}--port {p}{' ' + flag if flag else ''}{col.RESET}"
+                )
+    else:
         recs.append(
             "Firewall or SIP-ALG likely dropping UDP/5060 packets.\n"
             "       Try from a different network (mobile hotspot vs same ISP).\n"
@@ -247,55 +262,75 @@ def _sip_no_response_diagnosis(
             "       UDP OPTIONS are sometimes blocked; TCP/TLS SIP may pass through enterprise FW."
         )
 
-    # 5. NAT / ISP SIP-ALG
+    # Web admin surface
+    web_ports = tcp_open & {80, 443, 4443, 8080, 8443}
+    if web_ports:
+        recs.append(
+            f"Web admin surface on TCP {sorted(web_ports)} — browse to http(s)://{host}/\n"
+            f"       FreePBX: admin/admin  |  3CX: admin/<serial>  |  Grandstream: admin/admin\n"
+            f"       Login may allow direct call routing rules without SIP"
+        )
+
+    # WebSocket SIP
+    if 8088 in tcp_open or 8089 in tcp_open:
+        recs.append(
+            f"Asterisk WS/WSS SIP on 8088/8089 — SIP-over-WebSocket (RFC 7118)\n"
+            f"       Try: {col.BOLD}--port 8088{col.RESET}  (WS)  or  {col.BOLD}--port 8089 --tcp{col.RESET}  (WSS)\n"
+            f"       Inspect: http://{host}:8088/httpstatus"
+        )
+
+    # NAT / ISP SIP-ALG
     recs.append(
-        "ISP SIP-ALG may be rewriting/dropping SIP packets.\n"
-        "       Try tunnelling over TCP port 443 (mimics HTTPS): --port 443 --tcp\n"
-        "       Or try a VPN/proxy that bypasses SIP-ALG."
+        "ISP SIP-ALG may rewrite/drop SIP packets.\n"
+        "       Tunnel over TCP/443 (mimics HTTPS): --port 443 --tcp\n"
+        "       Or use a VPN/proxy that bypasses SIP-ALG."
     )
 
-    # 6. AMI / HTTP admin alternative path
+    # AMI paths
     if 5038 in tcp_open:
         recs.append(
-            f"Asterisk AMI open on TCP/5038 — add {col.BOLD}--ami-attack{col.RESET} flag.\n"
-            f"       AMI can originate calls without SIP: brute-force creds then use 'originate' action."
+            f"Asterisk AMI open on TCP/5038 — add --ami-attack flag.\n"
+            f"       AMI can originate calls without SIP at all (AMI 'originate' action)."
         )
-
     if 8088 in tcp_open:
         recs.append(
-            f"Asterisk HTTP rawman reachable — try {col.BOLD}--ami-attack{col.RESET} (uses /rawman endpoint).\n"
-            f"       Also check: http://{host}:8088/httpstatus  for exposed modules."
+            f"Asterisk /rawman on 8088 — add --ami-attack flag.\n"
+            f"       Also check: http://{host}:8088/httpstatus for exposed modules."
         )
 
-    # 7. Port knocking / IDS evasion
+    # IDS evasion
     recs.append(
-        "Target may be using port-knocking or fail2ban (IDS evasion).\n"
+        "Target may use fail2ban/IDS.\n"
         "       Wait 15+ min then retry from a fresh IP.\n"
-        "       Use: --mode stealth  to reduce probe rate below most IDS thresholds."
+        "       Use --mode stealth to stay below most IDS thresholds."
     )
 
-    # 8. Different source port
+    # Source port forcing
     recs.append(
-        "Some PBXes only reply to SIP from privileged ports (<1024).\n"
-        "       Try: --source-port-range 5060-5060  (forces source port = 5060)."
+        "Some PBXes only reply to SIP from privileged source ports.\n"
+        "       Try: --source-port-range 5060-5060"
     )
 
-    print(f"  {col.BOLD}Actionable recommendations:{col.RESET}")
+    print(f"  {col.BOLD}Recommendations + auto-actions:{col.RESET}")
     for i, rec in enumerate(recs, 1):
         lines = rec.split("\n")
-        print(f"    {col.YELLOW}{i}.{col.RESET} {lines[0]}")
+        prefix = f"{col.GREEN}★{col.RESET}" if "AUTO-APPLIED" in lines[0] else f"{col.YELLOW}{i}.{col.RESET}"
+        print(f"    {prefix} {lines[0]}")
         for line in lines[1:]:
             print(f"       {line}")
     print()
 
     if not open_alts:
-        print(f"  {col.RED}{col.BOLD}  No SIP response on any probed port/transport.{col.RESET}")
-        print(f"  {col.YELLOW}  The PBX may be firewalled, behind a SIP proxy, or unreachable from this network.{col.RESET}")
+        print(f"  {col.RED}{col.BOLD}  No SIP on any probed transport — see recommendations above.{col.RESET}")
+        print(f"  {col.YELLOW}  PBX may be firewalled, behind a SIP proxy, or unreachable from this network.{col.RESET}")
     else:
-        print(f"  {col.GREEN}{col.BOLD}  SIP found on {len(open_alts)} alt port(s) above — re-run with the --port flag shown.{col.RESET}")
+        print(f"  {col.GREEN}{col.BOLD}  AUTO-RECOVERY: switching to {open_alts[0][0]}/{open_alts[0][1]} "
+              f"— resuming full scan now.{col.RESET}")
 
     print(f"  {col.BOLD}{col.YELLOW}╚{'═'*50}╝{col.RESET}")
     print()
+
+    return discovered_sip, found_port, found_is_tcp, found_use_tls
 
 
 # ---------------------------------------------------------------------------
@@ -790,10 +825,24 @@ def main() -> int:
                 f"server={col.BOLD}{sip_srv or '(hidden)'}{col.RESET}  "
                 f"fingerprint={col.CYAN}{h.fingerprint}{col.RESET}", col)
         else:
-            _warn(f"{h.ip}: no SIP response on UDP/TCP — running deep diagnostics…", col)
-            _sip_no_response_diagnosis(
+            _warn(f"{h.ip}: no SIP on standard ports — auto-probing all transports…", col)
+            _disc_sip, _disc_port, _disc_tcp, _disc_tls = _sip_no_response_diagnosis(
                 h.ip, h.open_ports, args.port, args.timeout, args.source_ip, col
             )
+            if _disc_sip:
+                # AUTO-RECOVERY: patch h.sip and all local SIP variables so all
+                # subsequent phases (enum, spray, call PoC) run on the found port
+                h.sip = _disc_sip
+                sip_info = _disc_sip
+                sip_transport = _disc_sip.get("transport", "udp")
+                sip_tcp = sip_transport in ("tcp", "tls")
+                sip_tls = sip_transport == "tls"
+                sip_port = _disc_port
+                _ok(
+                    f"AUTO-RECOVERED SIP on {sip_transport.upper()}/{sip_port} "
+                    f"— full scan resuming (enum · spray · call PoC)",
+                    col,
+                )
 
         # ══════════════════════════════════════════════════════════════════
         _phase(f"PHASE 3 · AMI / MANAGEMENT ATTACK  [{h.ip}]", col)
@@ -889,8 +938,12 @@ def main() -> int:
         _phase(f"PHASE 4 · TOLL-FRAUD CALL POC  [{h.ip}]", col)
 
         if not h.sip:
-            _warn(f"{h.ip}: no SIP response — extension enumeration, spray, and call PoC skipped.", col)
-            _info("Tip: if deep-probe above found an alt port, re-run with --port <port> to reach dialplan.", col)
+            _warn(
+                f"{h.ip}: all SIP transports exhausted — no reachable SIP port found.\n"
+                f"         Extension enumeration, credential spray, and call PoC cannot run.\n"
+                f"         Check recommendations in Phase 2b above for bypass paths.",
+                col,
+            )
             host_reports.append(hr)
             continue
 
