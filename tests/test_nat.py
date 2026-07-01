@@ -782,7 +782,7 @@ class TestSetup:
         monkeypatch.setattr(nat, "get_reflexive_address", lambda **kw: None)
         monkeypatch.setattr(nat, "discover_upnp_gateway", lambda timeout=3.0: None)
         ctx = setup(ports_to_map=[], enable_upnp=True)
-        assert any("no IGD" in e.lower() for e in ctx.setup_log)
+        assert any("no igd" in e.lower() for e in ctx.setup_log)
 
     def test_setup_reflexive_failure_logged(self, monkeypatch):
         from scanner import nat
