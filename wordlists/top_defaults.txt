@@ -1,0 +1,77 @@
+# Top PBX default credentials — highest hit-rate subset for fast spray pass
+# Format: username:password
+# Ordered by real-world hit frequency.
+# Self-password (ext:ext) and blank (ext:"") are tried before this list
+# by smart_self_password=True — no need to duplicate them here.
+
+# ── FreePBX / Asterisk factory defaults ──────────────────────────────────
+admin:admin
+admin:amp111
+admin:password
+admin:asterisk
+admin:freepbx
+admin:sangoma
+admin:1234
+admin:12345
+admin:123456
+admin:admin123
+admin:Admin1234!
+admin:fpbx
+
+# ── Extension-style logins (most PBXes allow ext as username) ────────────
+1000:1234
+1000:0000
+1000:1111
+1000:4321
+1000:admin
+1000:password
+1000:asterisk
+1000:voip
+1000:sip
+
+# ── Grandstream UCM factory defaults ─────────────────────────────────────
+admin:admin
+admin:admingswave
+admin:Grandstream2014
+admin:grandstream
+admin:ucm6100
+admin:ucm6200
+
+# ── 3CX defaults ──────────────────────────────────────────────────────────
+admin:Admin1234!
+admin:3cx
+admin:admin1234
+admin:P@ssword1
+admin:P@ssw0rd
+
+# ── Mitel / ShoreTel ──────────────────────────────────────────────────────
+admin:mitel
+admin:sysadmin
+admin:1234
+
+# ── Cisco Unified CM ──────────────────────────────────────────────────────
+admin:cisco
+admin:Cisco123
+CCMAdministrator:cisco
+
+# ── Avaya defaults ────────────────────────────────────────────────────────
+admin:avaya
+craft:crftpw
+dadmin:dadmin01
+
+# ── Universal weak passwords ──────────────────────────────────────────────
+admin:0000
+admin:0001
+admin:1111
+admin:2222
+admin:9999
+admin:test
+admin:pass
+admin:secret
+admin:voip
+admin:sip
+admin:pbx
+admin:default
+admin:letmein
+admin:qwerty
+admin:abc123
